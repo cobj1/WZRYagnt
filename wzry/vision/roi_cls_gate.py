@@ -20,24 +20,46 @@ ROOT = Path(__file__).resolve().parents[2]
 _lock = threading.Lock()
 _clf = None
 _loaded_path = None
+_load_failed = False          # 加载失败后置位, 避免每次调用重试(触发联网校验会卡数秒)
 _CONF = {"mm_red": 0.55, "mm_blue": 0.55, "mm_green": 0.55}
 
 
 def _load_clf(path=None):
-    global _clf, _loaded_path
+    """加载 ROI 分类器(只尝试一次)。
+
+    v14.0 修正: 权重缺失时旧实现会**每次调用**都 `YOLO(路径)` —— ultralytics
+    拿到不存在的路径会走在线资产校验, 网络不通时重试数秒, 且因异常导致
+    `_clf` 未缓存 → 每个候选点重复卡顿(runs/cls/roi_cls 权重丢失时实测
+    MMTrackerV7 单次 update 21s)。现在: 文件不存在或加载异常 -> 立即置失败
+    标记并返回 None, 后续调用零开销。
+    """
+    global _clf, _loaded_path, _load_failed
     path = path or str(ROOT / "runs" / "cls" / "roi_cls" / "weights" / "best.pt")
     with _lock:
-        if _clf is None or _loaded_path != path:
+        if _clf is not None and _loaded_path == path:
+            return _clf
+        if _load_failed and _loaded_path == path:
+            return None                       # 已失败过, 不再重试
+        _loaded_path = path
+        if not Path(path).exists():
+            _load_failed = True
+            return None
+        try:
             from ultralytics import YOLO
             _clf = YOLO(path)
-            _loaded_path = path
+        except Exception:
+            _load_failed = True
+            _clf = None
+            return None
         return _clf
 
 
 def classify_roi(img_bgr):
-    """对抠图 ROI 分类 -> (cls_name, conf)。"""
+    """对抠图 ROI 分类 -> (cls_name, conf)。分类器不可用返回 (None, 0.0)。"""
+    clf = _load_clf()
+    if clf is None:
+        return None, 0.0
     try:
-        clf = _load_clf()
         r = clf.predict(img_bgr, verbose=False)[0]
         return clf.names[int(r.probs.top1)], float(r.probs.top1conf)
     except Exception:
@@ -58,6 +80,11 @@ def filter_dots(mm_img, reds, blues, greens, size=242):
     except Exception:
         return reds, blues, greens
 
+    # v14.0 修正: 分类器不可用 -> 原样透传(不拦截), 同时避免旧实现在
+    # 失败分支写入 3 元组、下方按 5 元组解包导致的 ValueError 崩溃。
+    if _load_clf() is None:
+        return reds, blues, greens
+
     def _classify(cands):
         keep = []
         for (nx, ny, conf) in cands:
@@ -71,10 +98,7 @@ def filter_dots(mm_img, reds, blues, greens, size=242):
                 continue
             roi = cv2.resize(roi, (64, 64), interpolation=cv2.INTER_AREA)
             name, c = classify_roi(roi)
-            if name is None:
-                keep.append((nx, ny, conf))   # 分类器故障不拦截
-            else:
-                keep.append((nx, ny, conf, name, c))
+            keep.append((nx, ny, conf, name, c))   # name=None 时下方按类名过滤会自然丢弃
         return keep
 
     kr = _classify(reds)

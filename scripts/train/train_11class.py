@@ -27,7 +27,9 @@ def check_data(data_dir, allow_empty=False):
     """训练前校验：11 类声明、各类框数、train/val 比例。"""
     with open(CLASSES_JSON, "r", encoding="utf-8-sig") as f:
         classes = json.load(f)
-    assert len(classes) == 11, f"classes.json 应为 11 类，实际 {len(classes)}"
+    assert len(classes) == len(__import__("wzry.train.encoding",
+                                          fromlist=["CLASSES"]).CLASSES), \
+        f"classes.json 应与 wzry.train.encoding.CLASSES 同长，实际 {len(classes)}"
     labels = sorted((data_dir / "labels").rglob("*.txt"))
     counts = {}
     for txt in labels:

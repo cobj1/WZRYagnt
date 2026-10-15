@@ -18,5 +18,7 @@ def build_state(frame, dets: List[Det], phase: str, minimap: Optional[dict] = No
             cls=d.cls,
             screen=[d.center[0] / w, d.center[1] / h,
                     (d.xyxy[2] - d.xyxy[0]) / w, (d.xyxy[3] - d.xyxy[1]) / h],
+            conf=float(d.conf),
+            camp_src=getattr(d, "camp_src", None),
         ))
     return st

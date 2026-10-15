@@ -11,6 +11,9 @@ temp/
 *.avi
 *.mkv
 
+# 固件本机私密配置（Wi-Fi 密码）
+secrets.h
+
 # 运行产物与数据（体积大，需选择性提交）
 runs/
 models/

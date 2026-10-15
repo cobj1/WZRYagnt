@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
-"""YOLO 检测封装：加载 ultralytics 模型，输出结构化检测结果。
+"""YOLO 检测封装：加载检测模型，输出结构化检测结果。
 
-阵营修正：小兵/塔两阵营外观几乎相同，YOLO 常混淆阵营。
-但 我方=蓝方(蓝色饰件/血条) / 敌方=红方(红色饰件/血条)，框内蓝/红像素
-占比是硬判据 → 阵营翻转修正。
+支持两种后端（按 `model_path` 后缀自动选择）：
+  1) ultralytics (.pt)：原方案的 11 类 + mm_* 小地图类模型
+     —— 阵营修正：小兵/塔两阵营外观几乎相同，YOLO 常混淆阵营。但
+        我方=蓝方(蓝色饰件/血条) / 敌方=红方(红色饰件/血条)，框内蓝/红像素
+        占比是硬判据 → 阵营翻转修正。
+  2) YOLOv5 ONNX (.onnx)：P0 替代检测器（zhongkui_r3 权重丢失后的替补，
+     见 wzry/vision/hok_yolov5.py）。8 个"通用类"(hero/soldier/tower/crystal/
+     wild_monster/dragon/Buff/grass) 已在后端内部按同一套蓝/红像素判据完成
+     阵营分流，故此处不再重复做 camp_correct；该模型没有 mm_* 类，小地图点
+     仍由规则式 MMTrackerV7 提供。
 """
 import time
 from dataclasses import dataclass, field
@@ -70,22 +77,37 @@ class Det:
     conf: float
     xyxy: List[float]          # [x1, y1, x2, y2] 像素
     center: List[float]        # [cx, cy]
+    camp_src: str = "unknown"  # v14.2 阵营判据来源: color/default/assumed/neutral/extra
+                               #   (下游"幻影敌人"过滤需要, 见 optimizer.enemy_hero_trusted)
 
     def to_dict(self):
         return {"class": self.cls, "confidence": round(float(self.conf), 4),
                 "bbox": [round(v, 1) for v in self.xyxy],
-                "center": [round(v, 1) for v in self.center]}
+                "center": [round(v, 1) for v in self.center],
+                "camp_src": self.camp_src}
 
 
 class YoloDetector:
     def __init__(self, model_path, conf=0.3, iou=0.5, device=None, half=False):
-        from ultralytics import YOLO
-        self.model = YOLO(str(model_path))
+        self.model_path = str(model_path)
         self.conf = conf
         self.iou = iou
         self.device = device or ("0" if self._cuda_ok() else "cpu")
         self.half = half
         self.last_infer_ms = 0.0
+        self.last_mm_ms = 0.0
+        self._hok = None            # YOLOv5 ONNX 后端(替代检测器)
+        self.model = None           # ultralytics YOLO 句柄(仅 .pt 后端)
+        if self.model_path.lower().endswith(".onnx"):
+            from wzry.vision.hok_yolov5 import HokYoloV5
+            self._hok = HokYoloV5(self.model_path, conf=conf, iou=iou)
+            self.backend = "hok_yolov5_onnx"
+            self.names = self._hok.names
+        else:
+            from ultralytics import YOLO
+            self.model = YOLO(self.model_path)
+            self.backend = "ultralytics"
+            self.names = getattr(self.model, "names", None)
 
     @staticmethod
     def _cuda_ok():
@@ -96,6 +118,20 @@ class YoloDetector:
             return False
 
     def detect(self, frame: np.ndarray) -> List[Det]:
+        if self._hok is not None:
+            # ONNX 替代检测器: 后端已按蓝/红像素判据完成阵营分流, 不再重复
+            # camp_correct(重复校正会把 default 兜底的框翻回去)
+            t0 = time.perf_counter()
+            raw = self._hok.detect(frame)
+            self.last_infer_ms = (time.perf_counter() - t0) * 1000.0
+            dets: List[Det] = []
+            for d in raw:
+                x1, y1, x2, y2 = (float(v) for v in d["xyxy"])
+                dets.append(Det(cls=d["cls"], conf=float(d["conf"]),
+                                xyxy=[x1, y1, x2, y2],
+                                center=[(x1 + x2) / 2, (y1 + y2) / 2],
+                                camp_src=str(d.get("camp_src", "unknown"))))
+            return hero_dedup_ui(dets)
         t0 = time.perf_counter()
         # v13.2 inference_mode: 减推理内存(不影响结果)
         try:
@@ -128,7 +164,14 @@ class YoloDetector:
     def detect_minimap(self, mm_crop: np.ndarray, conf=0.25) -> List[Det]:
         """v5.0 小地图点检测: 对 232x232 小地图裁剪跑模型, 只提取 mm_* 类。
         返回 Det(坐标=裁剪内像素), 供 mm_tracker 直接用模型红/蓝/绿点。
-        mm 类: 12 mm_red 13 mm_blue 14 mm_green (15 mm_yellow)。"""
+        mm 类: 12 mm_red 13 mm_blue 14 mm_green (15 mm_yellow)。
+
+        ONNX 替代检测器(8 通用类)没有 mm_* 类 -> 返回空列表。调用方(m2)是
+        "有结果才覆盖"的语义, 因此小地图点仍由规则式 MMTrackerV7 提供。
+        """
+        if self._hok is not None:
+            self.last_mm_ms = 0.0
+            return []
         t0 = time.perf_counter()
         out: List[Det] = []
         try:

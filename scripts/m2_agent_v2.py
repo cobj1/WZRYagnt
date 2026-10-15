@@ -14,7 +14,9 @@
 import argparse
 import json
 import math
+import queue
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +47,24 @@ MOVE_DURATION_MS = 450
 LANE_DIR_BLUE = (0.75, 0.72)   # v2.91: 发育路中心(蓝方右下), 旧(0.5,0.5)=地图中心=河道! 用户: 别待河道
 LANE_DIR_RED = (0.25, 0.28)    # v2.91: 发育路中心(红方左上镜像)
 DANGER_FRAC = 0.45
+# v14.3 战斗决策(用户批准): ①不占优不接战 ②回城必须无近敌
+ENGAGE_HP_MIN = 0.60          # 接战血量下限: 低于此值不主动开团
+ENGAGE_MAX_ENEMY = 2          # 屏内可信敌英数上限: >=3 个不打
+# v15.4 收人头窗口(这是"不占优不接战"的**唯一例外**, 消费 ui.lock_target*):
+#   锁定的那个目标已经快死(锁定目标血量 <= KILL_HP_MAX)且自己还够活着打完
+#   (KILL_SELF_HP_MIN)时, 把接战血量门槛从 ENGAGE_HP_MIN 放宽到 KILL_SELF_HP_MIN。
+#   两者缺一不可: 只看目标残血 = 无脑冲; 不看自己血量 = 送人头。敌英数上限照旧生效。
+#   锁定目标血量由 hero_hp.lock_target() 提供(真机 19 帧验证, 误差 <=1pp)。
+KILL_HP_MAX = 0.30            # 锁定目标血量 <= 它 -> 收人头窗口
+KILL_SELF_HP_MIN = 0.35       # 放宽后的接战血量门槛
+# v15.4 占优推进(消费 extra.enemy_hp_scene / ui.enemy_hp_min): 屏幕上**多个**敌人残血 =
+#   敌方整体不占优 -> 自己血量略低也允许打。只放宽接战门槛, 不改移动目标。
+PRESS_ENEMY_HP_MAX = 0.35     # 单个敌人算"残血"的线
+PRESS_MIN_LOW_ENEMIES = 2     # 至少几个残血敌人才算"敌方整体不占优"
+PRESS_SELF_HP_MIN = 0.50      # 占优推进时自己的血量门槛(比常规 0.60 低, 但高于收人头的 0.35)
+PRESS_STALE_S = 0.6           # 该读数在 0.5s 节流块里 -> 允许沿用的最大陈旧秒数(防许可每拍闪断)
+RECALL_ENEMY_CLEAR_FRAC = 0.65  # 回城门禁: 最近(可信)敌英/敌红条必须比这个更远才回城
+                              #   (原 0.45 危险圈太松 -> 实测 recall_interrupted×2)
 # 宸辨柟娉夋按鏂瑰悜堝皬鍦板浘鍧愭爣夛細钃濇柟宸笅 / 绾柟鍙充笂堥暅鍍忥級
 FOUNTAIN_DIR_BLUE = (0.12, 0.88)
 FOUNTAIN_DIR_RED = (0.88, 0.12)
@@ -146,6 +166,7 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
     enemies, minions, turrets, allies, ally_minions, monsters = [], [], [], [], [], []
     ally_turrets = []
     selfs = []                      # v2.45 self collection
+    from wzry.decision.optimizer import enemy_hero_trusted as _eh_trusted   # v14.2
     for u in units:
         cls = str(u.get("cls", ""))
         scr = u.get("screen") or [0.5, 0.5, 0.0, 0.0]
@@ -165,7 +186,13 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
         if cls == "self":
             pass   # v2.46 鍏睆鑷繁涓嶆娴涓嶆樉绀 鑷繁蹇呭湪灞忓箷涓, 浠皬鍦板浘缁跨幆涓哄噯
         elif cls == "enemy_hero":
-            enemies.append(scr)
+            # v14.2 幻影敌人过滤(用户问题③"技能空放"): 阵营判据不显著(camp_src="default":
+            #   遮挡/远景/技能特效下框内蓝/红像素占比判不出来, 后端保守兜底判成敌人)或
+            #   置信不足(conf<0.55)的框不进 enemies -> 不触发 skill1/skill2/attack/连招,
+            #   避免朝空处放技能。skill 是 m2 规则层直接放行(solve 白名单不覆盖), 故
+            #   过滤必须做在这里, 而非 optimizer._feat。
+            if _eh_trusted(u):
+                enemies.append(scr)
         elif cls == "enemy_minion":
             minions.append(scr)
         elif cls == "enemy_turret":
@@ -227,6 +254,58 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
     #          v2.98 红条独证不释放技能: 暴君/红buff等野怪红条也是红条且yolo常漏检
     #          -> 无 yolo enemy_hero 框时, 红条只算"疑似敌英", 不触发任何技能/出钩
     _has_yolo_eh = bool(enemies)
+    # ---- v14.3 战斗决策(用户批准): 不占优不接战 ----
+    # 实测 180s 完整对局: 3 死 0 英雄击杀、回城被打断 2 次 -> "看到谁就打谁"。
+    # 门槛: HP>=ENGAGE_HP_MIN 且 屏内**可信**敌英 <=ENGAGE_MAX_ENEMY 才允许接战;
+    #       不满足且近敌已进技能射程 -> 直接朝反方向撤(map_move), 不生成任何技能候选。
+    _ui_now = state_dict.get("ui") or {}
+    _hp_e = _ui_now.get("hp")
+    _hp_e = float(_hp_e) if (_hp_e is not None and _hp_e == _hp_e
+                             and 0.0 <= float(_hp_e) <= 1.0) else 0.6
+    _ne0 = nearest(enemies)
+    _d_ne0 = dist_width(_ne0[0], _ne0[1]) if _ne0 else 9.9
+    # v15.4 两个"占优"例外(消费读数): 缺读数一律按常规门槛走 -> **不放宽**。
+    #   ① 收人头窗口: 锁定的那个目标快死(ui.lock_target_hp <= KILL_HP_MAX) + 自己还够活。
+    #   ② 占优推进:   屏幕上**多个**敌人残血(extra.enemy_hp_scene 里 <= PRESS_ENEMY_HP_MAX
+    #      的个数 >= PRESS_MIN_LOW_ENEMIES) = 敌方整体不占优 -> 允许自己血量略低也打。
+    #      它只放宽接战门槛, **不改移动目标**(压线/推进属于另一层决策, 不在这里动)。
+    _lt_hp = _ui_now.get("lock_target_hp")
+    _kill_confirm = bool(_ui_now.get("lock_target") and _lt_hp is not None
+                         and float(_lt_hp) <= KILL_HP_MAX and _hp_e >= KILL_SELF_HP_MIN)
+    # ② 的读数(extra.enemy_hp_scene)在 0.5s 节流块里, 而 state_dict 每拍重建 -> 被跳过的拍
+    #   上它是缺失的; 直接用许可会每拍闪断(英雄走一步撤一步)。按 hp/mp 回填的同一思路做**有界缓存**:
+    #   读到新值时记 n_low + 时间戳, 缺失时在 PRESS_STALE_S 内沿用(<=0.6s 陈旧远好过闪烁)。
+    _scene = (state_dict.get("extra") or {}).get("enemy_hp_scene")
+    if _scene:
+        _n_low = sum(1 for r in _scene if r is not None and float(r) <= PRESS_ENEMY_HP_MAX)
+        cooldowns["n_low_enemies"], cooldowns["n_low_t"] = _n_low, now
+    else:
+        _n_low = (int(cooldowns.get("n_low_enemies") or 0)
+                  if (now - float(cooldowns.get("n_low_t", -9e9))) <= PRESS_STALE_S else 0)
+    _press = bool((not _kill_confirm) and _n_low >= PRESS_MIN_LOW_ENEMIES
+                  and _hp_e >= PRESS_SELF_HP_MIN)
+    if _kill_confirm and (now - float(cooldowns.get("kill_log_t", -9e9)) > 5.0):
+        cooldowns["kill_log_t"] = now
+        print(f"[kill] 锁定目标残血 {float(_lt_hp):.2f} + 自己 HP {_hp_e:.2f}"
+              f" -> 接战门槛放宽到 {KILL_SELF_HP_MIN}")
+    if _press and (now - float(cooldowns.get("press_log_t", -9e9)) > 5.0):
+        cooldowns["press_log_t"] = now
+        print(f"[press] 敌方残血 {_n_low} 个(<= {PRESS_ENEMY_HP_MAX}) + 自己 HP {_hp_e:.2f}"
+              f" -> 接战门槛放宽到 {PRESS_SELF_HP_MIN}")
+    _engage_floor = (KILL_SELF_HP_MIN if _kill_confirm
+                     else PRESS_SELF_HP_MIN if _press else ENGAGE_HP_MIN)
+    # 接战类动作统一用这个 reason(便于日志/复盘区分"常规接战"与两个占优例外)
+    _engage_reason = ("kill_confirm_attack" if _kill_confirm
+                      else "press_advantage_attack" if _press else "engage_enemy")
+    _engage_ok = (_hp_e >= _engage_floor and len(enemies) <= ENGAGE_MAX_ENEMY)
+    # v14.3 回城门禁: 最近(可信)敌英/敌红条都得够远, 否则读条中必被近身打断
+    _recall_clear = _d_ne0 > RECALL_ENEMY_CLEAR_FRAC and not any(
+        math.hypot(b[0] / w - 0.5, (b[1] / h - 0.5) * aspect) <= RECALL_ENEMY_CLEAR_FRAC
+        for b in enemy_bars)
+    if (not _engage_ok) and _ne0 is not None and _d_ne0 <= SKILL2_RANGE_FRAC:
+        _ax_e, _ay_e = _away_map(state_dict, _ne0[0], _ne0[1], k=0.20)
+        return {"type": "map_move", "nx": _ax_e, "ny": _ay_e,
+                "reason": "disengage_retreat"}
     if _has_yolo_eh or enemy_bars:
         _nq0 = nearest(enemies) if enemies else None
         _dq0 = dist_width(_nq0[0], _nq0[1]) if _nq0 else 0.90
@@ -236,7 +315,7 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
         _s1_ = _s_.get("1") or {}
         # v10.5 用户铁律: 碰到敌人 = 先二技能勾! 大招 ONLY 在勾中后 combo!
         #   没勾到 = 只用一技能消耗 (大招绝不先手)
-        if _nq0 is not None and _dq0 <= SKILL2_RANGE_FRAC \
+        if _engage_ok and _nq0 is not None and _dq0 <= SKILL2_RANGE_FRAC \
                 and ready("skill2_t", SKILL2_THROTTLE_S) and _s2_.get("unlocked") is not False:
             cooldowns["skill2_t"] = now
             cooldowns["skill"] = now
@@ -244,14 +323,14 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
             cooldowns["hook_anchor_dist"] = _dq0
             return {"type": "skill", "id": 2, "mode": "tap",
                     "reason": "enemy_in_skill2_range"}
-        if ready("skill1_t", SKILL1_THROTTLE_S) and _s1_.get("unlocked") is not False \
-                and _has_yolo_eh:
+        if _engage_ok and ready("skill1_t", SKILL1_THROTTLE_S) \
+                and _s1_.get("unlocked") is not False and _has_yolo_eh:
             cooldowns["skill1_t"] = now
             cooldowns["skill"] = now
             return {"type": "skill", "id": 1, "mode": "tap", "reason": "enemy_hero_near"}
-        if ready("attack_t", ATTACK_THROTTLE_S) and _has_yolo_eh:
+        if _engage_ok and ready("attack_t", ATTACK_THROTTLE_S) and _has_yolo_eh:
             cooldowns["attack_t"] = now
-            return {"type": "attack", "priority": "free", "reason": "engage_enemy"}
+            return {"type": "attack", "priority": "free", "reason": _engage_reason}
 
     # ---- v2.13 鍥炲煄璇绘潯淇濇姢氬洖鍩庡悗 RECALL_ACTIVE_S 鍐呬笉鎵鍏朵粬鍔綔 ----
     # 堜慨澶嶏細鎭閿绉诲姩鍦洖鍩庤鏉腑鎵 -> 鍥炲煄琚墦鏂紝琛涓鐩村洖涓嶆弧    # 渚嬪氭晫浜绾潯杩戣韩堝嵄闄級鏃朵腑鏂洖鍩庯紝璧版甯稿喅绛栵紙閫冭窇/鍙嶅嚮    if now - float(cooldowns.get("recall_t", 0.0)) < RECALL_ACTIVE_S:
@@ -301,7 +380,7 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
             return {"type": "map_move", "nx": _ax_low, "ny": _ay_low,
                     "reason": "low_hp_fallback_safe"}
         # 安全: 回城(自动回泉水补满)
-        if ready("recall_t", 20.0):
+        if _recall_clear and ready("recall_t", 20.0):
             cooldowns["recall_t"] = now
             return {"type": "recall", "reason": "low_hp_recall_first"}
     # ---- brainless fire (skills if enemy present) ----
@@ -396,15 +475,16 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
             return {"type": "skill", "id": 2, "mode": "tap",
                     "reason": "enemy_in_skill2_range"}
         # 一技能消耗(平时也允许, 敌英在一技能范围内)
-        if not in_ult and ready("skill1_t", SKILL1_THROTTLE_S) \
+        if _engage_ok and not in_ult and ready("skill1_t", SKILL1_THROTTLE_S) \
                 and _nq is not None and _dq <= SKILL1_RANGE_FRAC \
                 and _s1q.get("unlocked") is not False and _has_yolo_eh_q:
             cooldowns["skill1_t"] = now
             cooldowns["skill"] = now
             return {"type": "skill", "id": 1, "mode": "tap", "reason": "enemy_hero_near"}
-        # v2.65 鈶鏁屼汉瀛樺湪辨櫘鏀        if ready("attack_t", ATTACK_THROTTLE_S) and _has_yolo_eh_q:
+        # v2.65 ②敌人存在即普攻
+        if _engage_ok and ready("attack_t", ATTACK_THROTTLE_S) and _has_yolo_eh_q:
             cooldowns["attack_t"] = now
-            return {"type": "attack", "priority": "free", "reason": "engage_enemy"}
+            return {"type": "attack", "priority": "free", "reason": _engage_reason}
         # v2.71 鎶鑳介棬鑷洕(1s鑺傛祦): 鏈夋晫璇佹嵁鍗存湭鍑轰换浣曟妧鑳芥椂鎵撳嵃鍏抽敭閲        if enemies or enemy_bars:
             _sg = cooldowns.get("sg_t", 0.0)
             if now - float(_sg) > 1.0:
@@ -428,7 +508,7 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
             return {"type": "map_move", "nx": _ax_hp, "ny": _ay_hp,
                     "reason": "low_hp_fallback_safe"}
         # 残血 + 安全: 回城(自动回泉水), 满血后回来
-        if ready("recall_t", 20.0):
+        if _recall_clear and ready("recall_t", 20.0):
             cooldowns["recall_t"] = now
             cooldowns["low_hp_recall_t"] = now   # 标记(回城后满血再出)
             return {"type": "recall", "reason": "low_hp_safe_recall_15"}
@@ -444,12 +524,13 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
         nt_ally = nearest(ally_turrets)
         under_ally_tower = (nt_ally is not None
                             and dist_width(nt_ally[0], nt_ally[1]) < ALLY_TOWER_RECALL_FRAC)
-        if not dangerous and under_ally_tower and ready("recall_t", RECALL_THROTTLE_S):
+        if _recall_clear and not dangerous and under_ally_tower \
+                and ready("recall_t", RECALL_THROTTLE_S):
             cooldowns["recall_t"] = now
             return {"type": "recall", "reason": "low_hp_safe_recall"}
         # 涓嶅湪濉斾笅 -> 鏈嚜瀹跺璧帮紙鏃犲鍙鍒欐湞娉夋按> 忓湴鍥剧偣鍑 鑷娉夌偣
         # 残血安全: 回城(自动回泉水), 满血再出
-        if ready("recall_t", RECALL_THROTTLE_S):
+        if _recall_clear and ready("recall_t", RECALL_THROTTLE_S):
             cooldowns["recall_t"] = now
             return {"type": "recall", "reason": "low_hp_safe_recall"}
 
@@ -546,7 +627,7 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
 #                # 閽瓙閬尅妫鏌紙鐢埛瑙勫垯 007夛細鏁屼汉杩炵嚎"绮楃洿绾涓婃湁鏁屽叺/閲庢-> 涓嶉挬
                 blocked = _hook_path_blocked(
                     ne, minions + monsters, HOOK_BLOCK_FRAC, dist_width, aspect)
-                if not blocked:
+                if _engage_ok and not blocked:
                     cooldowns["skill2_t"] = now
                     cooldowns["skill"] = now
                     cooldowns["hook_pending"] = now
@@ -575,9 +656,9 @@ def decide(state_dict: dict, cooldowns: dict) -> dict:
         ne = nearest(enemies)
         # v2.21 鎺垬寮曟搸氭晫浜哄湪 0.35 灞忓鍐-> 浼樺厛璐磋韩缂犳枟(绉诲姩+鏀诲嚮閿繛鍙
         d_ne = dist_width(ne[0], ne[1])
-        if d_ne < ENGAGE_FRAC and ready("attack_t", ATTACK_THROTTLE_S):
+        if _engage_ok and d_ne < ENGAGE_FRAC and ready("attack_t", ATTACK_THROTTLE_S):
             cooldowns["attack_t"] = now
-            return {"type": "attack", "priority": "free", "reason": "engage_enemy"}
+            return {"type": "attack", "priority": "free", "reason": _engage_reason}
         target = (ne[0], ne[1])
         reason = "chase_enemy"
     else:
@@ -780,6 +861,65 @@ def update_cooldowns(action: dict, cooldowns: dict, now: float):
             update_cooldowns(sub, cooldowns, now)
 
 
+def _policy_action_to_m2(pa: dict) -> dict:
+    """BCNet 输出 -> m2 动作 dict（与 apply_action 口径一致）。
+
+    move 走 **target 路径**：规则数据训出来的模型 target 有监督、theta 没有
+    （theta 由执行器在真机上用 self_est 现算），所以交给 map_move 而不是直接给摇杆角。
+    """
+    a = pa.get("act_name")
+    if a == "move":
+        tgt = pa.get("target")
+        if isinstance(tgt, (list, tuple)) and len(tgt) == 2:
+            return {"type": "map_move", "nx": max(0.02, min(0.98, float(tgt[0]))),
+                    "ny": max(0.02, min(0.98, float(tgt[1]))), "reason": "bc:target"}
+        return {"type": "move", "theta": float(pa.get("theta", 0.0)),
+                "r": float(pa.get("r", 0.5)), "duration_ms": MOVE_DURATION_MS,
+                "reason": "bc:theta"}
+    if a in ("skill1", "skill2", "skill3"):
+        return {"type": "skill", "id": int(a[-1]), "mode": "tap", "reason": f"bc:{a}"}
+    if a == "attack":
+        return {"type": "attack", "priority": "free", "reason": "bc:attack"}
+    if a in ("recall", "restore", "summoner"):
+        return {"type": a, "reason": f"bc:{a}"}
+    return {"type": "none", "reason": f"bc:{a}"}
+
+
+def _policy_guard(cand: dict, state_dict: dict, cooldowns: dict, now: float):
+    """BC 接管时的安全层（与规则栈同源）：幻影敌人过滤 + 接战门槛 + 回城门禁 + 冷却节流。
+
+    模型输出**必须**过这一层；任何一项不满足就丢弃 -> 本拍退回规则动作。
+    返回 (ok, reason)。
+    """
+    if not cand or cand.get("type") == "none":
+        return False, "none/空动作"
+    t = cand.get("type")
+    ui = state_dict.get("ui") or {}
+    hp = float(ui.get("hp") or 1.0)
+    enemies = [u for u in (state_dict.get("units") or [])
+               if u.get("cls") == "enemy_hero"
+               and u.get("camp_src") != "default"
+               and float(u.get("conf", 1.0)) >= 0.55]
+    _hp_min = float(globals().get("ENGAGE_HP_MIN", 0.60))
+    if t in ("skill", "attack"):
+        if not enemies:
+            return False, "无可信敌人(幻影过滤)"
+        if t == "skill":
+            sid = int(cand.get("id") or 0)
+            thr = 3.0 if sid == 2 else 1.5
+            if now - float(cooldowns.get(f"skill{sid}_t", 0.0)) <= thr:
+                return False, f"skill{sid} 冷却节流"
+        elif now - float(cooldowns.get("attack_t", 0.0)) <= 0.8:
+            return False, "attack 节流"
+        if hp < _hp_min:
+            return False, f"接战门槛未过(hp={hp:.2f}<{_hp_min})"
+    if t == "recall" and now - float(cooldowns.get("recall_t", 0.0)) <= 20.0:
+        return False, "回城节流"
+    if t == "map_move" and now - float(cooldowns.get("skill", 0.0)) < SKILL_DEBOUNCE_S:
+        return False, "技能后防抖"
+    return True, "ok"
+
+
 def _async_result_detect(frame, reward):
     """decoded docstring."""
     import threading as _th
@@ -839,10 +979,32 @@ def apply_action(ex, action: dict, cooldowns: dict):
     now = time.time()
     t = action.get("type")
     if t == "map_move":
-        # v2.27 鐜嬭鐐瑰嚮忓湴鍥捐嚜鍔綅绉杈呭姪绉诲姩: 鐩存帴鐐瑰皬鍦板浘鐩爣
-        px = int(float(action.get("nx", 0.5)) * 242)
-        py = int(float(action.get("ny", 0.5)) * 242)
-        ex.tap(px, py, source="policy")
+        # v14.2 点小地图在真机不移动英雄(只移镜头) -> 改走摇杆推杆朝向目标。
+        _nx, _ny = float(action.get("nx", 0.5)), float(action.get("ny", 0.5))
+        _camp = cooldowns.get("camp") or "blue"
+        _s = cooldowns.get("self_est")
+        if not _s:
+            _s = BASE_BLUE if _camp == "blue" else BASE_RED
+        sx, sy = float(_s[0]), float(_s[1])
+        dx, dy = _nx - sx, _ny - sy
+        dist = math.hypot(dx, dy)
+        if dist < MAPMOVE_NEAR:
+            # v14.2 航位推算没有真实位置反馈: 估计位置一旦"到点"就再也离不开, 于是永远
+            # 不推杆 -> 英雄站立不动(实测 180s 只发 19 次 swipe, 然后被连杀 4 次、0 击杀)。
+            # 到点即重锚回本方基地, 下一拍继续朝目标推进(方向仍正确)。
+            _sb = BASE_BLUE if _camp == "blue" else BASE_RED
+            cooldowns["self_est"] = _sb
+            sx, sy = float(_sb[0]), float(_sb[1])
+            dx, dy = _nx - sx, _ny - sy
+            dist = math.hypot(dx, dy)
+        dur = int(max(MAPMOVE_MIN_MS, min(MAPMOVE_MAX_MS, dist / STICK_SPEED * 1000)))
+        if now - float(cooldowns.get("_map_t", -9.9)) < dur / 1000.0:
+            return                       # 上一次推杆尚未结束: 避免 swipe 叠发
+        ex.move(math.atan2(-dy, dx), MOVE_R, dur)     # 世界 Δ -> 摇杆方向(0=右, 逆时针)
+        cooldowns["_map_t"] = now
+        _step = STICK_SPEED * (dur / 1000.0)          # 航位推算: 自己前进 step
+        cooldowns["self_est"] = (max(0.02, min(0.98, sx + dx / dist * _step)),
+                                 max(0.02, min(0.98, sy + dy / dist * _step)))
     elif t == "move":
         ex.move(float(action.get("theta", 0.0)),
                 float(action.get("r", MOVE_R)),
@@ -866,12 +1028,107 @@ def apply_action(ex, action: dict, cooldowns: dict):
 
 
 # ---------------------------------------------------------------------------
+# v14.3 运行时塔重锚: 把 map_move 的开环航位推算变成"每经过一座塔纠一次偏"的闭环
+# ---------------------------------------------------------------------------
+TOWER_SNAP_FRAC = 0.16        # YOLO 塔框底边(塔基)距英雄屏幕锚点 < 该值 => 英雄就在这座塔上
+TOWER_SNAP_MAX_ERR = 0.25     # 估计位置离该塔超过这个距离就不吸附(防吸错塔; 约等于一条路的塔距)
+SNAP_ALREADY_EPS = 0.02       # v15.1 已在塔上(=误差极小) -> 视为无需纠偏，直接退出
+SNAP_SAME_TOWER_COOLDOWN_S = 6.0   # v15.1 同一座塔重复吸附的冷却（偏差不够大时不重复吸）
+
+
+def _snap_self_est_to_tower(frame, dets, mm, cooldowns, w=1280.0, h=720.0):
+    """英雄走到某座塔上时, 把航位推算的 self_est 吸附到该塔的小地图坐标(闭环纠偏)。
+
+    为什么需要: map_move 用 STICK_SPEED 航位推算"自己在哪", STICK_SPEED 只要不准(或
+      中途撞墙/被拉回), 估计就越漂越远 -> 目标方向算错 -> 英雄原地打转/撞墙。真机实测
+      小地图绿点恒定在泉水图标处, **不随英雄移动**(满杆推 15.3s 绿点只挪 0.048), 所以
+      自身位置无法直接观测, 只能在"经过已知塔"时校正。
+    判据: YOLO 塔框的底边(塔基落地处)贴到英雄屏幕锚点(self_hp_mp 的 hero_pos, 王者镜头
+      把英雄放在屏幕中部偏下, 不是屏幕中心); 且该塔在小地图上仍存活(MMTrackerV7 的
+      towers 只输出存货塔)。吸附目标 = 存活塔里离当前估计最近的那座。
+    返回 (x, y, 估计误差) 便于日志核对; 未命中返回 None。
+    """
+    if not (mm and mm.get("found")):
+        return None
+    towers = mm.get("towers") or []
+    if not towers:
+        return None
+    try:
+        from wzry.vision.self_bars import self_hp_mp
+        _hp, _mp, _pos = self_hp_mp(frame)
+    except Exception:
+        return None
+    if not _pos:
+        return None
+    ax, ay = _pos[0] / w, _pos[1] / h
+    hit = None
+    for d in (dets or []):
+        if str(getattr(d, "cls", "")) not in ("enemy_turret", "ally_turret"):
+            continue
+        bx = (d.xyxy[0] + d.xyxy[2]) / 2.0 / w
+        by = d.xyxy[3] / h                     # 塔框底边 = 塔基
+        dist = math.hypot(bx - ax, (by - ay) * (h / w))
+        if dist < TOWER_SNAP_FRAC and (hit is None or dist < hit[0]):
+            hit = (dist, bx, by)
+    if hit is None:
+        return None
+    est = cooldowns.get("self_est")
+    if not est:
+        est = BASE_BLUE if (cooldowns.get("camp") or "blue") == "blue" else BASE_RED
+    t = min(towers, key=lambda p: math.hypot(p[0] - est[0], p[1] - est[1]))
+    d_est = math.hypot(t[0] - est[0], t[1] - est[1])
+    if d_est > TOWER_SNAP_MAX_ERR:
+        return None
+    _key = (round(float(t[0]), 2), round(float(t[1]), 2))
+    _now = time.time()
+    # v15.1 修"重锚空转"：真机实测日志每 0.3s 刷一次同一座塔、偏差恒为 0 —— 因为
+    #   self_est 被吸到塔上后下一次 d_est 就是 0，还会再"重锚"一次；而每次都要调
+    #   self_hp_mp（全画面血条检测）-> 主循环被拖到 ~2.8fps、英雄推进也失去反馈。
+    #   ① 已在该塔上 -> 无需纠偏，直接退出（不再空转、不再白跑 self_hp_mp）
+    if d_est < SNAP_ALREADY_EPS:
+        return None
+    #   ② 同一座塔的重复吸附加冷却（偏差不够大时不重复吸，避免把估计钉死在塔上）
+    if (cooldowns.get("snap_key") == _key
+            and _now - float(cooldowns.get("snap_key_t", 0.0)) < SNAP_SAME_TOWER_COOLDOWN_S
+            and d_est < TOWER_SNAP_MAX_ERR * 0.5):
+        return None
+    cooldowns["self_est"] = (_key[0], _key[1])
+    cooldowns["snap_key"], cooldowns["snap_key_t"] = _key, _now
+    return (round(_key[0], 3), round(_key[1], 3), round(d_est, 3))
+
+
+# ---------------------------------------------------------------------------
 # 瀹炴椂鍒嗘瀽鏍囨敞坴2.15: 姣忓抚鍏绱犳爣娉-> temp/live_annot/屼緵浜哄伐鏍告煡 AI 鐞嗚# ---------------------------------------------------------------------------
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
 # recovered consts (from v3.1)
 RECALL_THROTTLE_S = 20.0
 RECALL_ACTIVE_S = 8.0
+# v14.2 移动通道修正: 实测"点小地图"在真机**不移动英雄**(点前后整屏均差仅 7.8, 几乎无
+#   变化), 而"摇杆拖动"有效(均差 70.0, 整屏滚动) —— 王者的小地图只移动镜头, 不走人。
+#   故 map_move 由"点小地图目标点"改为"摇杆推杆"。相机朝向固定且与小地图同向, 世界方向
+#   (小地图 Δnx,Δny) 即摇杆屏幕方向。theta 用 executor 约定(0=右, 逆时针, y 向上)。
+#   "自己"在小地图上的位置无法从视觉可靠定位(绿点=自家基地固定图标), 用航位推算:
+#   从本方基地出发, 按每次推杆时长前进。方向为主 + 定时重发纠偏, 偏差可接受。
+STICK_SPEED = 0.018           # 满杆 1 秒 -> 小地图归一化位移(在 map_move 实际工作点 r=0.8 实测)
+                              # 真机标定 2026-10-15 (英雄=钟馗, 蓝方, scripts/calib_stick_speed.py):
+                              #   ① 干净锚点(新开局 0:08 英雄刚在泉水) 沿下路满杆直推 900ms/杆:
+                              #      #1 到 0.150 用 9.0s -> 0.0167 (同塔另一次 8.1s -> 0.0186)
+                              #   ② 残局里从基地(离泉水约 0.03~0.05, 锚点偏)测的 2 点过原点拟合 = 0.0214,
+                              #      锚点偏会让距离偏大 -> 该值偏高, 以 ① 为准则取 0.018。
+                              #   结论: 真值区间 0.017~0.020, 取 0.018。
+                              # 与旧值 0.045 的关系: 0.045 是"满舵"量级; ActionExecutor.stick_radius=0.12
+                              #   -> r=1.0 只有 86px(帧空间), 而校准表 dir_* 满杆点约 130~160px, 故 r=0.8
+                              #   只到满舵 ~50%, 0.045*0.5≈0.0225 与实测同量级 -> 旧值其实是"满舵数"被
+                              #   当成了 r=0.8 的数, 这才是"英雄推进慢/到点太早"的一个来源。
+                              # 移速随英雄/出装/减速效果变化: 换英雄或改 r 都要重标, 或 CLI 覆盖:
+                              #   --stick-speed <值>; 标定法见 scripts/calib_stick_speed.py
+MAPMOVE_MIN_MS = 350
+MAPMOVE_MAX_MS = 900
+MAPMOVE_NEAR = 0.04           # 距目标 < 该值视为已到达, 停推(避免原地抖)
+BASE_BLUE = (0.074, 0.88)     # 本方泉水在小地图上的归一化位置(蓝方; 真机实测 2026-10-14:
+                              #   小地图绿点恒定于此 = 泉水治疗圈图标, 不是英雄; 红方镜像)
+BASE_RED = (0.926, 0.12)
 TURRET_SAFE_FRAC = 0.55
 TURRET_THREAT_FRAC = 0.45
 ENGAGE_FRAC = 0.30
@@ -1043,31 +1300,139 @@ def format_decision(action: dict) -> str:
 
 
 def main():
+    global STICK_SPEED          # v14.2 (声明须在任何使用之前)
     ap = argparse.ArgumentParser(description="doc")
     ap.add_argument("--capture", default="desktop", choices=["desktop", "screencap", "scrcpy"],
                     help="frame source: desktop/screencap/scrcpy")
     ap.add_argument("--seconds", type=float, default=120.0, help="run seconds")
     ap.add_argument("--forever", action="store_true",
                     help="opt")
-    ap.add_argument("--model", default=str(ROOT / "runs" / "detect" / "zhongkui_r3"
-                                           / "weights" / "best.pt"),
+    # v14.0 默认检测器改为 P0 替代模型(YOLOv5 ONNX, 8 通用类) —— 原 zhongkui_r3
+    # 权重已丢失; 传 --model 指向 .pt 可回退 ultralytics 11 类后端
+    ap.add_argument("--model", default=str(ROOT / "runs" / "detect" / "hok_yolov5"
+                                           / "hok_yolov5s.onnx"),
                     help="opt")
     ap.add_argument("--action", action="store_true",
                     help="opt")
     ap.add_argument("--no-action", dest="no_action", action="store_true",
                     help="opt")
     ap.add_argument("--save", action="store_true", help="opt")
+    # v15.1 取证用：关键帧落盘间隔 + "看到敌方英雄就额外落一帧"
+    #   （顶部目标头像只在锁定/攻击敌方时出现，5s 节流会正好错过那个瞬间）
+    ap.add_argument("--frame-every", type=float, default=5.0, help="关键帧间隔秒(默认5)")
+    ap.add_argument("--frame-on-enemy", action="store_true",
+                    help="检测到敌方英雄时额外落一帧(取证目标头像/敌方血条)")
+    ap.add_argument("--hunt", action="store_true",
+                    help="主动找敌: 看不见敌人且小地图有红点时, 无视走廊约束径直去找(默认关)")
+    # v15.1 UI导航/信息查询层（与主战斗感知解耦的支线）：
+    #   off=零改动 / read=只读游戏自动弹出的面板(阵亡回放, 零点击) / full=允许点击打开面板
+    ap.add_argument("--ui-nav", default="off", choices=["off", "read", "full"],
+                    help="面板类信息查询: off/read/full")
     ap.add_argument("--detect-hz", type=float, default=10.0, help="opt")
+    ap.add_argument("--stick-speed", type=float, default=STICK_SPEED,
+                    help="满杆 1 秒的小地图归一化位移(默认=真机标定值, 见 "
+                         "scripts/calib_stick_speed.py; 移速随英雄/出装变化)")
     ap.add_argument("--show", action="store_true", help="opt")
+    ap.add_argument("--laya", default="off", choices=["off", "shadow", "ensemble"],
+                    help="opt")
+    ap.add_argument("--laya-model", default=None, help="opt")
+    ap.add_argument("--laya-beta", type=float, default=0.5, help="opt")
+    # v15.0 BCNet 策略接线（与 --laya 同一套 shadow 模式）：
+    #   off=零改动 / shadow=每拍跑模型并落盘、**不改动作流** / bc=接管（仍必须过安全层）
+    ap.add_argument("--policy", default="off", choices=["off", "shadow", "bc"], help="opt")
+    ap.add_argument("--policy-checkpoint", default=None, help="BCNet/BCNetMem 权重(.pt)")
+    ap.add_argument("--freeze-weights", action="store_true", help="opt")
+    # v14.2 ESP32 HID 桥（真机路线）: 板子插手机 USB 口当 HID 触摸屏, 电脑走 Wi-Fi 控制。
+    # 默认 adb(驱动 MuMu 模拟器); 要打真机就 --backend esp32 并给板子地址。
+    ap.add_argument("--backend", default="adb", choices=["adb", "esp32"],
+                    help="执行通道: adb(MuMu) / esp32(真机 HID 桥)")
+    ap.add_argument("--board-host", default=None, help="ESP32 板子的 Wi-Fi 地址(backend=esp32 必填)")
+    ap.add_argument("--board-port", type=int, default=7300, help="板子 TCP 端口(须与固件 BRIDGE_PORT 一致)")
+    ap.add_argument("--board-mode", default="touch", choices=["touch", "mouse"],
+                    help="须与烧的固件一致(推荐 touch=多点触摸屏)")
+    ap.add_argument("--board-size", default="1080x2340",
+                    help="手机物理分辨率 WxH, 须与固件 TOUCH_SURFACE_W/H 一致")
     args = ap.parse_args()
 
     do_action = bool(args.action) and not args.no_action
+    freeze_weights = bool(getattr(args, "freeze_weights", False))
+    STICK_SPEED = float(args.stick_speed)      # v14.2 CLI 覆盖(apply_action 读模块全局)
+    _laya = None  # v14.0 LayaScorer 句柄(finally 里 stop + 输出统计, P1 门槛: 异常数=0)
+
+    # v14.0 Laya 打分器接线 (laya-fusion-plan C3): off=零改动; shadow=仅记录; ensemble=混合排序
+    if getattr(args, "laya", "off") != "off":
+        from wzry.decision import optimizer as _opt_laya
+        from wzry.decision.laya_scorer import LayaScorer as _LayaScorer
+        _laya = _LayaScorer(mode=args.laya, beta=float(args.laya_beta),
+                            model_path=args.laya_model)
+        _opt_laya.set_scorer(_laya, beta=float(args.laya_beta), mode=args.laya)
+        _laya.start()
+        print(f"[Laya] mode={args.laya} beta={args.laya_beta} "
+              f"model={args.laya_model or 'default'}")
 
     from wzry.calib import load_calibration
     from wzry.capture.scrcpy_stream import ScrcpyStreamCapture
     from wzry.data.collector import MatchRecorder
     from wzry.state.fuser import build_state
     from wzry.state.match_state import MatchPhase, MatchStateMachine
+    # ---- v15.0 BCNet 策略接线 + 事件记忆层 + Hero Profile ----
+    _policy = None
+    _policy_mode = getattr(args, "policy", "off")
+    _policy_log = ROOT / "runs" / "bc" / "policy_shadow.jsonl"
+    if _policy_mode != "off":
+        if not getattr(args, "policy_checkpoint", None):
+            print("[policy] 未给 --policy-checkpoint -> 等价 off")
+            _policy_mode = "off"
+        else:
+            try:
+                from wzry.policy.inference import BCNetInference as _BCInf
+                _policy = _BCInf(args.policy_checkpoint)
+                print(f"[policy] mode={_policy_mode} ckpt={args.policy_checkpoint} "
+                      f"memory={_policy.has_memory}")
+            except Exception as _pe:
+                print(f"[policy] 加载失败 -> 等价 off: {type(_pe).__name__}: {_pe}")
+                _policy, _policy_mode = None, "off"
+    from wzry.memory.event_log import EventLog as _EventLog
+    _events = _EventLog(persist=bool(args.save))
+    # ---- v15.1 UI导航/信息查询层（按 wzry/uiquery/panel.py 的接口）：
+    #   点击=执行层 UI 触发动作 / 面板=辅助UI感知 / 内容回填状态层+记忆层。
+    #   模态锁保证"同一时刻只有一个面板占用整屏"，且 run() 必定 close + release。
+    _uiq = None
+    _is_panel_open = None
+    _uiq_mode = getattr(args, "ui_nav", "off")
+    if _uiq_mode != "off":
+        try:
+            from wzry.uiquery.panel import PanelNavigator as _PanelNav
+            from wzry.uiquery.panel import is_panel_open as _ipo
+            _is_panel_open = _ipo
+            _btns = ((json.loads((ROOT / "configs" / "calibration_absolute.json")
+                                 .read_text(encoding="utf-8-sig"))).get("panel_buttons") or {})
+            _uiq = _PanelNav(tap=getattr(ex, "tap", None), taps=_btns, timeout=3.0)
+            print(f"[ui-nav] mode={_uiq_mode} panel_buttons={list(_btns.keys()) or '无'}"
+                  f"（无标定则只读游戏自动弹出的面板）")
+        except Exception as _ue:
+            print(f"[ui-nav] 初始化失败(不影响主链): {type(_ue).__name__}: {_ue}")
+    _profile = None
+    try:
+        from wzry.decision import hero_profile as _hp0
+        _profile = _hp0.load("zhongkui")
+        if _profile:
+            for _sid in (1, 2, 3):
+                _sk = (_profile.get("skills") or {}).get(str(_sid)) or {}
+                _cd = _sk.get("max_cd_s")
+                if not _cd:
+                    try:
+                        from wzry.knowledge import skill_cd_prior
+                        _cd = skill_cd_prior(_sk.get("name"), slot=_sid) if _sk.get("name") else None
+                    except Exception:
+                        _cd = None
+                if _cd:
+                    _events.set_max_cd(_sid, _cd)
+            print(f"[profile] {_profile.get('hero')} 加点={_profile.get('level_order')} "
+                  f"出装 {len((_profile.get('items') or {}).get('route') or [])} 件 "
+                  f"(status={_profile.get('status')})")
+    except Exception as _pf:
+        print(f"[profile] 加载失败(不影响运行): {type(_pf).__name__}: {_pf}")
     from wzry.vision.detector import YoloDetector
     from wzry.vision.mm_tracker_v7 import MMTrackerV7
 
@@ -1127,7 +1492,8 @@ def main():
                     print(f"[自动学习守护] err {_e3}")
                     import time as _tg2
                     _tg2.sleep(120)
-        _thg.Thread(target=_auto_learn_watch, daemon=True).start()
+        if not freeze_weights:  # v14.0 --freeze-weights: A/B 评估期间冻结规则权重
+            _thg.Thread(target=_auto_learn_watch, daemon=True).start()
     except Exception as _e4:
         print(f"[自动学习守护] init err {_e4}")
 
@@ -1149,13 +1515,42 @@ def main():
 
     if do_action:
         from wzry.action.executor_v2 import ActionExecutor
-        ex = ActionExecutor()
-        print("鍔綔妯紡: 鎵-action岀湡鏈鸿鎽革級")
+        # v14.0 原始触摸事件单独落盘(data/action_events.jsonl): 便于核对
+        # "帧坐标 -> 设备像素"换算是否真的把触点送到正确位置(决策流 actions.jsonl
+        # 只记 m2 语义动作 map_move{nx,ny}, 看不到实际发送的设备坐标)
+        _evlog = ROOT / "data" / "action_events.jsonl"
+        if args.backend == "esp32":
+            # v14.2 真机通道: 板子当 HID 触摸屏, 电脑走 Wi-Fi。window_coords=True
+            # 让板子执行器也吃 1280x720 帧坐标(校准表/上层都在这个空间)。
+            from wzry.control.esp32_hid import Esp32HidExecutor
+            if not args.board_host:
+                raise SystemExit("--backend esp32 需要 --board-host <板子IP>")
+            _bw, _bh = (int(v) for v in str(args.board_size).lower().split("x"))
+            _board = Esp32HidExecutor(host=args.board_host, port=args.board_port,
+                                      mode=args.board_mode, device_size=(_bw, _bh),
+                                      event_log=_evlog, window_coords=True)
+            try:
+                _hello = _board.connect()
+            except OSError as _e:      # 连接超时/被拒 -> 清晰提示, 不抛裸 Traceback
+                raise SystemExit(f"连不上板子 {args.board_host}:{args.board_port} ({_e})"
+                                 "（先确认板子已连 Wi-Fi 且固件在跑）")
+            if _hello is None:
+                raise SystemExit(f"板子 {args.board_host}:{args.board_port} 未按约定上报 hello"
+                                 "（确认烧的是 firmware/esp32_hid_* 固件）")
+            ex = ActionExecutor(_board)
+            print(f"执行模式: ESP32 HID 桥 {args.board_host}:{args.board_port} "
+                  f"mode={args.board_mode} hello={_hello!r} "
+                  f"(触摸事件记入 data/action_events.jsonl)")
+        else:
+            from wzry.control.executor import AdbExecutor
+            ex = ActionExecutor(AdbExecutor(event_log=_evlog))
+            print("执行模式: 真实操作(触摸事件记入 data/action_events.jsonl)")
     else:
         ex = None
         print("鍔綔妯紡: 浠呰瀵燂紙榛樿 --no-action屼笉娉叆浠讳綍瑙懜涘姞 --action 鎵嶆墽琛岋級")
 
-    recorder = MatchRecorder(base_dir=ROOT / "data" / "matches")
+    recorder = MatchRecorder(base_dir=ROOT / "data" / "matches",
+                             frame_every_s=float(getattr(args, "frame_every", 5.0)))
     from wzry.understanding.behavior import BehaviorTagger
     from wzry.feedback.reward import RewardSystem
     tagger = BehaviorTagger()
@@ -1167,6 +1562,44 @@ def main():
                  "hook_anchor_dist": 0.0, "turret_threat": 0.0,
                  "hook_blocked": 0.0, "match_start_t": 0.0,
                  "roster": None, "roster_pending": 0.0}
+
+    # ---- v14.2 执行不阻塞感知: 动作投递到单消费者 daemon 线程 ----
+    # 症状: 同步 apply_action 让主循环在 adb input swipe(最长 900ms) 上等完才继续抓帧,
+    #   实测感知频率掉到 1.23Hz(目标 >=2.5Hz), 决策"看到的是旧画面"。
+    # 方案(顾问设计): 主循环只做"感知+决策+入队", 由唯一 worker 线程串行执行动作。
+    #   单线程 FIFO = 与改造前完全相同的"无并发 adb 输入流"语义(executor 内部锁
+    #   会串行化 adb 进程, 若主循环与 worker 同时发 swipe 会互相阻塞 -> 故主循环
+    #   不再直接调用 ex, 全部经队列)。
+    # 背压: 只在 worker 空闲时投递(队列最大深度 1) —— 若放开 FIFO, 感知 ~3Hz 而
+    #   动作 ~1Hz, 队列会无限堆积, 动作会在决策很久之后才执行(状态已过期)。
+    _action_q = queue.Queue()
+    _exec_idle = threading.Event()
+    _exec_idle.set()
+
+    def _action_worker():
+        while True:
+            item = _action_q.get()
+            if item is None:                 # 退出哨兵: finally 里 put(None) drain
+                _action_q.task_done()
+                break
+            _exec_idle.clear()
+            try:
+                _act, _cds = item
+                if _act.get("type") == "stick_move":   # 连续摇杆保持(不碰 apply_action 语义)
+                    ex.move(float(_act.get("theta", 0.0)), float(_act.get("r", MOVE_R)),
+                            int(_act.get("duration_ms", 200)))
+                else:
+                    apply_action(ex, _act, _cds)
+            except Exception as _e:
+                print(f"[exec] 异常(跳过): {_e}")
+            finally:
+                _action_q.task_done()
+                _exec_idle.set()
+
+    if do_action:
+        threading.Thread(target=_action_worker, daemon=True).start()
+        print("执行线程: 动作入队串行执行(主循环不阻塞)")
+
     # 鎶鑳芥寜閽儚绱犲潗鏍囷紙read_ui 鐢級
     with open(ROOT / "configs" / "calibration_absolute.json", encoding="utf-8") as _f:
         _pts = json.load(_f)["points"]
@@ -1298,7 +1731,8 @@ def main():
                                     print(f"[自动学习] retrain: {_r2.stdout.strip()[-100:]}")
                             except Exception as _e2:
                                 print(f"[自动学习] train err {_e2}")
-                        _th2.Thread(target=_auto_learn, daemon=True).start()
+                        if not freeze_weights:  # v14.0 冻结期间不自动 evolve
+                            _th2.Thread(target=_auto_learn, daemon=True).start()
                     except Exception:
                         pass
                 prev_phase = phase
@@ -1321,11 +1755,11 @@ def main():
                     pass
                 continue
             # v2.26 杩炵画鎽囨潌: 鍐崇瓥闂撮殭涓嶈鎽囨潌鏉炬墜(琛紳 200ms)
+            # v14.2 改投递到执行队列(由 worker 串行发 adb, 主循环不再直接碰 ex)
             if do_action and _last_move[0] is not None and time.time() < _last_move[2]:
-                try:
-                    ex.move(_last_move[0], _last_move[1], 200)
-                except Exception:
-                    pass
+                if _exec_idle.is_set():
+                    _action_q.put(({"type": "stick_move", "theta": _last_move[0],
+                                    "r": _last_move[1], "duration_ms": 200}, cooldowns))
             if now - last_detect < detect_interval:
                 continue
             last_detect = now
@@ -1522,6 +1956,10 @@ def main():
                 for _d in dets:
                     if _d.cls not in ("enemy_hero", "ally_hero"):
                         continue
+                    # v14.2 B.2: 检测器已用"框上方血条颜色"给出高置信阵营(camp_src="bar")
+                    # -> 不要再用不可靠的"框内蓝/红像素"复核覆盖它(那会把判对的英雄翻回去)。
+                    if getattr(_d, "camp_src", None) == "bar":
+                        continue
                     x1, y1, x2, y2 = _d.xyxy
                     _cy0 = int(y1); _cy1 = int(min(frame.shape[0], y1 + max(2, (y2 - y1) // 6)))
                     _cx = int((x1 + x2) // 2)
@@ -1585,7 +2023,9 @@ def main():
                             "cls": "enemy_hero",
                             "screen": [_d.center[0] / w, _d.center[1] / h,
                                        (_d.xyxy[2] - _d.xyxy[0]) / w,
-                                       (_d.xyxy[3] - _d.xyxy[1]) / h]})
+                                       (_d.xyxy[3] - _d.xyxy[1]) / h],
+                            "conf": float(_d.conf),                            # v14.2
+                            "camp_src": getattr(_d, "camp_src", None)})        # v14.2
                 # v2.78 鏁岃嫳蹇呴』甯孩鏉>=5px): None(鏃犳潯)=閲庢璇 -> 鍓旈櫎(鎵撹嚜瀹堕噹鎬墸鍒嗗皝鍫
                 from wzry.vision.self_bars import hero_bar_check
                 _kept_u = []
@@ -1618,6 +2058,14 @@ def main():
                 state_dict["units"] = _kept_u
             except Exception:
                 pass
+            # v14.3 类屏蔽必须**无条件**生效: 上面那段(含血条复核)整块在 try 里, 一旦抛
+            #   异常就被静默跳过 -> units 混入 塔/小兵/水晶, 与 decide() 的输入口径不一致,
+            #   也污染 P2 数据集。实测同一版代码: 有些对局录到 enemy_turret/ally_crystal,
+            #   有些没有 -> 就是这条偶发路径。
+            _BLOCK_CLS = ("enemy_turret", "ally_turret", "enemy_minion",
+                          "ally_minion", "enemy_crystal", "ally_crystal")
+            state_dict["units"] = [u for u in (state_dict.get("units") or [])
+                                   if str(u.get("cls")) not in _BLOCK_CLS]
             # ---- 鐞嗚灞傚寮猴紙v2.12夛細鑷繁HP/MP + 鏁屼汉绾潯 + 闃熷弸鏉+ 闃靛 ----
             if now - float(cooldowns.get("hp_t", 0.0)) >= 0.5:
                 cooldowns["hp_t"] = now
@@ -1653,11 +2101,73 @@ def main():
                     from wzry.vision.ui_reader import skill_ready_state
                     ss = skill_ready_state(frame, skills_pts)
                     state_dict.setdefault("ui", {})["skill_states"] = ss
+                    # 平铺一份 0/1 到 ui（编码器直接读；skill_states 本身是嵌套 dict）
+                    for _sid in (1, 2, 3):
+                        _r = (ss.get(_sid) or ss.get(str(_sid)) or {}).get("ready")
+                        if isinstance(_r, bool):
+                            state_dict["ui"][f"skill{_sid}_ready"] = _r
+                except Exception as _e:
+                    # v15.0: 原来是裸 pass -> 真机上 skill_states 从没进过数据也没人发现
+                    #   （实测录到的 states.jsonl 里 100% 缺 skill_states）。改成只报一次。
+                    if not cooldowns.get("_skill_state_warned"):
+                        cooldowns["_skill_state_warned"] = True
+                        print(f"[ui] 技能图标状态读取失败(只报一次): "
+                              f"{type(_e).__name__}: {_e}")
+                # v15.0 敌方/队友血量比例(顶部头像条): 原来整条链路都没有这项读数
+                try:
+                    from wzry.vision.top_status_bars import read as _tsb_read
+                    _tb = _tsb_read(frame)
+                    if _tb.get("found"):
+                        _u2 = state_dict.setdefault("ui", {})
+                        if _tb.get("enemy_hp_min") is not None:
+                            _u2["enemy_hp_min"] = _tb["enemy_hp_min"]
+                        if _tb.get("ally_hp_min") is not None:
+                            _u2["ally_hp_min"] = _tb["ally_hp_min"]
+                        state_dict.setdefault("extra", {})["top_bars"] = _tb["bars"]
                 except Exception:
                     pass
-                # 闃靛堝宸茶瘑鍒級
+                # v15.1 敌方血量比例(场景内头顶红条长度): 顶部头像条是**条件性元素**
+                #   (只在锁定/攻击敌方时出现), 而场景内红条只要敌人可见就有 -> 用它填
+                #   enemy_hp_min。顶部条若存在则优先(那是"当前锁定目标"的精确读数)。
+                try:
+                    from wzry.vision.hero_hp import enemy_hp_from_dets as _ehp
+                    _rs = _ehp(frame, dets)
+                    if _rs:
+                        _u3 = state_dict.setdefault("ui", {})
+                        if _u3.get("enemy_hp_min") is None:
+                            _u3["enemy_hp_min"] = min(_rs)
+                        state_dict.setdefault("extra", {})["enemy_hp_scene"] = _rs
+                except Exception:
+                    pass
+                # 阵容已识别（roster 来自外部 modlens 服务，可能为 None）
                 if cooldowns.get("roster"):
                     state_dict.setdefault("extra", {})["roster"] = cooldowns["roster"]
+            # v14.3 hp/mp 回填: 上面那块有 0.5s 节流, 而 state_dict 每拍重建 -> 被节流跳过的
+            #   那一拍 ui.hp/mp 直接缺失(实测缺失率 30%), 决策层(接战门槛/回城门禁)只能退到
+            #   保守值 0.6。用上一拍读数回填(陈旧 <=0.5s, 远好于退到 0.6); 读到新值时更新缓存。
+            _uic = state_dict.setdefault("ui", {})
+            for _k in ("hp", "mp"):
+                if _uic.get(_k) is None:
+                    _lastv = cooldowns.get("last_" + _k)
+                    if _lastv is not None:
+                        _uic[_k] = _lastv
+                else:
+                    cooldowns["last_" + _k] = _uic[_k]
+            # v15.4 顶部"锁定目标条"(选中/正在攻击敌方英雄时才出现) -> 状态层:
+            #   上面那块读的是"每个可见敌人"的最小血量; 这条是"我正在打的那一个"的实时血量,
+            #   是"该收/该撤"最直接的依据。放在**每拍**(不跟上面 0.5s 节流): 只扫 187x17 的小条,
+            #   开销可忽略; 而"有没有锁定目标"必须每拍都新 —— 拿上一拍的残血值当现在会误导决策。
+            #   约定: 没有锁定目标时 lock_target_hp **不写**(缺失), 用它的人必须先看 lock_target。
+            try:
+                from wzry.vision.hero_hp import lock_target as _lt
+                _ltr = _lt(frame)
+                _u5 = state_dict.setdefault("ui", {})
+                _u5["lock_target"] = bool(_ltr.get("present"))
+                if _ltr.get("present") and _ltr.get("ratio") is not None:
+                    _u5["lock_target_hp"] = _ltr["ratio"]
+                state_dict.setdefault("extra", {})["lock_target"] = _ltr
+            except Exception:
+                pass
             n_ticks += 1
             infer_sum += det.last_infer_ms
 
@@ -1695,6 +2205,88 @@ def main():
                 action = _solve(state_dict, action, _hp0, _camp0)
             except Exception as _oe:
                 pass  # 浼樺寲鍣紓甯镐笉闃绘柇(淇濆簳=瑙勫垯鍐崇瓥)
+            # ---- v15.1 --hunt: 主动找敌方（默认关；规则栈被"只走中/下路走廊"的硬约束
+            #   锁住, 红点在上路/河道时永远走不到 -> 取证"顶部目标头像/敌方血条"需要它）----
+            if getattr(args, "hunt", False):
+                try:
+                    _cls_of2 = (lambda d: d.get("cls") if isinstance(d, dict)
+                                else getattr(d, "cls", None))
+                    _has_eh = any(_cls_of2(d) == "enemy_hero" for d in dets)
+                    _reds = (((mm.get("dots") or {}).get("red") or [])
+                             if mm.get("found") else [])
+                    if (not _has_eh) and _reds and action.get("type") in ("none", "map_move"):
+                        _g = (((mm.get("dots") or {}).get("green") or [(0.5, 0.5)])[0])
+                        _t = min(_reds, key=lambda p: (p[0] - _g[0]) ** 2 + (p[1] - _g[1]) ** 2)
+                        action = {"type": "map_move", "nx": float(_t[0]), "ny": float(_t[1]),
+                                  "reason": "hunt_red_dot"}
+                except Exception:
+                    pass
+            # ---- v15.0 事件记忆层：喂当前帧 -> 事件/冷却/朝向（u4） ----
+            _mem = None
+            try:
+                _mem = _events.update(state_dict, now)
+                if action.get("type") in ("skill", "summoner"):
+                    _events.note_cast(int(action.get("id") or 0), now, source="rule")
+                if _profile is not None and now - float(cooldowns.get("_advise_t", 0.0)) > 10.0:
+                    cooldowns["_advise_t"] = now
+                    from wzry.decision import upgrade_policy as _up
+                    from wzry.decision import item_policy as _ip
+                    _ug = _up.suggest(state_dict, _profile)
+                    _it = _ip.plan(state_dict, _profile)
+                    _gate = _ip.purchase_gate(
+                        state_dict, _it.get("price"),
+                        in_combat=bool((_mem or {}).get("n_enemy_scr")),
+                        in_fountain=False)
+                    print(f"[决策支线] {_up.format_line(_ug)} | {_ip.format_line(_it, _gate)}")
+            except Exception:
+                pass
+            # ---- v15.1 UI导航层：阵亡时读"游戏自动弹出的"面板（零点击=最安全路径）
+            #   面板内容回填到状态层(ui，走 uiquery 的 ALLOWED_FIELDS 白名单)与记忆层
+            if _uiq is not None and now - float(cooldowns.get("_uiq_t", 0.0)) > 1.0:
+                try:
+                    if _is_panel_open is not None and _is_panel_open(frame):
+                        cooldowns["_uiq_t"] = now
+                        _f = _uiq.read("death_recap", frame) or {}
+                        if _f:
+                            state_dict.setdefault("extra", {})["panel_death"] = _f
+                            _uu = state_dict.setdefault("ui", {})
+                            for _k, _v in _f.items():
+                                _uu[_k] = _v
+                            _events.note_panel("death_recap", _f, now)
+                except Exception:
+                    pass
+            # ---- v15.0 BCNet 策略：shadow=只记录不接管 / bc=接管但必须过安全层 ----
+            if _policy is not None:
+                try:
+                    _dpx = (state_dict.get("ui") or {}).get("death_banner")
+                    _dead_now = bool(isinstance(_dpx, (int, float)) and _dpx >= 2500)
+                    _reborn = bool(cooldowns.get("_last_dead")) and not _dead_now
+                    if _reborn:
+                        _policy.reset("respawn")
+                    cooldowns["_last_dead"] = _dead_now
+                    _pa = _policy.decide(state_dict, reset=_reborn)
+                    if _policy_mode == "shadow":
+                        _policy_log.parent.mkdir(parents=True, exist_ok=True)
+                        with open(_policy_log, "a", encoding="utf-8") as _pf2:
+                            _pf2.write(json.dumps({
+                                "t": round(now, 3), "fid": state_dict.get("frame_id"),
+                                "act": _pa.get("act_name"),
+                                "rule_type": action.get("type"),
+                                "rule_reason": action.get("reason"),
+                                "theta": round(float(_pa.get("theta", 0.0)), 3),
+                                "r": round(float(_pa.get("r", 0.0)), 3),
+                                "target": _pa.get("target"),
+                                "ms": round(_policy.last_infer_ms, 1),
+                            }, ensure_ascii=False) + "\n")
+                    else:
+                        _cand = _policy_action_to_m2(_pa)
+                        _ok, _why = _policy_guard(_cand, state_dict, cooldowns, now)
+                        cooldowns["_policy_last"] = ("accepted", _cand.get("type")) if _ok \
+                            else ("rejected", _why)
+                        if _ok:
+                            action = _cand
+                except Exception as _pe:
+                    cooldowns["_policy_last"] = ("error", f"{type(_pe).__name__}: {_pe}")
             sig = (action.get("type"), action.get("id"))
             if sig != last_sig:
                 print(f"[{datetime.now():%H:%M:%S}] [鍐崇瓥] {format_decision(action)}")
@@ -1733,8 +2325,9 @@ def main():
                     _n_enemy = len(_mm_now.get("red") or [])
                     _n_ally = len(_mm_now.get("blue") or [])
                     _w_before = dict(learner.weights())
-                    learner.observe(_ev, near_enemies=_n_enemy,
-                                    hp_low=_hp_now < 0.4, ally_near=_n_ally > 0)
+                    if not freeze_weights:  # v14.0 冻结期间不做在线权重学习
+                        learner.observe(_ev, near_enemies=_n_enemy,
+                                        hp_low=_hp_now < 0.4, ally_near=_n_ally > 0)
                     _w_after = learner.weights()
                     _delta = " ".join(f"{k}:{_w_before[k]:.2f}->{_w_after[k]:.2f}"
                                       for k in _w_after
@@ -1764,6 +2357,10 @@ def main():
                 sig = (action.get("type"), action.get("id"))
             if last_dead and not beh.get("dead"):
                 cooldowns["revive_t"] = now   # v2.49 璁板綍澶嶆椿鏃跺埢(5s 鍐呬笉鎺垬)
+                # v14.2 复活=回泉水: 航位推算的"自己"必须一起归位, 否则估计位置还停在
+                # 死前/目标处 -> map_move 认为"已到达"而不再推杆, 英雄永久僵在基地。
+                _cb = cooldowns.get("camp") or "blue"
+                cooldowns["self_est"] = BASE_BLUE if _cb == "blue" else BASE_RED
             last_dead = bool(beh.get("dead"))
 
             # ---- v2.43 琚鎵撹嚜鐪 鑷繁(绱湀)鍦晫濉旀敾鍑诲湀鍐-> 寮哄埗鑴辩 ----
@@ -1785,39 +2382,14 @@ def main():
             except Exception:
                 pass
 
-            # ---- 鎾炲鎰熺煡 v2.64堝惈 map_move: 鐐瑰嚮瀵昏矾涔熷湪绉诲姩, 鍗闇缁曡---
-            if action.get("type") in ("move", "map_move"):
-                # v2.8氬繁鏂逛綅缃= 忓湴鍥剧豢鑹茬偣堢敤鎴疯涔夛細缁垮湀=鑷繁                hero_pos = None
-                if mm.get("found"):
-                    greens = (mm.get("dots") or {}).get("green") or []
-                    if greens:
-                        hero_pos = min(greens, key=lambda p: (p[0]-0.5)**2 + (p[1]-0.5)**2)
-                    else:
-                        # 缁胯壊鐐规湭妫鍑烘椂閫鍖栦负钃壊鐐癸紙闃熷弸杩戜技屽瀹癸級
-                        blues = (mm.get("dots") or {}).get("blue") or []
-                        if blues:
-                            hero_pos = min(blues, key=lambda p: (p[0]-0.5)**2 + (p[1]-0.5)**2)
-                wall_hit = wall_sensor.update(now, True, hero_pos)
-                if wall_hit:
-                    # v2.64 map_move 鍗: 鐩爣鐐瑰悜鍙充晶鍋忕閲嶅彂(浜浛渚
-                    if action.get("type") == "map_move":
-                        _side = 1 if (wall_sensor._bypass if hasattr(wall_sensor, "_bypass") else 1) else -1
-                        try:
-                            wall_sensor._bypass = not getattr(wall_sensor, "_bypass", True)
-                        except Exception:
-                            pass
-                        _nx = max(0.02, min(0.98, float(action.get("nx", 0.5)) + 0.06 * _side))
-                        _ny = max(0.02, min(0.98, float(action.get("ny", 0.5)) + 0.03))
-                        action = {"type": "map_move", "nx": _nx, "ny": _ny,
-                                  "reason": "wall_avoid_map"}
-                        print(f"[{datetime.now():%H:%M:%S}] [撞墙] 目标点旁移 0.06 -> 重发")
-                        sig = ("map_move", None)
-                    else:
-                        action = wall_sensor.avoid_action(float(action.get("theta", 0.0)))
-                        print(f"[{datetime.now():%H:%M:%S}] [撞墙] 位置未动 -> 绕行")
-                        sig = ("move", None)
-            else:
-                wall_sensor.update(now, False, None)
+            # ---- 撞墙感知 v14.2: 停用"小地图绿点当自己"的撞墙判定 ----
+            # 实测(2026-10-14, 76 帧全程): 小地图绿点恒定在 (0.074, 0.88) 不变 —— 它是
+            # 自家基地/水晶的固定图标, 不是英雄。原逻辑拿它当"自己", WallSensor 永远判定
+            # "没移动", 每 6 帧触发一次"目标点旁移 0.06 -> 重发", 与 map_move 节流叠加成
+            # 死循环: 英雄被反复改向 -> 原地打转/推进极慢, 正是用户反馈的问题①(卡住不动)。
+            # 定位不到真实自己(hero_pos=None)时传感器自行复位, 不再误判; 且 map_move 走的是
+            # 游戏自带寻路(会自己绕墙), 我们的旁移重发不仅多余, 还有害。
+            wall_sensor.update(now, False, None)
 
             # ---- 閽瓙勭娴嬮噺璁板綍堣嚜鍔爣瀹氫簩鎶鑳借寖鍥达級----
             if action.get("type") == "skill" and action.get("id") == 2:
@@ -1828,11 +2400,19 @@ def main():
             # ---- 鎵 / 妯嫙 ----
             if action.get("type") != "none":
                 if do_action:
-                    try:
-                        apply_action(ex, action, cooldowns)
+                    # v14.3 塔重锚(闭环纠偏): 英雄正踩在某座塔上 -> self_est 吸附到该塔坐标。
+                    #   放在入队前(此处有 frame/dets/mm), 0.3s 节流(每拍调一次 self_hp_mp 太贵)。
+                    if now - float(cooldowns.get("snap_t", 0.0)) >= 1.0:
+                        # v15.1 0.3 -> 1.0: 每拍都要跑 self_hp_mp(全画面血条检测)，太贵
+                        cooldowns["snap_t"] = now
+                        _snap = _snap_self_est_to_tower(frame, dets, mm, cooldowns)
+                        if _snap:
+                            print(f"[{datetime.now():%H:%M:%S}] [重锚] self_est <- 塔 "
+                                  f"({_snap[0]},{_snap[1]}) 原估计偏差 {_snap[2]}")
+                    # v14.2 入队(不等待执行); worker 空闲时才投递 -> 队列深度 <=1, 动作不过期
+                    if _exec_idle.is_set():
+                        _action_q.put((action, cooldowns))
                         n_actions += 1
-                    except Exception as _e:
-                        print(f"[exec] 鎵寮傚父(璺宠繃): {_e}")
                     # continuous stick: move 0.55s; instant actions release
                     if action.get("type") == "move":
                         _last_move[:] = [action.get("theta"), action.get("r", MOVE_R),
@@ -1850,6 +2430,20 @@ def main():
                 # v2.10氶樀瀹瑰啓鍏姸鎬佹祦堝喅绛栧眰鍙                if cooldowns.get("roster"):
                     state_dict.setdefault("extra", {})["roster"] = cooldowns["roster"]
                 recorder.on_state(state_dict)
+                # v15.0 关键帧落盘：Recorder.on_frame 从来没被调用过 -> data/matches/*/frames/
+                #   一直是空目录（离线标定/复现无图可用，实测 22 场 0 张）。这里接上；
+                #   Recorder 内部按 frame_every_s(默认 5s) 节流，不会拖慢主循环。
+                recorder.on_frame(frame)
+                # v15.1 取证：检测到敌方英雄的那一拍额外落一帧（不受 5s 节流），
+                #   用来抓"顶部锁定目标头像"以及场景内敌方血条。
+                if getattr(args, "frame_on_enemy", False):
+                    try:
+                        _cls_of = (lambda d: d.get("cls") if isinstance(d, dict)
+                                   else getattr(d, "cls", None))
+                        if any(_cls_of(d) == "enemy_hero" for d in dets):
+                            recorder.save_frame(frame, tag="enemy")
+                    except Exception:
+                        pass
                 if do_action and action.get("type") != "none":
                     rec = dict(action)
                     rec["t"] = time.time()
@@ -1924,11 +2518,29 @@ def main():
     except KeyboardInterrupt:
         print("\n手动退出。")
     finally:
+        # v14.2 退出前 drain 动作队列: 让已入队的动作执行完(或在 5s 后放弃), 再关 recorder,
+        #   否则"动作记录"与"实际执行"错位(最后几个动作没发出去却已落盘)。
+        if do_action:
+            try:
+                _action_q.put(None)          # 哨兵排在剩余动作之后
+                _action_q.join(timeout=5.0)
+            except Exception:
+                pass
         if recorder.active:
             recorder.close()
         cap.stop()
         if args.show:
             cv2.destroyAllWindows()
+        if _laya is not None:  # v14.0 P1 门槛验收: 异常数=0 / p95 延迟(shadow.jsonl latency_ms)
+            try:
+                _ls = _laya.stats()
+                _laya.stop()
+                print(f"[Laya] 统计: {_ls} | shadow 日志: {_laya.shadow_path}")
+                if _ls.get("errors"):
+                    print(f"[Laya][警告] 异常数={_ls['errors']} > 0, P1 门槛未过: "
+                          f"{_ls.get('last_error')}")
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

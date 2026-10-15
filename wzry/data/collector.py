@@ -82,10 +82,22 @@ class MatchRecorder:
         if now - self._last_frame_t < self.frame_every_s:
             return
         self._last_frame_t = now
+        self.save_frame(frame)
+
+    def save_frame(self, frame, tag=""):
+        """立即保存一帧（不受 frame_every_s 节流）——用于"检测到敌人"这类瞬时事件取证。
+
+        tag 非空时文件名带标签前缀（如 enemy_000123.png），便于事后按事件筛图。
+        """
+        if not self.active or self._n_frames >= self.max_frames:
+            return None
         import cv2
-        fn = self._frame_dir / f"frame_{self._n_frames:06d}.png"
+        name = f"{tag}_{self._n_frames:06d}.png" if tag else f"frame_{self._n_frames:06d}.png"
+        fn = self._frame_dir / name
         cv2.imwrite(str(fn), frame)
+        self._last_frame_t = time.time()
         self._n_frames += 1
+        return fn
 
     def on_action(self, act_dict):
         """写入一条动作事件（与执行器事件流同构）。"""

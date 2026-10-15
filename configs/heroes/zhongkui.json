@@ -1,0 +1,27 @@
+{
+  "hero": "钟馗",
+  "status": "draft",
+  "note": "本文件是 Hero Profile 的模板/draft：加点优先级与出装路线需要按当前版本的人工来源（官方推荐/高分对局统计）校验后再用于执行。代码只读它，改它不用改代码。",
+  "roles": ["游走", "辅助"],
+  "hero_type": 6,
+  "summoner": "闪现",
+  "skills": {
+    "1": {"slot": 1, "name": "湮灭之锁", "kind": "control", "note": "钩锁控制，主升"},
+    "2": {"slot": 2, "name": "虚空之握", "kind": "slow", "note": "减速/吸血"},
+    "3": {"slot": 3, "name": "轮回吞噬", "kind": "ultimate", "note": "大招，留给击杀窗口"}
+  },
+  "level_order": ["1", "2", "3"],
+  "level_order_note": "主1副2，有大点大（draft）",
+  "combo": ["1", "2", "3"],
+  "items": {
+    "route": ["学识宝石", "冷静之靴", "痛苦面具", "回响之杖", "虚无法杖", "博学者之怒"],
+    "boots": "冷静之靴",
+    "situational": ["抵抗之靴", "极寒风暴"],
+    "route_note": "draft 出装路线，需按版本校验"
+  },
+  "ranges": {
+    "skill1_frac": 0.32,
+    "skill2_frac": 0.40,
+    "note": "屏幕归一化半径(draft)；真值应从数值表 + 相机换算得出"
+  }
+}

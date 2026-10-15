@@ -16,6 +16,8 @@ class Unit:
     screen: Optional[List[float]] = None   # [cx, cy, w, h] 归一化像素坐标
     hp: Optional[float] = None        # 0-1
     dead: bool = False
+    conf: Optional[float] = None      # v14.2 检测置信度(下游"幻影敌人"过滤需要)
+    camp_src: Optional[str] = None    # v14.2 阵营判据来源: color/default/... (同上)
 
 
 @dataclass

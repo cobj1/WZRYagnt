@@ -95,6 +95,22 @@ def refresh_weights(new_w):
         _W = {**_DEFAULT_W, **new_w}
 
 
+E_HERO_MIN_CONF = 0.55        # v14.1 enemy_hero 可信置信下限
+
+
+def enemy_hero_trusted(u):
+    """enemy_hero 框是否可信(防"幻影敌人")。
+
+    v14.1: 阵营分流用"框内蓝/红像素占比", 遮挡/远景/技能特效下占比不显著时会
+    保守地兜底判成敌人(camp_src="default")——这类框在真机上表现为"敌方英雄"
+    其实是我方或幻影, 会让 skill1/skill2/attack 朝空处放技能。低置信框同理。
+    非检测器来源(缺 conf/camp_src)默认可信, 保持对旧行为的兼容。
+    """
+    if u.get("camp_src") == "default":
+        return False
+    return float(u.get("conf", 1.0)) >= E_HERO_MIN_CONF
+
+
 def _feat(state, hp):
     """一次性提取环境特征(供所有候选复用)。"""
     mm = state.get("minimap") or {}
@@ -109,7 +125,8 @@ def _feat(state, hp):
     for u in units:
         scr = u.get("screen") or [0.5, 0.5]
         if u.get("cls") == "enemy_hero":
-            enemies_scr.append(scr)
+            if enemy_hero_trusted(u):
+                enemies_scr.append(scr)
         elif u.get("cls") == "enemy_minion":
             minions_e.append(scr)
     # v7.0 标定特征
@@ -138,7 +155,7 @@ def _grid_best(f, camp="blue"):
     V = np.zeros((N, N))
     if f["reds"]:
         # v2.85 支援路线硬约束: 红场仅保留中/下路走廊内红点(上路红点=不支援不去)
-        _c = state.get("camp") or "blue"
+        _c = camp or "blue"
         _down_c = (0.75, 0.72) if _c == "blue" else (0.25, 0.28)
         _mid_c = (0.5, 0.58) if _c == "blue" else (0.5, 0.42)
         _reds_corridor = [p for p in f["reds"]
@@ -296,7 +313,35 @@ def evaluate(c, f, camp="blue"):
     return v
 
 
-def solve(state, fallback_action, hp, camp="blue", base_score=0.0):
+def _forecast(c, f0):
+    """v12.1 前瞻演算(蒙特卡洛式, 用户: 像下棋演算多步): 模拟执行后
+    估计"未来2步"收益: 移动后距敌/距队变化 + 敌群趋近风险。
+    v14.1 提升到模块级(laya-fusion-plan C4: 数据构建复刻同一规则分 r)。"""
+    try:
+        a = c[0]
+        if a.get("type") != "map_move":
+            return 0.0
+        nx, ny = a.get("nx", 0.5), a.get("ny", 0.5)
+        # 模拟: 移到此点后, 敌/队友距离变化
+        _d_red_before = min([math.hypot(f0["g"][0]-p[0], f0["g"][1]-p[1]) for p in f0["reds"]], default=9.9)
+        _d_red_after = min([math.hypot(nx-p[0], ny-p[1]) for p in f0["reds"]], default=9.9)
+        _d_blue_before = min([math.hypot(f0["g"][0]-p[0], f0["g"][1]-p[1]) for p in f0["blues"]], default=9.9)
+        _d_blue_after = min([math.hypot(nx-p[0], ny-p[1]) for p in f0["blues"]], default=9.9)
+        v = 0.0
+        if _d_red_after > _d_red_before + 0.05:
+            v += 0.8        # 远离敌人(安全提升)
+        elif _d_red_after < _d_red_before - 0.05:
+            v -= 0.8        # 靠近敌人(风险)
+        if _d_blue_after < _d_blue_before - 0.05:
+            v += 0.5        # 靠近队友(协同)
+        if f0.get("hp", 1.0) < 0.5 and _d_red_after < 0.2:
+            v -= 1.5        # 残血向敌群 = 大风险
+        return v
+    except Exception:
+        return 0.0
+
+
+def _solve_core(state, fallback_action, hp, camp="blue", base_score=0.0):
     """v2.42: 像素级密采样4096移动候选(向量化) + 战术候选枚举 -> 全局最优。
         若移动最优分高 -> map_move(网格点); 否则与战术候选(技能/蹲/原地)比优。
         全程 <2ms。异常回退 fallback。"""
@@ -319,31 +364,18 @@ def solve(state, fallback_action, hp, camp="blue", base_score=0.0):
                      or c[0].get("type") == "none"]
         # v12.1 前瞻演算(蒙特卡洛式, 用户: 像下棋演算多步): 每候选评估 + 模拟执行后
         #   估计"未来2步"收益: 移动后距敌/距队变化 + 敌群趋近风险 -> 加权 0.35
-        def _forecast(c, f0):
-            try:
-                a = c[0]
-                if a.get("type") != "map_move":
-                    return 0.0
-                nx, ny = a.get("nx", 0.5), a.get("ny", 0.5)
-                # 模拟: 移到此点后, 敌/队友距离变化
-                _d_red_before = min([math.hypot(f0["g"][0]-p[0], f0["g"][1]-p[1]) for p in f0["reds"]], default=9.9)
-                _d_red_after = min([math.hypot(nx-p[0], ny-p[1]) for p in f0["reds"]], default=9.9)
-                _d_blue_before = min([math.hypot(f0["g"][0]-p[0], f0["g"][1]-p[1]) for p in f0["blues"]], default=9.9)
-                _d_blue_after = min([math.hypot(nx-p[0], ny-p[1]) for p in f0["blues"]], default=9.9)
-                v = 0.0
-                if _d_red_after > _d_red_before + 0.05:
-                    v += 0.8        # 远离敌人(安全提升)
-                elif _d_red_after < _d_red_before - 0.05:
-                    v -= 0.8        # 靠近敌人(风险)
-                if _d_blue_after < _d_blue_before - 0.05:
-                    v += 0.5        # 靠近队友(协同)
-                if f0.get("hp", 1.0) < 0.5 and _d_red_after < 0.2:
-                    v -= 1.5        # 残血向敌群 = 大风险
-                return v
-            except Exception:
-                return 0.0
+        #   (v14.1 _forecast 提升到模块级, 复刻同一规则分)
         scored = [(evaluate(c, f, camp) + 0.35 * _forecast(c, f), c) for c in cands]
-        scored.sort(key=lambda x: -x[0])
+        # v14.0 打分器: reorder=True 表示已按混合分重排(排序用 s=r+beta*(p-1/K),
+        # 但 scored[i][0] 保留原始规则分 -> 后面与 gv 比较、<=0 回退的阈值语义不变)
+        _by_scorer = False
+        if _SCORER is not None:
+            try:
+                _by_scorer = _SCORER.reorder(scored, f, hp, camp)
+            except Exception:
+                _by_scorer = False
+        if not _by_scorer:
+            scored.sort(key=lambda x: -x[0])
         # 战术候选最高分 vs 网格移动分
         if scored and gv >= scored[0][0]:
             return {"type": "map_move", "nx": max(0.02, min(0.98, gx)),
@@ -359,6 +391,33 @@ def solve(state, fallback_action, hp, camp="blue", base_score=0.0):
         return fallback_action
     except Exception:
         return fallback_action
+
+
+_SCORER = None
+
+
+def set_scorer(scorer, beta=None, mode=None):
+    """v14.0 可插拔打分器(wzry.decision.laya_scorer.LayaScorer)。
+    shadow=仅记录; ensemble=混合排序; 传 None 恢复纯规则。
+    beta/mode 可选: 传入时同步更新 scorer 上的属性(laya-fusion-plan C2 签名)。"""
+    global _SCORER
+    _SCORER = scorer
+    if scorer is not None:
+        if beta is not None:
+            scorer.beta = float(beta)
+        if mode is not None:
+            scorer.mode = mode
+
+
+def solve(state, fallback_action, hp, camp="blue", base_score=0.0):
+    """v14.0: _solve_core 的包装层 — 打分器记录最终选择; 未接 scorer 时与 v2.42 完全一致。"""
+    action = _solve_core(state, fallback_action, hp, camp, base_score)
+    if _SCORER is not None:
+        try:
+            _SCORER.log_chosen(action)
+        except Exception:
+            pass
+    return action
 
 
 # v7.0 模块加载即启用标定收益

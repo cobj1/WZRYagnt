@@ -13,7 +13,10 @@ import threading
 import time
 from pathlib import Path
 
-ADB = "adb"
+from wzry.adb_util import resolve_adb
+
+# 不再写死 "adb"：本机 PATH 无 adb，MuMu 自带的在 nx_main 下（见 wzry/adb_util.py）
+ADB = resolve_adb()
 
 # MuMu12 常见实例 ADB 端口（实例 0 通常是 16384，旧版为 7555）
 MUMU_ADB_PORTS = (16384, 7555, 16416, 16448, 16480, 16512)
@@ -59,6 +62,11 @@ class AdbExecutor:
         self._event_fp = None
         self.last_cmd_ms = 0.0
         self.cmd_count = 0
+        # v14.0 坐标空间: 全项目(校准 configs/calibration_absolute.json、小地图 242 空间)
+        # 都用 1280x720 帧坐标, 而设备实际可能是 1920x1080 -> tap/swipe 必须按比例缩放。
+        # 旧实现在 1080p 设备上会把触点送到 ~67% 位置(技能键全按不中)。
+        self._win_w, self._win_h = 1280, 720
+        self._dev_w, self._dev_h = None, None      # 最近一次读到的设备显示尺寸
 
     def _auto_serial(self):
         # v2.58 自愈: 先尝试连固定 MuMu 端口, 再枚举
@@ -119,14 +127,39 @@ class AdbExecutor:
             pass
 
     def get_device_size(self):
-        """读取设备物理分辨率 (w, h)，来自 `wm size`。"""
+        """读取**当前逻辑显示尺寸**（= adb input 的坐标空间）。
+
+        v14.0 修正：`wm size` 报的是物理原生尺寸（竖屏 1080x1920），而横屏对局
+        的输入空间是 1920x1080 —— 用它做缩放会把触点算错（x 缩 0.84、y 放 2.67）。
+        `dumpsys window displays` 的 `cur=WxH` 才是权威值（含旋转）。
+        """
+        import re
+        r = self._run(["shell", "dumpsys", "window", "displays"])
+        out = (r.stdout or "") + (r.stderr or "")
+        m = re.search(r"cur=(\d+)x(\d+)", out)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        # 回退: wm size（可能为竖屏原生）-> 本项目全程横屏, 归一化为横屏
         r = self._run(["shell", "wm", "size"])
         out = (r.stdout or "") + (r.stderr or "")
-        import re
         m = re.search(r"(\d+)x(\d+)", out)
         if not m:
-            raise RuntimeError(f"无法解析 wm size: {out.strip()}")
-        return int(m.group(1)), int(m.group(2))
+            raise RuntimeError(f"无法解析显示尺寸: {out.strip()[:120]}")
+        w, h = int(m.group(1)), int(m.group(2))
+        return max(w, h), min(w, h)
+
+    def refresh_display_size(self):
+        """v14.2 用户要求: 每次操作前重新读取当前显示尺寸(自适应旋转/分辨率变化)。
+
+        原来只在首个动作时懒加载一次后就永久缓存 —— 若中途横竖屏切换(如大厅竖屏
+        1080x1920 -> 对局横屏 1920x1080)或分辨率变化, 缓存的旧尺寸会让后续所有触点
+        缩放错位。故每次 tap/swipe 前强制重读 `dumpsys window displays` 的 cur=WxH。
+        读取失败时保留上一次已知值(不置 0, 避免退化成不做缩放)。
+        """
+        try:
+            self._dev_w, self._dev_h = self.get_device_size()
+        except Exception:
+            pass
 
     # ---------- 窗口坐标 -> 设备坐标 ----------
     def set_window_size(self, w, h):
@@ -134,40 +167,48 @@ class AdbExecutor:
         self._win_w, self._win_h = int(w), int(h)
 
     def window_to_device(self, x_win, y_win):
-        """窗口像素 -> 设备像素（线性缩放）。若未 set_window_size 则按设备尺寸原样返回。"""
+        """帧像素(1280x720 标定空间) -> 设备像素(线性缩放, 用最近一次读到的显示尺寸)。"""
         x_win, y_win = int(round(x_win)), int(round(y_win))
-        if getattr(self, "_win_w", None):
-            dev_w, dev_h = self.get_device_size()
-            return int(x_win * dev_w / self._win_w), int(y_win * dev_h / self._win_h)
+        if self._dev_w is None:                     # 兜底: 首次调用前未刷新
+            self.refresh_display_size()
+        if self._dev_w and self._win_w and \
+                (self._dev_w, self._dev_h) != (self._win_w, self._win_h):
+            return (int(x_win * self._dev_w / self._win_w),
+                    int(y_win * self._dev_h / self._win_h))
         return x_win, y_win
 
     # ---------- 动作原语 ----------
     def tap(self, x, y, source="policy"):
-        x, y = int(round(x)), int(round(y))
-        r = self._run(["shell", "input", "tap", str(x), str(y)])
-        self._log({"type": "tap", "x": x, "y": y, "source": source,
+        self.refresh_display_size()                 # v14.2 操作前自适应屏幕尺寸
+        dx, dy = self.window_to_device(x, y)
+        r = self._run(["shell", "input", "tap", str(dx), str(dy)])
+        self._log({"type": "tap", "x": dx, "y": dy, "win": [int(round(x)), int(round(y))],
+                   "display": [self._dev_w, self._dev_h], "source": source,
                    "latency_ms": round(self.last_cmd_ms, 2)})
         return r.returncode == 0
 
     def swipe(self, x1, y1, x2, y2, duration=100, source="policy"):
-        x1, y1, x2, y2 = (int(round(v)) for v in (x1, y1, x2, y2))
+        self.refresh_display_size()                 # v14.2 操作前自适应屏幕尺寸
+        d1 = self.window_to_device(x1, y1)
+        d2 = self.window_to_device(x2, y2)
+        d1 = (int(round(d1[0])), int(round(d1[1])))
+        d2 = (int(round(d2[0])), int(round(d2[1])))
         r = self._run(["shell", "input", "swipe",
-                       str(x1), str(y1), str(x2), str(y2), str(int(duration))])
-        self._log({"type": "swipe", "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                   "duration": int(duration), "source": source,
-                   "latency_ms": round(self.last_cmd_ms, 2)})
+                       str(d1[0]), str(d1[1]), str(d2[0]), str(d2[1]), str(int(duration))])
+        self._log({"type": "swipe", "x1": d1[0], "y1": d1[1], "x2": d2[0], "y2": d2[1],
+                   "win": [[int(round(x1)), int(round(y1))],
+                           [int(round(x2)), int(round(y2))]],
+                   "duration": int(duration), "display": [self._dev_w, self._dev_h],
+                   "source": source, "latency_ms": round(self.last_cmd_ms, 2)})
         return r.returncode == 0
 
     def tap_win(self, x_win, y_win, source="policy"):
-        """按窗口像素点击（自动映射到设备像素）。"""
-        dx, dy = self.window_to_device(x_win, y_win)
-        return self.tap(dx, dy, source=source)
+        """按帧像素(1280x720 标定空间)点击。tap 已内置同一坐标空间换算, 此处直接委托。"""
+        return self.tap(x_win, y_win, source=source)
 
     def swipe_win(self, x1, y1, x2, y2, duration=100, source="policy"):
-        """按窗口像素滑动（自动映射到设备像素）。"""
-        d1 = self.window_to_device(x1, y1)
-        d2 = self.window_to_device(x2, y2)
-        return self.swipe(*d1, *d2, duration=duration, source=source)
+        """按帧像素滑动。swipe 已内置同一坐标空间换算, 此处直接委托。"""
+        return self.swipe(x1, y1, x2, y2, duration=duration, source=source)
 
     def key(self, keycode, source="policy"):
         r = self._run(["shell", "input", "keyevent", str(keycode)])
