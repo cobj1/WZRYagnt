@@ -7,6 +7,8 @@
 import cv2
 import numpy as np
 
+from wzry.vision import colors   # HSV 判据单一事实来源（v15.3）
+
 
 def _roi(frame, cx, cy, r):
     h, w = frame.shape[:2]
@@ -35,7 +37,8 @@ def find_hp_bar(frame, search=(0.0, 0.82, 0.20, 0.96), min_bar_len=40):
     if roi.size == 0:
         return None
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    green = cv2.inRange(hsv, (35, 60, 70), (90, 255, 255))
+    lo, hi = colors.in_range_bounds(colors.GREEN_HUD)   # v15.3 阈值见 colors.py
+    green = cv2.inRange(hsv, lo, hi)
     # 水平条结构：31x3 核开运算（保留 >31px 的横条）
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 3))
     bars = cv2.morphologyEx(green, cv2.MORPH_OPEN, kernel)
@@ -113,7 +116,8 @@ def find_mp_bar(frame, hp_bar=None, search=(0.0, 0.82, 0.30, 0.96)):
             if roi.size == 0:
                 continue
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            blue = cv2.inRange(hsv, (85, 60, 60), (140, 255, 255))
+            _lo, _hi = colors.in_range_bounds(colors.BLUE_HUD)   # v15.3 阈值见 colors.py
+            blue = cv2.inRange(hsv, _lo, _hi)
             if blue.sum() > 300:  # 有足够蓝色像素
                 # 最长连续蓝色段
                 row = blue[blue.shape[0] // 2] if blue.shape[0] else blue[0]
@@ -145,7 +149,8 @@ def find_mp_bar(frame, hp_bar=None, search=(0.0, 0.82, 0.30, 0.96)):
     if roi.size == 0:
         return None
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    blue = cv2.inRange(hsv, (85, 60, 60), (140, 255, 255))
+    _lo, _hi = colors.in_range_bounds(colors.BLUE_HUD)
+    blue = cv2.inRange(hsv, _lo, _hi)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 3))
     bars = cv2.morphologyEx(blue, cv2.MORPH_OPEN, kernel)
     best = None

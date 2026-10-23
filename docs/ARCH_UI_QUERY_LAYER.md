@@ -337,7 +337,11 @@ ally_gold, enemy_gold, ally_kills, enemy_kills
    - 已消费：`ui.lock_target_hp` → **收人头窗口**；`extra.enemy_hp_scene` / `ui.enemy_hp_min` → **占优推进**。
      两者都只放宽**接战门槛**（0.35 / 0.50，常规是 0.60），**不改移动目标**，敌英数上限（≤2）照旧生效。
    - 未消费：BCNet —— 两个键不在 `UI_KEYS`（要进去得改 `UI_DIM` 并重训）。
-   - **真正意义上的"推进/压线"（改移动目标）没做**：那属于移动决策层，风险比放宽接战门槛大，需要单独设计。
+   - **真正意义上的"推进/压线"（改移动目标）**：方案已单独成文 —— 见 [ARCH_MOVE_PUSH.md](ARCH_MOVE_PUSH.md)
+     （含 3 处必须先修的前置、判据/目标点算法/安全闸、`off|shadow|on` 三档开关与验收指标）。
+     **P0 已落地**：F1 敌塔威胁改走小地图分阵营塔（`towers_v7.enemy`，原来那条 YOLO 屏幕空间判据
+     是死代码）／F2 分阵营键注入 state／F3 视野外敌人粗判据；**P1 已落地**：`push_ok` / `push_target`
+     两个纯函数（判据/目标点，**未接线**，接线是 P2 的 `--push shadow`）。离线回归 144/144，**未真机**。
    - 真机验证仍缺：这两条都还没在**实机对局**里跑出过触发（盯 `[kill]` / `[press]` 两行即可确认）。
 
 ---
@@ -355,6 +359,8 @@ ally_gold, enemy_gold, ally_kills, enemy_kills
 | 单帧读像素定位按钮 | 同一个图标在两帧读出相差 40~100px，据此写死坐标会点空 | 改用 **scan-tap**：候选点 + 点击反馈定音，坐标以"点得开"为准 |
 | 面板经济 `XX.Yk` | `read_number` 读成 3378（丢小数点 + k 当数字） | 专用 `read_k_gold`：低置信字符过滤 + ×100 |
 | `numpy` 数组当条件 | `frame = grab() or old` 抛"truth value ambiguous" | 显式 `if _nf is not None` |
+| **注释与代码被挤在同一行**（历史格式损坏，形如 `# 底部信息条    beh_label = …`） | 赋值从没执行 → `NameError` 被下游 `except: pass` 吞掉 → `temp/live_annot/behavior.jsonl` **从来没生成过**（`self_reflect.py` 也在读它 → 一直在读空气） | 修好该行；**写盘失败的 `except` 不再静默**，改为打印 `[annot-record] …`。排查这类"看起来在跑、其实没产出"的坑，第一步就是**先确认产物文件真的存在** |
+| `ScreencapCapture` 的 `serial` 默认写死 `127.0.0.1:16384`，而 m2 构造它时**没把 `--serial` 传进去**（scrcpy 分支传了） | 换到真机（USB `9f352c1f`）走 `--capture screencap` 时**恒连模拟器** → `0 帧`，但日志只写"完成: 0帧"，看不出原因 | 与 scrcpy 分支对齐传 `serial=getattr(args,"serial",None)`；传 `None` 时行为与以前完全一致 |
 
 > 附带一条**被证伪**的猜测（留档免得后人重复）：曾怀疑"有锁定目标时右上角 HUD 会左移"，
 > 用同区域上下叠图对比后**否定** —— `≡≈1098`、齿轮 `≈1145`、金币 `≈1215` 在两帧完全一致。

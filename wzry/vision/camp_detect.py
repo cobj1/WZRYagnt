@@ -10,6 +10,8 @@
 import cv2
 import numpy as np
 
+from wzry.vision import colors   # HSV 判据单一事实来源（v15.3）
+
 
 def detect_show_stage(frame):
     """检测选完英雄展示阶段(上下排英雄卡+VS)。返回 bool。"""
@@ -21,8 +23,8 @@ def detect_show_stage(frame):
         if vs_roi.size == 0:
             return False
         hs = cv2.cvtColor(vs_roi, cv2.COLOR_BGR2HSV)
-        # VS 字白色高亮
-        vs_white = int(((hs[..., 1] < 60) & (hs[..., 2] > 200)).sum())
+        # VS 字白色高亮（v15.3 阈值见 colors.py: WHITE_VS）
+        vs_white = colors.count(hs, colors.WHITE_VS)
         # 特征2: 上下两排英雄卡区 (y40-280 上, y440-660 下) 有彩色英雄头像(many colors)
         up = frame[40:280, 100:1180]
         lo = frame[440:660, 100:1180]
@@ -40,11 +42,8 @@ def gold_name_row(frame):
     """选完英雄展示阶段: 金色名字像素 上半屏 vs 下半屏 -> 'up'/'down'/None。"""
     try:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        H = hsv[..., 0].astype(int)
-        S = hsv[..., 1].astype(int)
-        V = hsv[..., 2].astype(int)
-        # 金色名字 (V>170 亮金, 低饱和文字边缘? 名字金色高亮)
-        gold = ((H >= 12) & (H <= 45) & (S > 90) & (V > 150)).astype(np.uint8)
+        # 金色名字（v15.3 阈值见 colors.py: GOLD_NAME）
+        gold = colors.mask_u8(hsv, colors.GOLD_NAME)
         ys = np.nonzero(gold[:, 100:1180])[0]
         if len(ys) < 25:
             return None

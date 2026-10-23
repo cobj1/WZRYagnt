@@ -26,6 +26,20 @@ MINION_SPEED = 12.0    # 小兵点匹配 px/帧
 MINION_AGE = 3
 MINION_MOVE = 3.0      # 累计位移阈值 px
 
+# v15.4 mm.detect 结果缓存窗口(秒)。
+#   原为 0.4s（v13.6, 当时 detect ≈200ms, 省 137ms/帧）。现 detect 仅 22.7ms（190px 小地图/576p），
+#   而真机 scrcpy ≈3.5fps(286ms/帧) 时 0.4s 窗口会命中 **46%** 的帧 -> 近半帧拿到陈旧最多 400ms
+#   的小地图(塔位/敌方红点/野怪)，代价远大于收益。降到 0.15s 后：当前帧率下自然不命中；
+#   仍保留原意 —— `wait_frame` 帧龄 <1.0s 会重复返回同一帧，那种"同一帧重复处理"仍被去重。
+#   实测脚本: temp/_mm_cache_probe.py
+MM_CACHE_TTL = 0.15
+# v15.9 敌英轨迹"静止即丢弃"的触发帧数（0 = 关闭）。默认 0：
+#   实测（400 连续帧，真值=红圈大盘）static_age=6 时 精确94%/召回14%，
+#   关闭后 精确99%/召回98% —— 这条规则原本是为**旧环检测器**的幽灵红环设的，
+#   而 blob 判据（面积 300~1600 + 圆盘/停靠带过滤）本身不产生幽灵点，
+#   所以它对精确率毫无贡献，却吃掉了 84% 的真敌人（英雄站着补刀/对拼即被判"静物"）。
+MM_TRK_STATIC_AGE = 0
+
 
 class _Track:
     __slots__ = ("x", "y", "age", "miss", "conf", "init_x", "init_y", "dead", "hist")
@@ -109,18 +123,24 @@ class MMTrackerV7:
                     continue
                 # v2.87 红点死守防线: 敌方轨迹必须"动" (幽灵=塔饰/角饰红环, 完全静止)
                 # 位置历史跨度 <1.5px 且年龄>=6帧 -> 静物装饰, 丢弃; 真实敌方位移明显
-                if cls == "enemy" and t.age >= 6 and len(t.hist) >= 3:
+                # v15.9: 阈值参数化。30fps 下 6 帧只有 0.2s —— 英雄站着补刀/对拼就会被
+                #   当成"静物"丢掉，这是 tracker 召回(14%)远低于 detect(100%) 的要因之一。
+                if (cls == "enemy" and MM_TRK_STATIC_AGE > 0
+                        and t.age >= MM_TRK_STATIC_AGE and len(t.hist) >= 3):
                     xs = [p[0] for p in t.hist]
                     ys = [p[1] for p in t.hist]
                     if max(xs) - min(xs) < 1.5 and max(ys) - min(ys) < 1.5:
                         continue
                 # v2.90 输出点重闸: 平滑后的轨迹点必须仍为敌英(头像)模板
                 # (原始检测点过闸, 平滑输出点可能漂离头像 -> 蓝环队友误入红点)
+                # v16.0: 仅旧环路径需要 —— blob 判据的点本来就来自红圈大块(颜色门),
+                #   不存在"漂移到队友头像"问题；实测 776 帧此闸吃掉 25/331 帧真敌人
+                #   （细红圈压在暗底图上时 patch 边缘像素不足）。blob 模式跳过。
                 if cls == "enemy" and self._last_mm is not None:
                     try:
-                        from wzry.vision.mm_rules_v7 import _has_avatar
-                        if not _has_avatar(self._last_mm, int(round(t.x)),
-                                           int(round(t.y)), thr=0.62):
+                        from wzry.vision import mm_rules_v7 as _MR
+                        if _MR.MM_ENEMY_MODE == "ring" and not _MR._has_avatar(
+                                self._last_mm, int(round(t.x)), int(round(t.y)), thr=0.62):
                             continue
                     except Exception:
                         pass
@@ -203,17 +223,25 @@ class MMTrackerV7:
     # ---------- 主入口 ----------
     def update(self, frame):
         t0 = time.perf_counter()
-        # v13.6 mm.detect 200ms缓存(小地图点200ms内不变, 省137ms/帧, 功能不变)
+        # v13.6 mm.detect 结果缓存；v15.4 窗口 0.4s -> MM_CACHE_TTL(0.15s)，见模块顶部说明
         _nwc = time.perf_counter()
-        r = self._mm_cache_f if (self._mm_cache_f is not None and _nwc - self._mm_cache_t < 0.4) else None
+        r = self._mm_cache_f if (self._mm_cache_f is not None
+                                 and _nwc - self._mm_cache_t < MM_CACHE_TTL) else None
         if r is None:
             r = self.det.detect(frame)
             self._mm_cache_f = r
             self._mm_cache_t = _nwc
-        # v2.90 输出点重闸: 留存小地图裁剪 (0..msz 方区, 与 det 同坐标系)
-        r0 = r.get("size", 232) or 232
-        self._last_mm = (frame[0:int(r0), 0:int(r0)]
-                         if frame.shape[0] >= int(r0) and frame.shape[1] >= int(r0) else None)
+        # v2.90 输出点重闸: 留存小地图裁剪 (与 det 同坐标系)
+        # v15.3 小地图不再是 (0,0) 起（20:9 真机实测 x=63）-> 偏移从 det 返回的 center/size 反解
+        r0 = int(r.get("size", 232) or 232)
+        _c = r.get("center")
+        if _c:
+            _x0 = max(0, int(round(_c[0] - r0 / 2.0)))
+            _y0 = max(0, int(round(_c[1] - r0 / 2.0)))
+        else:
+            _x0 = _y0 = 0
+        self._last_mm = (frame[_y0:_y0 + r0, _x0:_x0 + r0]
+                         if frame.shape[0] >= _y0 + r0 and frame.shape[1] >= _x0 + r0 else None)
         if not r.get("found"):
             # v2.27 非对局: 清空轨迹并返回未找到(避免大厅/选英雄伪标注与伪决策)
             for cls in ("self", "ally", "enemy"):
@@ -224,6 +252,9 @@ class MMTrackerV7:
                     "dots": {"blue": [], "red": [], "green": [], "yellow": []},
                     "towers": [], "minions": [], "v7": {"self": [], "ally": [], "enemy": [],
                                                         "monster": [], "buff": [],
+                                                        "buff_supported": False,
+                                                        "monster_supported": False,
+                                                        "red_supported": False,
                                                         "minions": {"ally": [], "enemy": []}},
                     "towers_v7": {"ally": [], "enemy": []}}
         msz = float(r.get("size", 232))
@@ -254,7 +285,8 @@ class MMTrackerV7:
         #   (mm_red才算敌英/mm_blue才算队友/mm_green才算自己; 假红点/假蓝点被纠正)
         try:
             from wzry.vision.roi_cls_gate import filter_dots
-            _mm_crop = frame[0:int(msz), 0:int(msz)]
+            # v15.3: 用与 det 相同的偏移裁剪（原为 0,0 起，20:9 下会偏到小地图外）
+            _mm_crop = frame[_y0:_y0 + int(msz), _x0:_x0 + int(msz)]
             _r0, _b0, _g0 = filter_dots(
                 _mm_crop,
                 [(p[0] / msz, p[1] / msz, p[2]) for p in heroes_enemy],
@@ -294,6 +326,11 @@ class MMTrackerV7:
             "v7": {"self": rec(heroes["self"]), "ally": rec(heroes["ally"]),
                    "enemy": rec(heroes["enemy"])[:5],
                    "monster": r["dots"]["monster"], "buff": r.get("buff") or [],
+                   # v15.5/15.6: False = 该字段"未知"（颜色判据对常驻图标无效），不是"没有"
+                   "buff_supported": bool(r.get("buff_supported", True)),
+                   "monster_supported": bool(r.get("monster_supported", True)),
+                   # v15.8: False = 小地图敌英(RED)不可用，"空"不代表"附近没有敌人"
+                   "red_supported": bool(r.get("red_supported", True)),
                    "minions": {"ally": rec(minions["ally"]), "enemy": rec(minions["enemy"])}},
             "towers_v7": r["towers"],
         }

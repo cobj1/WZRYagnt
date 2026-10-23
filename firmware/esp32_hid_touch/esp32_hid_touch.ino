@@ -32,7 +32,10 @@
  *   t_up <id>                           -> 第 id 个触点抬起
  *   type <text>                         -> 键盘输入 ASCII
  *   key <combo>                         -> 按键，如 enter / cmd+h / noop
+ *   stat                                -> ok cmds=N drops=N down=N up=Ns（只读诊断）
  *   home/move/press/release/click/scroll-> 一律回 err mode is touch（鼠标是另一套固件）
+ *
+ *   t_tap / t_swipe 的 ms 上限为 SWIPE_MS_MAX(3000)，超出按上限执行。
  *
  *   坐标单位：**手机物理像素**（0..TOUCH_SURFACE_W-1 / 0..TOUCH_SURFACE_H-1），
  *   与电脑端 Esp32HidExecutor(device_size=(W,H)) 一致；固件内部把它线性映射到
@@ -75,6 +78,10 @@
 #define TOUCH_REPORT_ID 7         // 触摸输入报告的 Report ID；本板只注册 键盘(1) + 触摸屏
 #define TOUCH_FEATURE_REPORT_ID 8 // Contact Count Maximum 特性报告单独一个 ID（照微软样本）
 #define SWIPE_STEP_MS 8           // t_swipe 每步之间的间隔（越小越平滑、命令越少）
+#define SWIPE_MS_MAX 3000         // t_tap/t_swipe 的按住时长上限(ms)。
+                                  //   原实现无上限: 电脑端一条手滑/超大的 ms 会让
+                                  //   doTouchSwipe 的 for 循环阻塞 loop() 数分钟,
+                                  //   期间 WiFi 不服务、新命令全压在 TCP 缓冲里。
 #define CMD_LINE_MAX 200          // 单行命令上限（含结尾 '\0'）
 #define WIFI_RETRY_MS 5000UL      // Wi-Fi 重连间隔
 #define WIFI_REBOOT_MS 120000UL   // 断网超过此时间则重启板子（看门狗）
@@ -197,6 +204,8 @@ static size_t lineLen = 0;
 static volatile bool usbSuspended = false;  // 手机锁屏时 USB 口会挂起
 static uint32_t wifiDownSince = 0;
 static uint32_t wifiLastTry = 0;
+static uint32_t cmdCount = 0;               // 已处理的非空命令行数(诊断用)
+static uint32_t touchReportDrops = 0;       // HID 报告发送失败次数(TinyUSB FIFO 满等)
 
 // 触点状态：绝对像素坐标 + 是否按下
 static bool touchDown[TOUCH_MAX_CONTACTS];
@@ -308,8 +317,10 @@ static uint16_t toLogical(uint16_t v, uint32_t surface) {
   return (uint16_t)out;
 }
 
-// 把当前触点状态打包成一个报告发给手机（未按下的触点填 0）
-static void flushTouches() {
+// 把当前触点状态打包成一个报告发给手机（未按下的触点填 0）。
+// 返回发送结果：SendReport 失败时 TinyUSB 会**静默丢弃**该报告 —— 若不记录，
+// 电脑端会以为"已生效"而实际触点停在上一个位置（摇杆/技能位置漂移的隐性来源）。
+static bool flushTouches() {
   TouchReport rep;
   memset(&rep, 0, sizeof(rep));
   uint8_t n = 0;
@@ -325,7 +336,9 @@ static void flushTouches() {
     n++;
   }
   rep.count = n;
-  Touch.sendReport(rep);
+  bool ok = Touch.sendReport(rep);
+  if (!ok) touchReportDrops++;
+  return ok;
 }
 
 static void releaseAllTouches() {
@@ -400,6 +413,7 @@ static void doTouchUp(uint8_t cid) {
 static void doTouchTap(uint16_t x, uint16_t y, int ms) {
   if (busy()) return;
   if (ms < 1) ms = 1;
+  if (ms > SWIPE_MS_MAX) ms = SWIPE_MS_MAX;   // 无上限会把 loop() 阻塞数分钟
   uint8_t cid = freeContact();
   if (cid == 0xFF) { reply("err no free contact"); return; }
   const char *e = applyTouchDown(cid, x, y);
@@ -413,6 +427,7 @@ static void doTouchTap(uint16_t x, uint16_t y, int ms) {
 static void doTouchSwipe(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, int ms) {
   if (busy()) return;
   if (ms < 1) ms = 1;
+  if (ms > SWIPE_MS_MAX) ms = SWIPE_MS_MAX;   // 同上: 防超长按住把 loop() 卡死
   uint8_t cid = freeContact();
   if (cid == 0xFF) { reply("err no free contact"); return; }
   int steps = ms / SWIPE_STEP_MS;
@@ -518,6 +533,7 @@ static void doType(const char *text) {
 static void handleLine(char *line) {
   trimInPlace(line);
   if (line[0] == 0) return;  // 空行不回复
+  cmdCount++;
 
   char *sp = strchr(line, ' ');
   const char *cmd = line;
@@ -593,6 +609,18 @@ static void handleLine(char *line) {
       return;
     }
     doType(rest);
+    return;
+  }
+  if (!strcmp(cmd, "stat")) {
+    // 诊断(只读): 已处理命令数 / HID 报告发送失败次数 / 当前按下的触点数 / 开机秒数。
+    //   drops>0 说明有报告被 TinyUSB 丢弃 -> 触点实际位置可能落后于电脑端认知。
+    uint8_t nDown = 0;
+    for (uint8_t i = 0; i < TOUCH_MAX_CONTACTS; i++) if (touchDown[i]) nDown++;
+    char sbuf[110];
+    snprintf(sbuf, sizeof(sbuf), "ok cmds=%lu drops=%lu down=%u up=%lus",
+             (unsigned long)cmdCount, (unsigned long)touchReportDrops,
+             (unsigned)nDown, (unsigned long)(millis() / 1000));
+    reply(sbuf);
     return;
   }
   // 鼠标原语属于另一套固件

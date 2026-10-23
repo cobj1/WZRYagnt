@@ -21,10 +21,12 @@ from pathlib import Path
 
 
 class MatchRecorder:
-    def __init__(self, base_dir="data/matches", frame_every_s=5.0, max_frames=2000):
+    def __init__(self, base_dir="data/matches", frame_every_s=5.0, max_frames=2000,
+                 input_source="policy"):
         self.base_dir = Path(base_dir)
         self.frame_every_s = frame_every_s
         self.max_frames = max_frames
+        self.input_source = input_source
         self.session_dir = None
         self._states_fp = None
         self._actions_fp = None
@@ -33,6 +35,9 @@ class MatchRecorder:
         self._n_frames = 0
         self._start_t = None
         self._last_frame_t = 0.0
+        self._meta = {}
+        self._n_memory_states = 0
+        self._n_clock_states = 0
 
     @property
     def active(self):
@@ -53,13 +58,72 @@ class MatchRecorder:
         self._n_frames = 0
         self._start_t = time.time()
         self._last_frame_t = 0.0
-        if meta:
-            self._write_manifest({"meta": meta})
+        self._meta = dict(meta or {})
+        self._n_memory_states = 0
+        self._n_clock_states = 0
+        self._write_manifest()
+
+    @staticmethod
+    def _scoreboard_from_mem(mem_heroes):
+        rows = []
+        for h in mem_heroes:
+            hp = h.get("hp")
+            hp_max = h.get("hp_max")
+            rows.append({
+                "cid": h.get("id"),
+                "camp": h.get("camp"),
+                "gold": h.get("gold"),
+                "gold_total": h.get("gold_total", h.get("gold_earned")),
+                "gold_spent": h.get("gold_spent"),
+                "level": h.get("level"),
+                "exp": h.get("exp"),
+                "kills": h.get("kills", 0),
+                "deaths": h.get("deaths", 0),
+                "assists": h.get("assists", 0),
+                "hp": hp,
+                "hp_max": hp_max,
+                "equip": h.get("equip") or [],
+                "dead": bool(isinstance(hp, (int, float)) and hp <= 0),
+                "x": h.get("x"),
+                "z": h.get("z"),
+                "src": "memory",
+            })
+        return rows
 
     def on_state(self, state_dict):
-        """写入一条 GameState（dict）。"""
+        """写入一条 GameState（dict），并把内存字段提升到统一契约。"""
         if not self.active:
             return
+        ui = state_dict.setdefault("ui", {}) or {}
+        extra = state_dict.setdefault("extra", {}) or {}
+        sources = state_dict.get("sources") or {}
+        state_dict["sources"] = sources
+
+        clock = ui.get("match_clock")
+        if clock is None:
+            clock = extra.get("mem_clock_s")
+            if clock is not None:
+                ui["match_clock"] = clock
+        if clock is not None:
+            state_dict.setdefault("clock_s", clock)
+            sources["clock_s"] = "memory" if extra.get("mem_clock_s") is not None else "vision"
+            self._n_clock_states += 1
+
+        mem_heroes = extra.get("mem_heroes") or []
+        if mem_heroes:
+            state_dict.setdefault("scoreboard", self._scoreboard_from_mem(mem_heroes))
+            sources["scoreboard"] = "memory"
+            self._n_memory_states += 1
+
+        state_dict.setdefault("input_source", self.input_source)
+        record = state_dict.get("record") or {}
+        record.update({
+            "input_source": self.input_source,
+            "memory_active": bool(mem_heroes),
+            "clock_known": clock is not None,
+        })
+        state_dict["record"] = record
+
         self._states_fp.write(json.dumps(state_dict, ensure_ascii=False,
                                          default=self._json_default) + "\n")
         self._n_states += 1
@@ -100,11 +164,19 @@ class MatchRecorder:
         return fn
 
     def on_action(self, act_dict):
-        """写入一条动作事件（与执行器事件流同构）。"""
+        """写入一条动作事件（与执行器事件流同构），缺省标记来源。"""
         if not self.active:
             return
-        self._actions_fp.write(json.dumps(act_dict, ensure_ascii=False,
+        payload = dict(act_dict or {})
+        payload.setdefault("source", self.input_source)
+        self._actions_fp.write(json.dumps(payload, ensure_ascii=False,
                                           default=self._json_default) + "\n")
+
+    def on_human_input(self, event):
+        """记录人类输入（swipe/tap/key），用于来源 A 的人类动作标签。"""
+        payload = dict(event or {})
+        payload["source"] = "human"
+        self.on_action(payload)
 
     def _write_manifest(self, extra=None):
         if not self.session_dir:
@@ -115,6 +187,10 @@ class MatchRecorder:
             if self._start_t else None,
             "n_states": self._n_states,
             "n_frames": self._n_frames,
+            "input_source": self.input_source,
+            "memory_states": self._n_memory_states,
+            "clock_states": self._n_clock_states,
+            "meta": self._meta,
         }
         if extra:
             manifest.update(extra)

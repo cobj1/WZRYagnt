@@ -16,6 +16,8 @@ from pathlib import Path
 
 import numpy as np
 
+from wzry.vision.camp_src import TRUSTED_CAMP_SRC   # v15.2: camp_src 口径单一事实来源
+
 # 类别表以 configs/classes.json 为准（单一来源，避免"代码/配置两处漂移"）；
 # 读不到时回退到下面同序的硬编码表。v15.0 把 dragon / jungle_buff 从
 # neutral_monster 里拆出来，供记忆层做"资源点刷新/争夺"推理。
@@ -51,7 +53,8 @@ UI_KEYS = ["hp", "mp", "gold", "level", "kills", "deaths",
 #   见 wzry/vision/top_status_bars.py) / skillN_cd(剩余CD秒估计, 见 ui_reader)。
 # death_banner 原始值是像素计数 -> 入模前必须二值化(见 encode_state)。
 MOVE_R = 0.8                   # 与 m2_agent_v2.MOVE_R 对齐（推杆幅度）
-TRUST_SRC = ("bar", "color", "neutral")   # camp_src 中"判据可信"的来源
+# v15.2 camp_src 口径单一事实来源(wzry/vision/camp_src.py)：此处只做别名，勿另写字面量
+TRUST_SRC = TRUSTED_CAMP_SRC   # camp_src 中"判据可信"的来源
 
 
 def encode_state(st: dict, n_units_max: int = 20) -> dict:

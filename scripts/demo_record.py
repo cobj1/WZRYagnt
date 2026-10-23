@@ -153,6 +153,10 @@ def main():
     ap.add_argument("--frame-every", type=float, default=3.0, help="关键帧间隔秒")
     ap.add_argument("--no-touch", action="store_true", help="不捕获触摸事件")
     ap.add_argument("--serial", default=None, help="adb serial（默认自动发现 MuMu）")
+    ap.add_argument("--mem", action="store_true", help="开启内存直读（补时钟/金币/KDA/十英雄）")
+    ap.add_argument("--mem-self-id", type=int, default=None, help="内存自身英雄 cid")
+    ap.add_argument("--mem-hz", type=float, default=2.0, help="内存刷新频率")
+    ap.add_argument("--mem-clock-hint", type=int, default=None, help="局内时钟锚点（秒）")
     args = ap.parse_args()
 
     from wzry.capture.scrcpy_stream import ScrcpyStreamCapture  # noqa: E402
@@ -204,10 +208,32 @@ def main():
         pts = json.load(f)["points"]
     skills = {1: pts["skill1"], 2: pts["skill2"], 3: pts["skill3"]}
 
-    recorder = MatchRecorder(base_dir=sess.parent, frame_every_s=args.frame_every)
+    recorder = MatchRecorder(base_dir=sess.parent, frame_every_s=args.frame_every,
+                             input_source="human")
     recorder.start(meta={"source": "demo", "t0": t0, "serial": serial,
-                         "model": args.model, "action": "human"},
+                         "model": args.model, "action": "human", "mem": bool(args.mem)},
                    session_name=sess.name)
+
+    _memw = None
+    if args.mem:
+        try:
+            from wzry.vision.mem_battle import MemBattle, MemWorker
+            mb = MemBattle(serial=serial or "127.0.0.1:16384")
+            mb.connect()
+            mem_t0 = time.time()
+
+            def _exp_clock():
+                if args.mem_clock_hint is not None:
+                    return int(args.mem_clock_hint + max(0.0, time.time() - mem_t0))
+                return int(max(0.0, time.time() - mem_t0))
+
+            _memw = MemWorker(mb, self_id=args.mem_self_id,
+                              interval=1.0 / max(0.2, args.mem_hz),
+                              expected_clock_fn=_exp_clock).start()
+            print(f"[mem] 内存直读已开启: pid={mb.pid} self_id={args.mem_self_id or 'slot0'}")
+        except Exception as exc:
+            print(f"[mem] 启动失败（降级纯视觉）: {type(exc).__name__}: {exc}")
+            _memw = None
 
     detect_interval = 1.0 / max(0.5, args.detect_hz)
     last_detect = 0.0
@@ -270,6 +296,11 @@ def main():
                 state_dict.setdefault("ui", {})["skill_states"] = ui["skill_states"]
             if ui["mp_bar"]:
                 state_dict.setdefault("ui", {})["mp"] = ui["mp_bar"][-1]
+            if _memw is not None:
+                try:
+                    _memw.apply(state_dict)
+                except Exception:
+                    pass
             recorder.on_state(state_dict)
             recorder.on_frame(frame)
             n_ticks += 1
@@ -282,6 +313,8 @@ def main():
     except KeyboardInterrupt:
         print("\n手动结束录制。")
     finally:
+        if _memw is not None:
+            _memw.stop()
         if not args.no_touch:
             touch.stop()
         cap.stop()

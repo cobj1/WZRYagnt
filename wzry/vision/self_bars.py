@@ -23,6 +23,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from wzry.vision import colors   # HSV 判据单一事实来源（v15.3）
+
 # 血条特征
 BRIGHT_V = 140          # 血条高亮
 BAR_W_MIN, BAR_W_MAX = 25, 150
@@ -77,12 +79,53 @@ FULL_BAR_W = 115.0
 # 血条中心到英雄位置垂直距离（血条在头顶上方）
 HERO_BAR_GAP = 55
 
+# v16.0 分段式血条的"桥接"宽度：真机 10-18 的血条每 ~10px 有一道黑刻度，
+#   绿色连续段往往 < 开运算核(21px) -> 整条被抹掉。闭运算 13px 可跨过单道刻度。
+SELF_BAR_BRIDGE = 13
 
-def _find_bars(frame, hue_cond, label):
-    """全画面找指定颜色的高亮细横条。"""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    H, S, V = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
-    mask = (hue_cond(H, S, V) & (V > BRIGHT_V)).astype(np.uint8) * 255
+
+def _spec_mask_u8(hsv, spec, v_gt=BRIGHT_V):
+    """colors 规格 -> 0/255 掩码，用 `cv2.inRange`(C++) 实现。
+
+    v15.3 逐像素等价于旧式 `(hue_cond(H,S,V) & (V > BRIGHT_V)).astype(np.uint8) * 255`：
+    阈值全 <256，inRange 的闭区间边界与 `>=`/`<=` 一一对应；`V > v_gt` 折算成 `V >= v_gt+1`
+    并与规格自带的 V 下界取较大者（旧实现无条件 AND 上 `V > BRIGHT_V`，故规格里的更宽 V 门不生效）。
+    """
+    h_lo, h_hi, s_lo, s_hi, v_lo, v_hi = spec
+    if v_gt is not None:
+        v_lo = (v_gt + 1) if (v_lo is None or v_gt + 1 > v_lo) else v_lo
+    s0, s1 = (0 if s_lo is None else s_lo), (255 if s_hi is None else s_hi)
+    v0, v1 = (0 if v_lo is None else v_lo), (255 if v_hi is None else v_hi)
+    if h_lo > h_hi:                                   # 红：色相环绕
+        return cv2.bitwise_or(cv2.inRange(hsv, (0, s0, v0), (h_hi, s1, v1)),
+                              cv2.inRange(hsv, (h_lo, s0, v0), (180, s1, v1)))
+    return cv2.inRange(hsv, (h_lo, s0, v0), (h_hi, s1, v1))
+
+
+def _find_bars(frame, hue_cond, label, hsv=None, bridge=0, y_top=None):
+    """全画面找指定颜色的高亮细横条。
+
+    v15.2 性能（逐像素等价）：
+      - H/S/V 直接用 uint8 视图，不再 `astype(int)`（全帧升 int64 实测 ~11ms/次，
+        而所有颜色阈值都 <256，比较结果逐像素一致）；
+      - `hsv` 可由调用方传入复用 —— detect_all_bars 的三种颜色本就要各扫一遍全帧。
+    v15.3：`hue_cond` 可传 colors 规格(6 元组) -> 走 `cv2.inRange` 快路径（全帧布尔运算约
+      5ms/色 -> 约 0.5ms）；旧式 callable 仍兼容（脚本/调试用）。
+    v16.0：`bridge` = 先做 (bridge,1) 的**闭运算**把被黑色刻度切断的色段接回去。
+      真机 10-18 出现"分段式血条"（每 ~10px 一道黑刻度），绿色连续段 < 下面开运算的
+      21px 核 -> 整条被抹平、连一条候选都找不到（实测 0 条）。见 self_hp_mp 调用处。
+    """
+    if hsv is None:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    if isinstance(hue_cond, tuple):                   # colors 规格 -> inRange 快路径
+        mask = _spec_mask_u8(hsv, hue_cond)
+    else:
+        H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        mask = (hue_cond(H, S, V) & (V > BRIGHT_V)).astype(np.uint8) * 255
+    if bridge and bridge > 1:
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (int(bridge), 1)))
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 1))
     bars = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
     n, lab, st, cent = cv2.connectedComponentsWithStats(bars, 8)
@@ -94,7 +137,8 @@ def _find_bars(frame, hue_cond, label):
                 and area >= BAR_AREA_MIN):
             continue
         lx, ly = int(cent[i][0]), int(cent[i][1])
-        if lx > EXCLUDE_X or ly < EXCLUDE_Y_TOP or ly > EXCLUDE_Y_BOTTOM:
+        _yt = EXCLUDE_Y_TOP if y_top is None else y_top
+        if lx > EXCLUDE_X or ly < _yt or ly > EXCLUDE_Y_BOTTOM:
             continue
         found.append({"x": lx, "y": ly, "w": w_, "h": h_, "ratio": w_ / 150.0})
     found.sort(key=lambda b: (b["y"], b["x"]))
@@ -110,19 +154,11 @@ def detect_all_bars(frame):
     v2.92: 敌人红条专属过滤 y>=300 (顶部头像条 y240-300 红边=队友头像误判) + x>=380
             (左上角小队头像条列 x 220-380 全为 UI)
     """
-    def is_green(H, S, V):
-        return (H >= 35) & (H <= 90) & (S > 50)
-
-    def is_blue(H, S, V):
-        return (H >= 90) & (H <= 135) & (S > 60)
-
-    def is_red(H, S, V):
-        return ((H <= 15) | (H >= 165)) & (S > 60)
-
-    result = {
-        "self": _find_bars(frame, is_green, "self"),
-        "allies": _find_bars(frame, is_blue, "ally"),
-        "enemies": _find_bars(frame, is_red, "enemy"),
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)   # v15.2: 三色共用一次全帧转换
+    result = {   # v15.3 阈值集中到 wzry/vision/colors.py；传规格 -> 走 inRange 快路径
+        "self": _find_bars(frame, colors.GREEN_SCAN, "self", hsv=hsv),
+        "allies": _find_bars(frame, colors.BLUE_SCAN, "ally", hsv=hsv),
+        "enemies": _find_bars(frame, colors.RED_CAMP, "enemy", hsv=hsv),
     }
     # v2.92 敌人红条 UI 带排除: 顶部头像条区(y<300, x<380)与左列小队头像条(x<380)
     result["enemies"] = [b for b in result["enemies"]
@@ -152,9 +188,18 @@ def find_color_bars(frame, is_col, y_top=70, y_bot=635, x_max=1230,
            条厚 < thick_min 或 > thick_max 的条剔除(野怪白给, 英雄误杀).
     排除：小地图区(x<245,y<245)、右上/右下 UI(x>=x_max)、底部(y>y_bot)。
     """
+    h, w = frame.shape[:2]
+    # v15.3 修既有缺陷: y_bot/x_max 是 720p 默认值, 在 20:9(1280x576) 帧上会越界 IndexError
+    y_bot = min(int(y_bot), h)
+    x_max = min(int(x_max), w)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    H, S, V = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
-    mask = is_col(H, S, V).astype(np.uint8)
+    if isinstance(is_col, tuple):
+        # v15.3 colors 规格 -> inRange 快路径；不加 V>BRIGHT 约束（与旧实现一致），
+        #   `> 0` 是为了保持旧实现的 0/1 口径（下游只用真值性，但 0/1 便于逐像素比对）
+        mask = (_spec_mask_u8(hsv, is_col, v_gt=None) > 0).astype(np.uint8)
+    else:
+        H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        mask = is_col(H, S, V).astype(np.uint8)
     rows = []  # (y, x0, x1)
     for y in range(y_top, y_bot):
         if exclude_mm:
@@ -207,13 +252,13 @@ def find_color_bars(frame, is_col, y_top=70, y_bot=635, x_max=1230,
 
 
 def find_ally_bars(frame):
-    """队友蓝条（分段合并版）。"""
-    return find_color_bars(frame, lambda H, S, V: (H >= 90) & (H <= 135) & (S > 55) & (V > 60))
+    """队友蓝条（分段合并版）。阈值: colors.BLUE_SEG。"""
+    return find_color_bars(frame, colors.BLUE_SEG)
 
 
 def find_enemy_bars(frame):
-    """敌人红条（分段合并版）。"""
-    return find_color_bars(frame, lambda H, S, V: ((H <= 15) | (H >= 165)) & (S > 60) & (V > 60))
+    """敌人红条（分段合并版）。阈值: colors.RED_SEG。"""
+    return find_color_bars(frame, colors.RED_SEG)
     """在头顶区域找指定色相的横条，返回 (ratio, 条长, 区域宽)。
 
     v2.13：改用连通域找最长水平条（逐行 run 对血条渐变/缺口不鲁棒）。
@@ -248,8 +293,7 @@ def kill_banner_px(frame):
         if roi.size == 0:
             return 0
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        H, S, V = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
-        return int(((H >= 15) & (H <= 40) & (S > 120) & (V > 140)).sum())
+        return colors.count(hsv, colors.YELLOW_KILL)   # v15.3 阈值见 colors.py
     except Exception:
         return 0
 
@@ -262,8 +306,7 @@ def death_banner_px(frame):
         if roi.size == 0:
             return 0
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        H, S, V = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
-        return int((((H <= 15) | (H >= 165)) & (S > 80) & (V >= 40) & (V <= 150)).sum())
+        return colors.count(hsv, colors.RED_DEATH)   # v15.3 阈值见 colors.py
     except Exception:
         return 0
 
@@ -282,23 +325,20 @@ def self_hp_mp(frame):
     """
     h, w = frame.shape[:2]
 
-    def is_green(H, S, V):
-        return (H >= 35) & (H <= 90) & (S > 30) & (V > 45)   # v2.86 放宽(PW帧S/V低)
-
-    def is_blue(H, S, V):
-        return (H >= 85) & (H <= 140) & (S > 35) & (V > 35)   # v2.80 放宽(PW帧S偏低)
-
-    greens = _find_bars(frame, is_green, "self")
+    # v16.0 两处放宽（真机 10-18 出现"分段式血条 + 镜头偏高"，原判据一条都找不到）：
+    #   1) bridge=SELF_BAR_BRIDGE：黑色刻度把绿条切成 <21px 的短段，会被开运算(21,1)整条抹掉
+    #      （实测该帧 0 条候选）
+    #   2) y 上下界改比例：原来固定 [250,550]，而该帧自己血条在 y≈206，被直接排除
+    greens = _find_bars(frame, colors.GREEN_SELF_LOOSE, "self",
+                        bridge=SELF_BAR_BRIDGE, y_top=int(0.30 * h))
     if not greens:
         return None, None, None
     # 排除小地图方形区域 (x<240, y<240) 里的绿点/绿圈
     greens = [b for b in greens if not (b["x"] < 240 and b["y"] < 240)]
-    # 排除 HUD 区误检：自己英雄镜头跟随一般在画面中部，血条 y>=250
-    # （右上角头像/技能图标/金币动画的绿色元素 y<250）
-    greens = [b for b in greens if b["y"] >= 250]
-    # v3.0: 血条 y<=550（自己英雄在画面中央，血条不会低于 550；
-    # 底部按钮区(战队/结算界面)绿色按钮 y 600+ 误检排除）
-    greens = [b for b in greens if b["y"] <= 550]
+    # 排除 HUD 区误检：自己英雄镜头跟随一般在画面中部
+    greens = [b for b in greens if b["y"] >= 0.30 * h]
+    # 底部按钮区(战队/结算界面)绿色按钮误检排除
+    greens = [b for b in greens if b["y"] <= 0.96 * h]
     if not greens:
         return None, None, None
     # 自己血条 = 最宽的绿条（血条 90-123px，场景绿 <60px）
@@ -319,8 +359,7 @@ def self_hp_mp(frame):
         if x_hi > x_lo:
             sub = frame[y0:y1, x_lo:x_hi]
             hsv2 = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
-            H2, S2, V2 = hsv2[..., 0].astype(int), hsv2[..., 1].astype(int), hsv2[..., 2].astype(int)
-            m2 = ((H2 >= 90) & (H2 <= 135) & (S2 > 60) & (V2 > 60))
+            m2 = colors.mask(hsv2, colors.BLUE_MP)   # v15.3 阈值见 colors.py
             cols = m2.any(axis=0)
             if cols.any():
                 last = int(np.nonzero(cols)[0].max())

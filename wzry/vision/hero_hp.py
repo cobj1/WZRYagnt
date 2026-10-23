@@ -21,8 +21,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import cv2
 import numpy as np
 
+from wzry.vision import colors   # HSV 判据单一事实来源（v15.3）
 from wzry.vision.hok_yolov5 import _bar_color_fracs
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,10 +41,8 @@ MIN_RUN = 12                 # 实心段最小长度：低于它当噪声（避�
 
 
 def _red_mask(bgr):
-    import cv2
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    H, S, V = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
-    return (((H <= 15) | (H >= 168)) & (S > 50) & (V > 80)).astype(np.uint8)
+    # v15.3 阈值集中到 wzry/vision/colors.py（RED_SCENE）
+    return colors.mask_u8(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV), colors.RED_SCENE)
 
 
 def _max_run(mask):
@@ -135,7 +135,6 @@ def lock_target(frame, cfg=None):
     `present=False`（屏幕上没有锁定目标）时 ratio 为 None —— 这时**不要**把旧值当新值用。
     ratio = 填充长度 / 条体全长；这是近似值（相机/皮肤可能微调），实测误差 ≤0.7pp。
     """
-    import cv2
     cfg = cfg or load_lock_cfg()
     x0, x1 = int(cfg["x0"]), int(cfg["x1"])
     y0, y1 = int(cfg["y0"]), int(cfg["y1"])
@@ -145,8 +144,9 @@ def lock_target(frame, cfg=None):
         return {"present": False, "ratio": None, "red_frac": 0.0, "reason": "lock_target ROI 越界"}
     box = frame[y0:y1, x0:x1]
     hsv = cv2.cvtColor(box, cv2.COLOR_BGR2HSV)
-    H, S, V = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
-    hue_red = ((H <= 15) | (H >= 168)) & (S > 80)
+    V = hsv[..., 2]
+    # v15.3 阈值集中到 colors.py（RED_LOCK = 色相+饱和度；亮度按空槽/填充分两支，仍在本处）
+    hue_red = colors.mask(hsv, colors.RED_LOCK)
     red_frac = float((hue_red & (V > 90)).mean())        # 含暗红空槽：用来判"有没有目标"
     if red_frac < LOCK_PRESENT_MIN:
         return {"present": False, "ratio": None, "red_frac": round(red_frac, 3),

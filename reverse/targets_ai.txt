@@ -1,0 +1,18 @@
+# 目标：定位对局 AI 决策相关函数的引用点（libGameCore.so 已 strip 本地符号）
+[SelectTactics]
+[FinalSelectTactics]
+[CurrentTacticsCheck]
+[Last Tactics Execute]
+[InitHeroTacticsInfo]
+[GetTacticsConfigList]
+RuleTactics->Process
+RuleTactics::ProcessLingerInSpring
+RuleTactics::IsInDangerousPlace
+RuleTactics::KeepAwayFromEnemyTower
+AITargetSearcher::GetNearestEnemy
+AITrialHuicheng
+AITrialGuaji
+AITrialFeedTower
+game_ai_model_config
+tactics_config_file
+AILab/ai_config

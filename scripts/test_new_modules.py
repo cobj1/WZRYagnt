@@ -97,6 +97,7 @@ check("T4d 未标定时优雅降级（不报错、found=False）",
 
 # T4e 自标定脚本端到端：合成帧（5 条同色 + 空槽延伸）必须被判定为"通过校验"；
 #     非对局帧（静态 UI 条）必须被拒（否则 --write 会把错 ROI 固化进标定文件）
+import os  # noqa: E402
 import subprocess  # noqa: E402
 
 tmp_img = ROOT / "temp" / "test_topbar.png"
@@ -114,7 +115,10 @@ for i, x in enumerate((60, 150, 240, 330, 420)):     # 静态 UI 条：无空槽
 cv2.imwrite(str(tmp_img), _fake)
 _r2 = subprocess.run([sys.executable, str(ROOT / "scripts" / "calibrate_top_bar.py"),
                       str(tmp_img), "--write"],
-                     capture_output=True, text=True, encoding="utf-8", errors="replace")
+                     capture_output=True, text=True, encoding="utf-8", errors="replace",
+                     # 子进程 stdout 是管道 -> Python 3.12 按系统 ANSI 码页(GBK)输出,
+                     # 这里按 utf-8 解码 -> 下面按中文串判定会误红(T4e 只查 ASCII 不受影响)。
+                     env={**os.environ, "PYTHONUTF8": "1"})
 check("T4f 无空槽延伸的静态条 -> 拒绝校验（不进 --write 分支）",
       "拒绝写盘" in (_r2.stdout or "") or _r2.returncode == 3
       or "未找到候选" in (_r2.stdout or ""),
@@ -123,7 +127,13 @@ check("T4f 无空槽延伸的静态条 -> 拒绝校验（不进 --write 分支�
 # ---------------------------------------------------------------- 5. 数字读数器
 from wzry.vision import digit_reader as DR  # noqa: E402
 
-tpl = DR.build_templates()
+# ⚠️ build_templates() 的默认 out 是 configs/digit_templates.npz（**生产模板库**）。
+# 真机字形是用 scripts/calibrate_digits.py 有监督抠出来的、存量很少，
+# 测试直接调它会把真机字形**洗掉**（实测：跑完测试库就从 208 条回到 204 条）。
+# 所以这里必须写到 temp 下的副本。
+_t5_tpl_path = ROOT / "temp" / "digit_templates_test.npz"
+_t5_tpl_path.parent.mkdir(parents=True, exist_ok=True)
+tpl = DR.build_templates(_t5_tpl_path)
 img = np.full((40, 120, 3), 20, np.uint8)
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -135,7 +145,11 @@ try:
     check("T5  数字读数器认出合成 '1234'", num == 1234, f"got={num} conf={confs}")
 except Exception as e:
     check("T5  数字读数器（字体不可用跳过）", True, f"skip: {e}")
-check("T5b 模板文件已落盘", DR.TPL_PATH.exists())
+check("T5b 模板文件已落盘（写到 temp 副本，不污染生产库）",
+      _t5_tpl_path.exists() and DR.TPL_PATH.exists())
+check("T5b2 生产模板库里含真机字形（calibrate_digits 抠的，不应被测试洗掉）",
+      int(np.load(DR.TPL_PATH)["labels"].size) >= 204,
+      f"生产库 {int(np.load(DR.TPL_PATH)['labels'].size)} 条")
 check("T5c 未标定 ROI 返回 None（优雅降级）", DR.read_roi(np.zeros((720, 1280, 3), np.uint8),
                                                         "gold", rois={})[0] is None)
 
@@ -642,6 +656,432 @@ check("T26e 超过陈旧上限(1.5s > 0.6s) -> 许可失效，回到常规门槛
       _a10.get("reason") == "disengage_retreat", str(_a10))
 check("T26f 常量可调，且三层门槛有序（收人头 0.35 < 占优推进 0.50 < 常规 0.60）",
       m2mod.KILL_SELF_HP_MIN < m2mod.PRESS_SELF_HP_MIN < m2mod.ENGAGE_HP_MIN)
+
+# ---------------------------------------------------------------- 27. P0-F1 敌塔威胁（小地图分阵营塔）
+check("T27a P0-F2 分阵营键已注入 build_state（旧键保留）+ F1 只认分阵营敌塔",
+      '"towers_v7": mm.get("towers_v7")' in _src2 and '"towers": mm["towers"],' in _src2
+      and "def _mm_enemy_towers" in _src2)
+check("T27b 旧 YOLO 屏幕空间塔判据已删净（TURRET_ESCAPE_FRAC / TURRET_THREAT_FRAC / _is_base_building）",
+      not hasattr(m2mod, "TURRET_ESCAPE_FRAC") and not hasattr(m2mod, "TURRET_THREAT_FRAC")
+      and "_is_base_building" not in _src2
+      and hasattr(m2mod, "TURRET_MM_THREAT") and hasattr(m2mod, "TURRET_MM_ESCAPE"))
+
+
+def _tstate(tw_enemy, hp=0.85):
+    """最小状态：无单位/无小地图点，只有敌塔(分阵营) —— 自身位置走 cooldowns["self_est"]。"""
+    return {"t": 100.0, "screen_size": (1280, 720), "units": [],
+            "ui": {"hp": hp, "mp": 1.0}, "extra": {},
+            "minimap": {"found": True,
+                        "dots": {"blue": [], "red": [], "green": [], "yellow": []},
+                        "towers": [list(t) for t in tw_enemy],
+                        "towers_v7": {"ally": [], "enemy": [{"n": list(t)} for t in tw_enemy]}}}
+
+
+_TOW = (0.30, 0.40)
+_a = m2mod.decide(_tstate([_TOW]), {"camp": "blue", "self_est": _TOW})
+check("T27c 自身估算位置就在敌塔上 -> escape_turret（这条以前是死代码）",
+      _a.get("reason") == "escape_turret", str(_a))
+
+_co_h = {"camp": "blue", "self_est": _TOW}
+m2mod.decide(_tstate([_TOW]), _co_h)
+_co_h["self_est"] = (0.90, 0.90)          # 逃出去后自身位置已经远了
+_a = m2mod.decide(_tstate([_TOW]), _co_h)
+check("T27d 逃出后 1.5s 内保持远离（escape_turret_hold）",
+      _a.get("reason") == "escape_turret_hold", str(_a))
+_a = m2mod.decide({**_tstate([_TOW]), "t": 102.0}, _co_h)
+check("T27d2 超过 1.5s -> hold 失效（不会一路逃下去）",
+      _a.get("reason") != "escape_turret_hold", str(_a))
+
+_a = m2mod.decide(_tstate([_TOW]),
+                  {"camp": "blue", "self_est": (0.90, 0.90),
+                   "escape_t": 100.0, "hp_drop_t": 100.0})
+check("T27e 只由血条急降置的 escape_t **不**进塔 hold（不误绑到敌塔上）",
+      _a.get("reason") != "escape_turret_hold", str(_a))
+
+_NEAR = (0.375, 0.40)          # 距塔 0.075 ∈ (ESCAPE 0.06, THREAT 0.09)
+_a = m2mod.decide(_tstate([_TOW]), {"camp": "blue", "self_est": _NEAR})
+check("T27f 距敌塔 0.075（圈外但靠近）+ 屏内无敌人 -> avoid_turret",
+      _a.get("reason") == "avoid_turret", str(_a))
+
+_a = m2mod.decide(_tstate([_TOW]), {"camp": "blue", "self_est": (0.90, 0.90)})
+check("T27g 距敌塔很远 -> 无任何塔动作（与修复前行为一致）",
+      _a.get("reason") not in ("escape_turret", "escape_turret_hold", "avoid_turret"), str(_a))
+
+_st_h = _tstate([])
+_st_h["minimap"]["towers"] = [list(_TOW)]        # 旧"混合未分类"列表里有塔
+_a = m2mod.decide(_st_h, {"camp": "blue", "self_est": _TOW})
+check("T27h 只有未分类 mm['towers'] -> 不判敌塔（不猜：拿自家塔乱撤更糟）",
+      _a.get("reason") != "escape_turret", str(_a))
+
+_a = m2mod.decide(_tstate([_TOW]), {"camp": "blue", "self_est": _TOW, "match_start_t": 100.0})
+check("T27i 开局 8s 内不判塔威胁（保留原有开局保护）",
+      _a.get("reason") != "escape_turret", str(_a))
+
+# ---------------------------------------------------------------- 28. P0-F3 视野外敌人粗判据
+check("T28 F3 粗判据已落地（纯函数，供 P1 push_ok 消费）", hasattr(m2mod, "enemy_out_of_view"))
+_oov = m2mod.enemy_out_of_view(
+    {"minimap": {"found": True, "dots": {"blue": [[0.2, 0.3], [0.3, 0.4]], "red": []}}, "units": []})
+check("T28b 屏内无任何敌英 + 我方 2 人 -> suspect_gank（对面可能在蹲）",
+      _oov["suspect_gank"] and _oov["ally_seen"] == 2, str(_oov))
+_oov2 = m2mod.enemy_out_of_view(
+    {"minimap": {"found": True, "dots": {"blue": [[0.2, 0.3]], "red": []}}, "units": []})
+check("T28c 视野内我方只有 1 人 -> 不判蹲（宁缺勿滥）", not _oov2["suspect_gank"], str(_oov2))
+_oov3 = m2mod.enemy_out_of_view(
+    {"minimap": {"found": True, "dots": {"blue": [[0.2, 0.3], [0.3, 0.4]], "red": [[0.8, 0.1]]}},
+     "units": []})
+check("T28d 小地图有红点 -> 不算视野外", not _oov3["suspect_gank"], str(_oov3))
+_oov4 = m2mod.enemy_out_of_view(
+    {"minimap": {"found": True, "dots": {"blue": [[0.2, 0.3], [0.3, 0.4]], "red": []}},
+     "units": [{"cls": "enemy_hero", "screen": [0.5, 0.5, 0.02, 0.03],
+                "conf": 0.9, "camp_src": "bar"}]})
+check("T28e 屏内有可信敌英 -> 不算视野外", not _oov4["suspect_gank"], str(_oov4))
+_oov5 = m2mod.enemy_out_of_view({"minimap": {}, "units": []})
+check("T28f 拿不到小地图 -> 不判蹲（不猜）", not _oov5["suspect_gank"], str(_oov5))
+
+# ---------------------------------------------------------------- 29. P1 推进门控 / 目标点（纯函数，未接线）
+import math  # noqa: E402
+
+check("T29a P1 常量齐备且自洽（站位 > F1 的靠近半径；hp 门高于残血线）+ 两个函数已在",
+      all(hasattr(m2mod, _k) for _k in (
+          "PUSH_SELF_HP_MIN", "PUSH_MIN_ALLY", "PUSH_ALLY_NEAR", "PUSH_CORRIDOR_K",
+          "PUSH_WAVE_NEAR", "PUSH_STANDOFF", "PUSH_LEAD"))
+      and m2mod.PUSH_STANDOFF > m2mod.TURRET_MM_THREAT
+      and m2mod.PUSH_SELF_HP_MIN > m2mod.LOW_HP_FRAC
+      and hasattr(m2mod, "push_ok") and hasattr(m2mod, "push_target"))
+
+_EST = (0.70, 0.68)
+_CO_P = {"camp": "blue", "self_est": _EST}
+
+
+def _pstate(hp=0.80, blue=((0.2, 0.2), (0.3, 0.3)), red=((0.2, 0.9),),
+            towers=((0.95, 0.92),), waves=((0.72, 0.70),)):
+    """推进测试的最小状态：自身位置走 cooldowns["self_est"]，其余只给推动所需要的键。"""
+    return {"t": 1000.0, "screen_size": (1280, 720), "units": [],
+            "ui": {"hp": hp, "mp": 1.0}, "extra": {},
+            "minimap": {"found": True,
+                        "dots": {"blue": [list(p) for p in blue],
+                                 "red": [list(p) for p in red],
+                                 "green": [[0.074, 0.88]], "yellow": []},
+                        "towers": [list(t) for t in towers],
+                        "towers_v7": {"ally": [], "enemy": [{"n": list(t)} for t in towers]},
+                        "v7": {"minions": {"ally": [{"n": list(p)} for p in waves],
+                                           "enemy": []}}}}
+
+
+_ok1, _why1 = m2mod.push_ok(_pstate(), _CO_P)
+_pt1, _r1 = m2mod.push_target(_pstate(), _CO_P)
+check("T29b 占优 + 有兵线 + 走廊内有敌塔 -> 可推，且首选跟兵线",
+      _ok1 and _why1 == "push_ok" and _r1 == "push_follow_wave", f"{_why1}/{_r1}")
+check("T29b2 目标点在走廊内、离敌塔 >= PUSH_STANDOFF（不贴脸）",
+      _pt1 is not None
+      and math.hypot(_pt1[0] - 0.75, _pt1[1] - 0.72) <= m2mod.PUSH_CORRIDOR_K
+      and math.hypot(_pt1[0] - 0.95, _pt1[1] - 0.92) >= m2mod.PUSH_STANDOFF, str(_pt1))
+
+check("T29c 无我方兵线 -> 不推（推塔要靠兵线）",
+      m2mod.push_ok(_pstate(waves=()), _CO_P) == (False, "push_blocked_no_wave"))
+check("T29d 视野内我方 0 个点且身边没队友 -> 不推（孤身不推）",
+      m2mod.push_ok(_pstate(blue=()), _CO_P) == (False, "push_blocked_alone"))
+check("T29d3 P3-A 放宽后：只有 1 个蓝点也够（人数门 2->1）",
+      m2mod.push_ok(_pstate(blue=((0.2, 0.2),)), _CO_P)[0] is True)
+check("T29d2 可见敌人 3 个 (> 2 绝对上限) -> 不推（B″ 判据3）",
+      m2mod.push_ok(_pstate(red=((0.1, 0.1), (0.2, 0.2), (0.3, 0.3))), _CO_P)
+      == (False, "push_blocked_outnumbered"))
+check("T29d2b B″：红 2 vs 蓝 1（旧\"相对比较\"会被判人数劣挡住）-> 绝对上限 <=2 故允许",
+      m2mod.push_ok(_pstate(blue=((0.2, 0.2),), red=((0.1, 0.1), (0.2, 0.9))), _CO_P)[0] is True)
+check("T29e 自己血 0.40 (< 0.45) -> 不推",
+      m2mod.push_ok(_pstate(hp=0.40), _CO_P) == (False, "push_blocked_hp"))
+check("T29e2 P3-A 放宽后：0.45 血就能推（血门 0.55->0.45）",
+      m2mod.push_ok(_pstate(hp=0.45), _CO_P)[0] is True)
+check("T29f 走廊内没有敌塔 -> 不推（回退原行为）",
+      m2mod.push_ok(_pstate(towers=()), _CO_P) == (False, "push_blocked_no_tower"))
+check("T29g 已站在塔外站位圈内(d=0.028) -> 不推（先由 F1 撤出去）",
+      m2mod.push_ok(_pstate(towers=((0.72, 0.70),)), _CO_P) == (False, "push_blocked_too_close"))
+check("T29h 逃/被重击窗口内 -> 不推",
+      m2mod.push_ok(_pstate(), {**_CO_P, "escape_t": 1000.0}) == (False, "push_blocked_escaping"))
+
+_co_blind = dict(_CO_P)
+_ok_b0, _ = m2mod.push_ok(_pstate(red=()), _co_blind)          # t=1000 进入"没敌人"，开窗
+check("T29i B′：单拍看不见敌人**不**判蹲（正常单带时对面本来就不在视野里）",
+      _ok_b0 is True and "blind_start" in _co_blind)
+check("T29i2 B′：该窗口持续到 10s（>=8s）且身边没队友 -> 才判蹲",
+      m2mod.push_ok({**_pstate(red=()), "t": 1010.0}, _co_blind)
+      == (False, "push_blocked_gank"))
+check("T29i3 B′：一旦有敌人露头 -> 窗口重置（不再判蹲）",
+      m2mod.push_ok({**_pstate(red=((0.2, 0.9),)), "t": 1010.0}, _co_blind)[0] is True)
+check("T29i4 B′：重置后马上又看不见，但没到 8s -> 不判蹲",
+      m2mod.push_ok({**_pstate(red=()), "t": 1012.0}, _co_blind)[0] is True)
+_co_blind2 = dict(_CO_P)
+m2mod.push_ok(_pstate(red=(), blue=((0.71, 0.69), (0.2, 0.2))), _co_blind2)
+check("T29i5 B′：就算蹲窗口已超时，只要身边就有队友 -> 允许跟队友推",
+      m2mod.push_ok({**_pstate(red=(), blue=((0.71, 0.69), (0.2, 0.2))), "t": 1010.0},
+                    _co_blind2)[0] is True)
+
+_far = {"camp": "blue", "self_est": (0.30, 0.30)}
+_st_far = _pstate(blue=((0.30, 0.31), (0.31, 0.30)), red=(),
+                  towers=((0.75, 0.72),), waves=((0.32, 0.32),))
+_ok2, _why2 = m2mod.push_ok(_st_far, _far)
+_pt2, _r2 = m2mod.push_target(_st_far, _far)
+check("T29j 门控通过但目标点落在走廊外 -> 放弃推进（防推着推着跑河道/对抗路）",
+      _ok2 and _pt2 is None and _r2 == "push_blocked_corridor", f"{_why2}/{_r2}")
+
+check("T29k 塔选择 = 最近且**在走廊内**（走廊外的近塔不选）",
+      m2mod._push_pick_tower([(0.30, 0.30), (0.95, 0.92)], (0.72, 0.70), (0.75, 0.72), 0.30)
+      == (0.95, 0.92))
+check("T29l 兵线选择 = 最近且更靠敌方（身后那条不选）",
+      m2mod._push_pick_wave([(0.45, 0.55), (0.60, 0.40)], (0.5, 0.5), (0.7, -0.7))
+      == (0.60, 0.40))
+_pt3, _r3 = m2mod.push_target(_pstate(waves=()), _CO_P)
+_d3 = math.hypot(_pt3[0] - 0.95, _pt3[1] - 0.92) if _pt3 else -1.0
+check("T29m 无兵线时退回压塔：目标离塔 = PUSH_STANDOFF 且仍在走廊内",
+      _r3 == "push_lane_tower" and abs(_d3 - m2mod.PUSH_STANDOFF) < 0.02, f"{_r3} d={_d3:.3f}")
+
+_da = m2mod.decide(_pstate(), dict(_CO_P))
+check("T29n P1 未接线：同一个'该推'的场景，decide() 仍返回老的 dps_lane_push",
+      _da.get("reason") == "dps_lane_push", str(_da))
+
+# ---------------------------------------------------------------- 30. P2 接线：--push off|shadow|on
+check("T30a 三档开关已接线（CLI --push + cooldowns['push_mode'] + decide 里的分支）",
+      'choices=["off", "shadow", "on"]' in _src2 and '"push_mode"' in _src2
+      and "--push" in _src2)
+_a_off = m2mod.decide(_pstate(), dict(_CO_P))
+_a_sh = m2mod.decide(_pstate(), {**_CO_P, "push_mode": "shadow"})
+check("T30b **shadow 与 off 动作逐字节一致**（本方案最重要的安全性质）",
+      _a_sh == _a_off, f"{_a_sh} vs {_a_off}")
+_co_sh = {**_CO_P, "push_mode": "shadow"}
+m2mod.decide(_pstate(), _co_sh)
+check("T30c shadow 照常评估并落盘（ok / why / 预计点位）",
+      _co_sh.get("push_info", {}).get("ok") is True
+      and _co_sh["push_info"]["target"] is not None, str(_co_sh.get("push_info")))
+_co_off = dict(_CO_P)
+m2mod.decide(_pstate(), _co_off)
+check("T30d off 时**完全不评估**（连 push_info 都不产生：零开销）",
+      "push_info" not in _co_off)
+_a_on = m2mod.decide(_pstate(), {**_CO_P, "push_mode": "on"})
+check("T30e on 时真正接管移动（reason = push_follow_wave）",
+      _a_on.get("reason") == "push_follow_wave", str(_a_on))
+_a_on2 = m2mod.decide(_pstate(waves=()), {**_CO_P, "push_mode": "on"})
+check("T30f on 但被闸挡掉（无兵线）-> 退回原行为 dps_lane_push（条件不成立即与 off 一致）",
+      _a_on2.get("reason") == "dps_lane_push", str(_a_on2))
+check("T30g 每拍 push 评估结果已进 behavior.jsonl 记录（shadow 一局即可统计占比）",
+      '"push": (state_dict.get("extra") or {}).get("push")' in _src2)
+_co_ps = {"push_mode": "shadow"}
+_a_ps = m2mod.decide(_mk_cs(0.40, True, 0.20), _co_ps)      # 走接战/技能分支, 到不了移动块
+check("T30j shadow 下没走到移动块的拍 push_info=None（不贴上一拍的陈旧值）",
+      _co_ps.get("push_info", "missing") is None)
+# 真机跑出来才发现的静默失败：'# 底部信息条' 与 beh_label 赋值曾被挤在同一行 ->
+#   赋值从没执行 -> NameError 被 except:pass 吞掉 -> behavior.jsonl 从来没生成过
+_lines2 = _src2.splitlines()
+check("T30h beh_label 赋值是真代码行（不被历史格式损坏成注释）",
+      any(_l.strip().startswith("beh_label =") for _l in _lines2))
+check("T30h2 记录写盘失败不再静默（会打印 [annot-record]）",
+      '"[annot-record] 行为记录写入失败' in _src2)
+check("T30i screencap 采集能拿到 --serial（真机 USB 否则恒连 127.0.0.1:16384，实测 0 帧）",
+      "ScreencapCapture(interval=0.02, rotate_s=1800," in _src2)
+
+# ---------------------------------------------------------------- 31. E-P0 推进优先级（支援帧只评估，不采用）
+_SUP_BLUE = ((0.72, 0.70),)          # 落在射手走廊内 -> 会走 support_dps_lane 分支
+check("T31a E 常量/工具已在（PUSH_STAY_WITH_ALLY + _push_eval）",
+      hasattr(m2mod, "PUSH_STAY_WITH_ALLY") and hasattr(m2mod, "_push_eval"))
+
+_co_e = {"camp": "blue", "self_est": _EST, "push_mode": "shadow"}
+_a_e = m2mod.decide(_pstate(blue=_SUP_BLUE), _co_e)
+_fi_e = _co_e.get("push_info") or {}
+check("T31b 支援帧也会评估推进(scope=support)，但动作**仍是 support_dps_lane**（E-P0 不采用）",
+      _fi_e.get("scope") == "support" and _fi_e.get("ok") is True
+      and _a_e.get("reason") == "support_dps_lane", f"{_fi_e.get('scope')}/{_a_e.get('reason')}")
+check("T31c e_ok=1：队友在前方且推进点没甩开他 -> E-P1 接线后这一拍会接管",
+      _fi_e.get("e_ok") is True and _fi_e.get("gap") is not None, str(_fi_e))
+check("T31d shadow 下支援帧的动作与 off 逐字节一致（零行为变化）",
+      m2mod.decide(_pstate(blue=_SUP_BLUE), {"camp": "blue", "self_est": _EST}) == _a_e)
+check("T31e E-P1 后：`on` 会接管支援帧（reason 变成 push_follow_wave）",
+      m2mod.decide(_pstate(blue=_SUP_BLUE), {"camp": "blue", "self_est": _EST,
+                                             "push_mode": "on"}).get("reason")
+      == "push_follow_wave")
+
+_co_e2 = {"camp": "blue", "self_est": _EST, "push_mode": "shadow"}
+m2mod.decide(_pstate(blue=((0.66, 0.64),)), _co_e2)
+check("T31f 队友在我身后（推进方向反面）-> e_ok=0（继续跟人，不把射手甩掉）",
+      (_co_e2.get("push_info") or {}).get("e_ok") is False, str(_co_e2.get("push_info")))
+_co_e3 = {"camp": "blue", "self_est": _EST, "push_mode": "shadow"}
+m2mod.decide(_pstate(blue=((0.93, 0.90),)), _co_e3)
+check("T31g 队友离推进点 > PUSH_STAY_WITH_ALLY -> e_ok=0（会甩开人 -> 放弃接管）",
+      (_co_e3.get("push_info") or {}).get("e_ok") is False, str(_co_e3.get("push_info")))
+_co_e4 = {"camp": "blue", "self_est": _EST}
+m2mod.decide(_pstate(blue=_SUP_BLUE), _co_e4)
+check("T31h off 时支援帧也不产生 push_info（零足迹性质不变）",
+      "push_info" not in _co_e4)
+
+# ---------------------------------------------------------------- 32. 离线回放基础设施（replay_push.py）
+_rp_spec = importlib.util.spec_from_file_location("replay_push", ROOT / "scripts" / "replay_push.py")
+rpm = importlib.util.module_from_spec(_rp_spec)
+_rp_spec.loader.exec_module(rpm)
+
+check("T32a 推进评估把输入也记下来了（hp/est/阵营/蓝红点/敌塔/兵线/逃生窗口/屏内敌数/支援点）",
+      all(k in (_fi_e.get("in") or {}) for k in
+          ("hp", "est", "camp", "blue", "red", "towers", "waves", "esc", "nscene", "sup")),
+      str(sorted((_fi_e.get("in") or {}).keys())))
+
+_rec_stub = {"t": 1000.0, "reason": "support_dps_lane", "hp": 0.80, "push": _fi_e}
+_recon_st, _recon_co = rpm.rebuild(_rec_stub, _fi_e["in"])
+_a_rp = m2mod._push_eval(_recon_st, _recon_co, "support", tuple(_fi_e["in"]["sup"]))
+check("T32b 回放能重建同一拍并得到**同样的判据结论**（ok/why/e_ok 三项一致 = 口径没漂）",
+      _a_rp["ok"] == _fi_e["ok"] and _a_rp["why"] == _fi_e["why"]
+      and _a_rp.get("e_ok") == _fi_e.get("e_ok"),
+      f"回放 {_a_rp['ok']}/{_a_rp['why']}/{_a_rp.get('e_ok')} "
+      f"vs 记录 {_fi_e['ok']}/{_fi_e['why']}/{_fi_e.get('e_ok')}")
+check("T32c 回放脚本可被复用（load_m2 / frames / rebuild / run / summarize / summarize_live 都在）",
+      all(hasattr(rpm, f) for f in
+          ("load_m2", "frames", "rebuild", "run", "summarize", "summarize_live"))
+      and "PUSH_SELF_HP_MIN" in (ROOT / "scripts" / "replay_push.py").read_text(encoding="utf-8"))
+_lv = [({"t": 1000.0, "reason": "push_follow_wave"}, {**_fi_e, "used": True}),
+       ({"t": 1001.0, "reason": "grid_best"}, {**_fi_e, "used": True, "reason": "push_follow_wave"})]
+_LVS = rpm.summarize_live(_lv, quiet=True)
+check("T32d live 统计能算出「used=True 但最终动作变了」= 被 solve() 覆盖的拍数",
+      _LVS["used"] == 2 and _LVS["overridden"] == 1, str(_LVS))
+_pin_esc = dict(_fi_e["in"], esc=True)
+_pin_noesc = dict(_fi_e["in"], esc=False)
+_rows_esc = rpm.run(m2mod, [({"t": 1000.0}, {"in": _pin_esc, "scope": "fallback"}),
+                            ({"t": 1000.5}, {"in": _pin_noesc, "scope": "fallback"})])
+check("T32e 回放逐拍重建逃生窗口：上一拍的 esc=True **不会**把下一拍也判成在逃",
+      _rows_esc[0][2]["why"] == "push_blocked_escaping"
+      and _rows_esc[1][2]["why"] != "push_blocked_escaping",
+      f"f1={_rows_esc[0][2]['why']} f2={_rows_esc[1][2]['why']}")
+
+# ---------------------------------------------------------------- 33. E-P1 接线（`on` 才接管支援帧）
+_co_e1 = {"camp": "blue", "self_est": _EST, "push_mode": "on"}
+_a_e1 = m2mod.decide(_pstate(blue=_SUP_BLUE), _co_e1)
+_fi1 = _co_e1.get("push_info") or {}
+_tg1 = _fi1.get("target")
+check("T33a on + e_ok -> 接管支援帧（reason=push_follow_wave 且 used=True）",
+      _a_e1.get("reason") == "push_follow_wave" and _fi1.get("used") is True, str(_a_e1))
+check("T33b 接管点仍满足 E 的三条硬约束（走廊内 / 离敌塔>=PUSH_STANDOFF / 贴合队友<=0.15）",
+      _tg1 is not None and _a_e1.get("nx") is not None
+      and math.hypot(_a_e1["nx"] - 0.75, _a_e1["ny"] - 0.72) <= m2mod.PUSH_CORRIDOR_K
+      and math.hypot(_a_e1["nx"] - 0.95, _a_e1["ny"] - 0.92) >= m2mod.PUSH_STANDOFF
+      and math.hypot(_tg1[0] - 0.72, _tg1[1] - 0.70) <= m2mod.PUSH_STAY_WITH_ALLY,
+      f"target={_tg1} nx={_a_e1.get('nx')}")
+check("T33e 「细化而非抢占」：接管点换了站位点（≠队友点）但没换目标人（仍 <=0.15）",
+      _tg1 is not None and (_tg1[0], _tg1[1]) != (0.72, 0.70)
+      and math.hypot(_tg1[0] - 0.72, _tg1[1] - 0.70) <= m2mod.PUSH_STAY_WITH_ALLY, str(_tg1))
+
+_co_e2 = {"camp": "blue", "self_est": _EST, "push_mode": "on"}
+_a_e2 = m2mod.decide(_pstate(blue=((0.66, 0.64),)), _co_e2)
+check("T33c on 但队友在我身后(e_ok=0) -> **不**接管，仍 support_dps_lane（守住「射手在哪跟哪」）",
+      _a_e2.get("reason") == "support_dps_lane"
+      and (_co_e2.get("push_info") or {}).get("used") is False, str(_a_e2))
+_co_e3 = {"camp": "blue", "self_est": _EST, "push_mode": "on"}
+_a_e3 = m2mod.decide(_pstate(blue=((0.93, 0.90),)), _co_e3)
+check("T33d on 但队友离推进点 > PUSH_STAY_WITH_ALLY(e_ok=0) -> **不**接管（不把人甩开）",
+      _a_e3.get("reason") == "support_dps_lane", str(_a_e3))
+check("T33f on 接管时也能走 map_move（push_* reason 在下游白名单里，未被当成屏内目标）",
+      _a_e1.get("type") == "map_move" and _a_e1.get("nx") is not None, str(_a_e1))
+
+# ---------------------------------------------------------------- 34. YOLO ONNX 线程数旋钮
+#   v16.0 P3: ORT 默认按物理核数开满 intra_op 线程(16 核) -> 推理突发饿死采集 reader。
+from wzry.vision import hok_yolov5 as _hok_mod  # noqa: E402
+
+_so4 = _hok_mod._sess_options(4)
+check("T34a intra_threads=4 -> SessionOptions 限 4 intra / 1 inter",
+      _so4 is not None and _so4.intra_op_num_threads == 4
+      and _so4.inter_op_num_threads == 1)
+check("T34b 默认(None/0/负) -> 不传 SessionOptions，与旧行为逐位一致",
+      _hok_mod._sess_options(None) is None and _hok_mod._sess_options(0) is None
+      and _hok_mod._sess_options(-1) is None)
+check("T34c m2 接线 --yolo-threads（CLI -> YoloDetector -> HokYoloV5）",
+      '"--yolo-threads"' in _src2 and "intra_threads=(_yolo_threads" in _src2
+      and "intra_threads=intra_threads"
+      in (ROOT / "wzry" / "vision" / "detector.py").read_text(
+          encoding="utf-8", errors="replace"))
+
+# ---------------------------------------------------------------- 34. E-P2：阈值临时覆盖 + 两局对照
+def _reject(fn):
+    try:
+        fn()
+        return False
+    except SystemExit:
+        return True
+
+
+_old_hp_min, _old_stay = m2mod.PUSH_SELF_HP_MIN, m2mod.PUSH_STAY_WITH_ALLY
+_why_low_before = m2mod.push_ok(_pstate(hp=0.40), dict(_CO_P))[1]
+_ovr = m2mod.apply_push_overrides(["PUSH_SELF_HP_MIN=0.33", "PUSH_STAY_WITH_ALLY=0.2"])
+check("T34a --push-set 能临时覆盖可调常量（判据读全局 -> 立即生效）",
+      m2mod.PUSH_SELF_HP_MIN == 0.33 and m2mod.PUSH_STAY_WITH_ALLY == 0.2
+      and _ovr == [("PUSH_SELF_HP_MIN", 0.33), ("PUSH_STAY_WITH_ALLY", 0.2)], str(_ovr))
+_why_low_after = m2mod.push_ok(_pstate(hp=0.40), dict(_CO_P))[1]
+check("T34b 覆盖后判据立刻按新值判（hp 0.40 原本被血门挡, 0.33 后放行）",
+      _why_low_before == "push_blocked_hp" and _why_low_after == "push_ok",
+      f"{_why_low_before} -> {_why_low_after}")
+m2mod.PUSH_SELF_HP_MIN, m2mod.PUSH_STAY_WITH_ALLY = _old_hp_min, _old_stay
+check("T34c --push-set 白名单外/非数字一律拒绝，且**不改任何全局**（先校验后生效）",
+      _reject(lambda: m2mod.apply_push_overrides(["RECALL_ENEMY_CLEAR_FRAC=0.1"]))
+      and _reject(lambda: m2mod.apply_push_overrides(["PUSH_SELF_HP_MIN=abc"]))
+      and _reject(lambda: m2mod.apply_push_overrides(["PUSH_SELF_HP_MIN=0.2", "NOPE=1"]))
+      and m2mod.PUSH_SELF_HP_MIN == _old_hp_min, str(m2mod.PUSH_SELF_HP_MIN))
+
+_recs_a = [{"t": 1000.0 + i, "reason": "support_dps_lane", "score": 1.0, "label": "idle"}
+           for i in range(10)]
+_recs_b = [{"t": 2000.0 + i, "reason": "push_follow_wave", "score": 1.5, "label": "recalling"}
+           for i in range(10)]
+_ev_b = [(_recs_b[i], {"scope": "support", "ok": i < 5, "used": True,
+                       "reason": "push_follow_wave"}) for i in range(10)]
+_mb = rpm.metrics(_recs_b, _ev_b)
+check("T34d 对照指标算得对（support ok 5/10=50% / 实推 10 拍 / support 家族占比 0 / 回城代理 10）",
+      _mb["support_ok_ratio"] == 0.5 and _mb["support_n"] == 10 and _mb["push_exec"] == 10
+      and _mb["support_ratio"] == 0.0 and _mb["label_recalling"] == 10 and _mb["used"] == 10,
+      str(_mb))
+check("T34e 对照缺文件会明确报错（不静默给一排 0）",
+      _reject(lambda: rpm.compare(str(ROOT / "temp" / "_none_a.jsonl"),
+                                 str(ROOT / "temp" / "_none_b.jsonl"))))
+check("T34f 对照/整局读取的口径都在（all_records / metrics / metrics_of / compare / _ROWS）",
+      all(hasattr(rpm, f) for f in ("all_records", "metrics", "metrics_of", "compare"))
+      and "support_ok_ratio" in rpm._ROWS and "overridden" in rpm._ROWS)
+_m_dur = rpm.metrics([{"t": 0.0, "reason": "x"},
+                      {"t": 1_792_000_000.0, "reason": "x"},
+                      {"t": 1_792_000_420.0, "reason": "x"}], [])
+check("T34g 时长统计会过滤脏时间戳（实测记录里存在 t=0 的行，否则 max-min 会变成 1.79e9 秒）",
+      _m_dur["dur_s"] == 420.0, str(_m_dur["dur_s"]))
+
+# ---------------------------------------------------------------- 35. screenrecord 裸 H264 -> TCP 采集（v16.4）
+# 背景：scrcpy --record 的 mkv 被 muxer 按 ~5s 一簇落盘（首字节实测 5.7s），cv2 尾读
+# 还会在 EOF 永久锁死；裸 H.264 seek 后到下一个 IDR 前全丢。改用 screenrecord 裸流
+# 经本地 TCP 喂 cv2：实测 32.6fps 交付、帧间隔中位 32ms、无 >200ms 空档。
+_sr_path = ROOT / "wzry" / "capture" / "screenrecord_capture.py"
+check("T35a screenrecord 采集模块在（裸 H264 -> 本地 TCP -> cv2）", _sr_path.exists())
+from wzry.capture.screenrecord_capture import ScreenrecordCapture  # noqa: E402
+check("T35b 接口与 ScrcpyStreamCapture 对齐（start/get_frame/wait_frame/stop）",
+      all(hasattr(ScreenrecordCapture, f) for f in
+          ("start", "get_frame", "wait_frame", "stop")))
+_sr_src = _sr_path.read_text(encoding="utf-8", errors="replace")
+check("T35c 转投用 read1 + TCP_NODELAY（read 会攒满 64KB -> 实测 0.4s 一批的突发交付）",
+      "read1(" in _sr_src and "TCP_NODELAY" in _sr_src)
+check("T35d screenrecord 单次上限 180s -> rotate_s 自动封顶 170 + --time-limit 兜底",
+      ScreenrecordCapture(ROOT / "tools" / "scrcpy", serial="x",
+                          rotate_s=1800).rotate_s == 170
+      and '"--time-limit", "180"' in _sr_src)
+_sr_u = ScreenrecordCapture(ROOT / "tools" / "scrcpy", serial="x")
+import subprocess as _sp  # noqa: E402
+
+
+class _WM:
+    stdout = "Physical size: 1440x3200"
+
+
+_sr_orig_run = _sp.run
+_sp.run = lambda *a, **k: _WM()
+try:
+    _sr_wh = _sr_u._resolve_size()
+finally:
+    _sp.run = _sr_orig_run
+check("T35e wm size 1440x3200 长边缩到 1280 并对齐 16 -> (1280,576)（同 scrcpy --max-size 输出）",
+      _sr_wh == (1280, 576), str(_sr_wh))
+check("T35f m2 接线 --capture screenrecord（choices 含项 + 分支传 --serial）",
+      '"screenrecord"' in _src2
+      and 'ScreenrecordCapture(ROOT / "tools" / "scrcpy", rotate_s=170,' in _src2)
+check("T35g 息屏保活（实睡实测：screenrecord 报 INVALID_LAYER_STACK + WiFi adb 掉线；"
+      "对策：起流前查 mScreenState 决定 POWER/Wakeup + screen_off_timeout 周期保活）",
+      "mScreenState" in _sr_src and "KEYCODE_POWER" in _sr_src
+      and "screen_off_timeout" in _sr_src and "_stop_evt.set()" in _sr_src)
 
 print(f"\n结果: {len(PASS)}/{len(PASS) + len(FAIL)} 通过")
 if FAIL:

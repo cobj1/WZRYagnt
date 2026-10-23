@@ -267,6 +267,18 @@ class Esp32HidExecutor:
     def ping(self):
         return self._send("ping")
 
+    def stat(self):
+        """只读诊断：返回板子自报的 `cmds=/drops=/down=/up=` 原始文本。
+
+        `drops` 是 HID 报告发送失败(TinyUSB FIFO 满等)的累计次数 —— 大于 0 说明
+        触点实际位置可能落后于电脑端认知（摇杆/技能位置漂移的隐性来源）。
+        未连板子/未知命令时返回 None，不抛。
+        """
+        ok, reply = self._link.send("stat")
+        self.last_cmd_ms = self._link.last_ms
+        self.cmd_count += 1
+        return reply if ok else None
+
     # ---------- 内部：发命令 + 记事件 ----------
     def _send(self, line, event=None):
         ok, reply = self._link.send(line)
@@ -466,7 +478,7 @@ def _main():
                                        Esp32HidExecutor.MODE_MOUSE],
                     default=Esp32HidExecutor.MODE_TOUCH)
     ap.add_argument("--event-log", default=None, help="事件流输出路径（可选）")
-    ap.add_argument("cmd", choices=["ping", "home", "tap", "swipe", "key", "type"],
+    ap.add_argument("cmd", choices=["ping", "stat", "home", "tap", "swipe", "key", "type"],
                     help="要执行的原语")
     ap.add_argument("args", nargs="*", help="tap: x y / swipe: x1 y1 x2 y2 [ms] / key: keycode / type: text")
     a = ap.parse_args()
@@ -477,6 +489,11 @@ def _main():
     t0 = time.perf_counter()
     if a.cmd == "ping":
         ok = ex.ping()
+    elif a.cmd == "stat":
+        _rep = ex.stat()
+        print(f"stat: {_rep}")
+        ex.close()
+        return 0 if _rep else 1
     elif a.cmd == "home":
         ok = ex.home_pointer()
     elif a.cmd == "tap":

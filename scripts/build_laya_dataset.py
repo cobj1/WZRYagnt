@@ -5,10 +5,18 @@
   A. 人类对局: data/matches/<session>/{states,actions}.jsonl ->
      每帧离线跑 _feat + gen_candidates + evaluate + _forecast(与线上 solve 完全同参),
      把人的实际移动(actions.jsonl 的 swipe 事件流反推方向)映射到最近候选 = 正例。
-  B. 按结果回溯: 决策后 N 秒(默认 5s)内事件按 docs/REWARD_STANDARD.md 计分
-     (kill +20 / tower_kill +10 / escape_alive +5 / be_tower_attacked -20 /
-      be_attacked -3 / died -50), 给已选候选打优势标签, 正负都要。
-     事件由状态序列离线估计(屏内敌英减少=击杀、hp 归零=阵亡、塔区内掉血=被塔打 ...)。
+     **前提: 该会话必须有 swipe(人类输入)证据**。data/matches/ 里 agent 自对局记录的是
+     agent 自己的输出(map_move/skill/attack), swipe 数为 0 —— 这类会话不做来源 A 标注
+     (否则会把"根本没有人类输入"误标成正例 stand)。全无证据时脚本中止, 需 --allow-no-human。
+  B. 按结果回溯: 决策后 N 秒(默认 5s)内事件按 docs/REWARD_STANDARD.md 的
+     **离线可估计子集**计分 (kill +20 / tower_kill +10 / escape_alive +5 /
+      be_tower_attacked -20 / be_attacked -3 / died -50), 给已选候选打优势标签,
+      正负都要。事件由状态序列离线估计(屏内敌英减少=击杀、hp 归零=阵亡、
+      塔区内掉血=被塔打 ...)。
+
+样本是 listwise 的: 每帧 = 状态 + 全部 top-k 候选 + 规则分 + 人类选择 + 规则 argmax
+(rule_top/neg_rule), 供 train_laya 直接构造 (preferred=human_label,
+rejected=rule_top) 对比对, 而不是只标一个"已选候选好坏"。
 
 划分: 按对局(session)切 train/val/test(70/15/15, md5 确定性), 不按帧切, 防数据泄漏。
 输出: runs/laya/dataset/{train,val,test}.jsonl + meta.json
@@ -32,7 +40,9 @@ from wzry.decision import optimizer                       # noqa: E402
 from wzry.decision.laya_scorer import (TOP_K,             # noqa: E402
                                        build_state_text, candidate_label)
 
-# docs/REWARD_STANDARD.md 事件分值 (与运行时 reward.on_event 同表)
+# docs/REWARD_STANDARD.md 的**离线可估计子集**(不是全表): 助攻(+15)/清兵(+2)/
+# 大招(+5)/空转(-2)/未恢复未回城(-5) 无法从 states 序列可靠反推, 未计分。
+# 与运行时 reward.on_event 同分值, 但事件集合更小 -> 优势标签量级偏保守。
 REWARD = {"kill": 20.0, "tower_kill": 10.0, "escape_alive": 5.0,
           "died": -50.0, "be_tower_attacked": -20.0, "be_attacked": -3.0}
 
@@ -106,6 +116,24 @@ def nearest_map_move(point, cands):
     return best, bd
 
 
+def agent_chosen(actions, t0, win_s, cands):
+    """v14.2 来源 B 的锚点: [t0, t0+win] 内 agent 实际下发的 map_move -> 最近候选。
+
+    actions.jsonl 的 map_move 带 nx/ny(与候选同坐标系)与 reason, 因此 agent 自对局
+    (无 swipe)也能得到"已选候选"标签 —— 原先 advantage_label 硬绑 human_label,
+    没有人类输入时来源 B 一并失效, 整份数据没有任何可用标签。
+    """
+    ts = [a.get("t", 0) for a in actions]
+    i0 = bisect.bisect_left(ts, t0)
+    for a in actions[i0:]:
+        if a.get("t", 0) > t0 + win_s:
+            break
+        if a.get("type") != "map_move":
+            continue
+        return nearest_map_move((float(a.get("nx", 0.5)), float(a.get("ny", 0.5))), cands)
+    return None, 9.9
+
+
 def outcome_advantage(states, times, hp_s, ene_s, tur_s, zon_s, i0, t0, win_s):
     """(t0, t0+win] 事件回溯 -> (advantage, events dict)。状态序列离线估计。"""
     j = bisect.bisect_right(times, t0 + win_s)
@@ -153,13 +181,23 @@ def process_session(mdir, args, out_fhs, stats):
     if len(states) < 10:
         stats["skipped"].append(mdir.name)
         return
+    # v14.2 来源 A 的前提: 会话里必须有"人类输入"证据(swipe)。
+    #   实测 data/matches/ 的 33 个会话 swipe 数全为 0 —— 记录的是 agent 自己的输出
+    #   (map_move/skill/attack), 不是人类操作。此时 human_move_dir 恒为 None,
+    #   旧的 `if d is None: human_label = "stand"` 会把"根本没有人类输入"误标成正例
+    #   stand, 使整个数据集退化为 (preferred=stand, rejected=rule_top) ——
+    #   照此训练等于教 agent 原地不动。故按会话级证据决定是否做来源 A 标注。
+    n_swipe = sum(1 for a in actions if a.get("type") == "swipe")
+    has_human_input = n_swipe > 0
+    if not has_human_input:
+        stats["no_human_sessions"].append(mdir.name)
     times = [s.get("t", 0) for s in states]
     hp_s = [state_snap(s)[0] for s in states]
     ene_s = [state_snap(s)[1] for s in states]
     tur_s = [state_snap(s)[2] for s in states]
     zon_s = [state_snap(s)[3] for s in states]
     split = split_session(mdir.name)
-    n_pos = n_adv = 0
+    n_pos = n_adv = n_out = n_chosen = 0
     for i0, st in enumerate(states):
         t0 = times[i0]
         hp = hp_s[i0]
@@ -186,40 +224,68 @@ def process_session(mdir, args, out_fhs, stats):
         rule_scores = [round(float(r), 4) for r, _ in scored]
         if len(set(labels)) < args.min_labels:
             continue
-        # 来源 A: 人类移动 -> 最近候选正例
+        # 来源 A: 人类移动 -> 最近候选正例(仅当该会话存在人类输入证据)
         human_label = None
-        d = human_move_dir(actions, t0, args.human_window)
-        if d is None:
-            if "stand" in labels:              # 无 swipe = 原地
-                human_label = "stand"
-        else:
-            gx, gy = f["g"]
-            # 屏幕方向 -> 小地图意图点(轴同向假设; 若录像坐标系翻转用 --flip-y 校正)
-            pt = (gx + args.swipe_gain * d[0],
-                  gy + (-1 if args.flip_y else 1) * args.swipe_gain * d[1])
-            tag, dist = nearest_map_move(pt, [c for _, c in scored])
-            if tag is not None and dist <= args.match_tol:
-                human_label = tag
-        # 来源 B: 结果回溯优势标签(标在已选候选上; 人类局=human_label)
+        if has_human_input:
+            d = human_move_dir(actions, t0, args.human_window)
+            if d is None:
+                if "stand" in labels:          # 窗口内人没有推杆 = 原地
+                    human_label = "stand"
+            else:
+                gx, gy = f["g"]
+                # 屏幕方向 -> 小地图意图点(轴同向假设; 若录像坐标系翻转用 --flip-y 校正)
+                pt = (gx + args.swipe_gain * d[0],
+                      gy + (-1 if args.flip_y else 1) * args.swipe_gain * d[1])
+                tag, dist = nearest_map_move(pt, [c for _, c in scored])
+                if tag is not None and dist <= args.match_tol:
+                    human_label = tag
+                else:
+                    # v14.2 度量 top-16 截断损失: 人的意图点匹配不到任一 top-k 候选
+                    #   (候选被规则分截断在 16 名之外, 或映射增益/翻转未标定)
+                    n_out += 1
+        # 来源 B 的锚点: 优先人类选择, 无人类输入时退到 agent 实际下发的 map_move
+        chosen_label, chosen_src = human_label, ("human" if human_label else None)
+        if chosen_label is None:
+            tag_b, dist_b = agent_chosen(actions, t0, args.human_window,
+                                         [c for _, c in scored])
+            if tag_b is not None and dist_b <= args.match_tol:
+                chosen_label, chosen_src = tag_b, "agent"
+        # 结果回溯优势标签(标在已选候选上)
         adv, ev = outcome_advantage(states, times, hp_s, ene_s, tur_s, zon_s,
                                     i0, t0, args.window)
-        adv_label = human_label
+        adv_label = chosen_label
+        rule_top = labels[0]        # 规则 argmax(rule_scores 已按 r 降序)
         rec = {"session": mdir.name, "t": round(t0, 3), "camp": args.camp,
                "state": build_state_text(f, args.camp), "labels": labels,
-               "rule_scores": rule_scores, "human_label": human_label,
+               "rule_scores": rule_scores, "rule_top": rule_top,
+               "human_label": human_label,
+               "chosen_label": chosen_label, "chosen_src": chosen_src,
+               # v14.2 listwise 对比项: 已选候选 vs 规则 argmax(供 train_laya 默认负例)
+               "neg_rule": (rule_top if (chosen_label and rule_top != chosen_label)
+                            else None),
                "advantage": round(adv, 1), "advantage_label": adv_label,
                "events": ev}
         out_fhs[split].write(json.dumps(rec, ensure_ascii=False) + "\n")
         stats["records"][split] += 1
         if human_label:
             n_pos += 1
+            stats["human_label_hist"][human_label] = \
+                stats["human_label_hist"].get(human_label, 0) + 1
+        if chosen_label:
+            n_chosen += 1
+            stats["chosen_src_hist"][chosen_src] = \
+                stats["chosen_src_hist"].get(chosen_src, 0) + 1
         if ev and adv_label:
             n_adv += 1
     stats["sessions"][mdir.name] = {"split": split, "states": len(states),
+                                    "swipe_actions": n_swipe,
                                     "human_pos": n_pos, "adv_labeled": n_adv,
+                                    "chosen_labeled": n_chosen,
+                                    "human_out_of_topk": n_out,
                                     "records": n_pos + n_adv}
     print(f"[session] {mdir.name} -> {split}: 状态 {len(states)}, "
-          f"人类正例 {n_pos}, 结果回溯 {n_adv}")
+          f"swipe {n_swipe}, 人类正例 {n_pos}, 已选候选标签 {n_chosen}, "
+          f"结果回溯 {n_adv}, 意图点落在 top-k 外 {n_out}")
 
 
 def main():
@@ -241,6 +307,10 @@ def main():
     ap.add_argument("--flip-y", action="store_true",
                     help="屏幕 swipe y 轴与小地图反向时开启(标定项)")
     ap.add_argument("--sessions", default=None, help="逗号分隔, 默认全部")
+    ap.add_argument("--allow-no-human", action="store_true",
+                    help="允许在'没有任何人类输入(swipe)证据'的数据上产出数据集。"
+                         "默认禁止: 此时来源 A 全部为空, 旧行为会退化成把 stand 当正例,"
+                         "照此训练等于教 agent 原地不动")
     args = ap.parse_args()
 
     mroot = Path(args.matches_dir)
@@ -260,12 +330,20 @@ def main():
     fhs = {k: open(out / f"{k}.jsonl", "w", encoding="utf-8")
            for k in ("train", "val", "test")}
     stats = {"records": {"train": 0, "val": 0, "test": 0},
-             "sessions": {}, "skipped": [],
+             "sessions": {}, "skipped": [], "no_human_sessions": [],
+             "human_label_hist": {}, "chosen_src_hist": {},
              "window_s": args.window, "reward_table": REWARD,
              "notes": [
                  "camp 不可从 states.jsonl 恢复, 用 --camp 回退; 上线前建议 MatchRecorder 增记 camp",
                  "swipe->小地图增益/翻转需 P0 后用真实录像标定 (--swipe-gain/--flip-y/--match-tol)",
                  "助攻(+15)/清兵(+2)/大招(+5)/空转(-2) 离线不可靠估计, 未计分",
+                 "样本为 listwise: labels/rule_scores/rule_top/human_label/"
+                 "chosen_label/chosen_src/neg_rule 齐全",
+                 "chosen_src=human 表示已选候选来自人类 swipe 映射; "
+                 "=agent 表示来自 agent 实际下发的 map_move(nx/ny 与候选同坐标系)",
+                 "sessions[*].human_out_of_topk = 人的意图点匹配不到 top-k 候选的帧数,"
+                 " 用来度量 top-16 截断损失; 该值偏高说明候选被规则分截断或映射未标定",
+                 "sessions[*].swipe_actions = 该会话的人类输入证据数; 为 0 则该会话不做来源 A",
              ]}
     t0 = time.time()
     for d in sess:
@@ -276,6 +354,29 @@ def main():
                                    encoding="utf-8")
     print(f"\n完成 {time.time() - t0:.1f}s -> {out}")
     print(f"记录数: {stats['records']}")
+    _nnh = len(stats["no_human_sessions"])
+    _proc = len(sess) - len(stats["skipped"])     # v14.2 修: 跳过会话不算进分母
+    _hist = stats["human_label_hist"]
+    _npos = sum(_hist.values())
+    _srcs = stats["chosen_src_hist"]
+    print(f"会话: 处理 {_proc} (跳过 {len(stats['skipped'])}), "
+          f"其中有人类输入(swipe)证据 {_proc - _nnh}")
+    print(f"已选候选标签: 合计 {sum(_srcs.values())} 条, 来源 {dict(_srcs) or '无'}")
+    print(f"人类正例: {_npos} 条, 取值 {len(_hist)} 种 "
+          f"({', '.join(f'{k}:{v}' for k, v in sorted(_hist.items(), key=lambda x: -x[1])[:6]) or '-'})")
+    if _nnh >= _proc and _proc:
+        print("\n[阻塞] 没有任何会话带 swipe(人类输入)证据 —— 来源 A 全为空。")
+        print("       数据里记录的是 agent 自己的输出(map_move/skill/attack), 不是人类操作。")
+        print("       当前数据集只有'来源 B'(agent 已选候选 + 结果回溯优势), 可用于")
+        print("       (preferred=chosen_label, rejected=rule_top) 的对比训练;")
+        print("       但 P2 门槛要求的'与人类选择 top-1 一致率'无法评估,")
+        print("       需补真人带输入的对局(录像反推动作, 或 m2 以人类操作驱动采集)。")
+        if not args.allow_no_human:
+            print("       已中止。确认只要来源 B 的数据请加 --allow-no-human。")
+            return 2
+    elif _npos and max(_hist.values()) / _npos > 0.9:
+        print(f"\n[警告] 人类正例高度集中在一个标签({max(_hist, key=_hist.get)}), "
+              f"来源 A 判别力很弱 —— 检查 --swipe-gain/--flip-y/--match-tol 是否标定。")
     print(f"P2 门槛提示: test 集需有 human_label 的记录才可评 top-1 一致率")
     return 0
 

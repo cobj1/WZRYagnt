@@ -67,6 +67,19 @@ class ScrcpyStreamCapture:
     def _start_pipeline(self):
         self._seq += 1
         self._file = self.temp_dir / f"stream_{self._seq:04d}.mkv"
+        # v16.3: 先删同名遗留文件。否则 `_seq` 从小值起时很可能命中上一次的 mkv，
+        #   于是"文件已有足够字节"的判据立刻通过 -> cv2 打开一个马上被 scrcpy 截断的文件
+        #   （表现为 File ended prematurely / 读到旧帧 / 节奏错乱）。
+        try:
+            if self._file.exists():
+                self._file.unlink()
+        except OSError:
+            pass
+        # v16.4: unlink 失败(Windows 上文件仍被上一次的孤儿 scrcpy 占用)会静默放过，
+        #   随后新 scrcpy 写不进这个路径 / cv2 读到旧流 -> 连续启动失败。这里显式查证。
+        if self._file.exists():
+            raise RuntimeError(
+                f"无法清理残留录制文件（可能仍有 scrcpy 进程占用）: {self._file}")
         cmd = [
             self.scrcpy_exe, "-s", self.serial,
             "--no-window", "--no-control", "--no-audio",
@@ -78,14 +91,34 @@ class ScrcpyStreamCapture:
         ]
         self._proc = subprocess.Popen(cmd)
         self._session_start = time.time()
-        # 等待文件有足够内容（约 0.3s 录制量），否则 ffmpeg 打开后不会轮询追加数据
-        min_bytes = max(4096, int(bit_rate_int(self.bit_rate) / 8 * 1024 * 1024 * 0.3))
-        for _ in range(60):
+        # 等文件里有 mkv 头 + 首个 cluster 才能被 ffmpeg 解析（太小会报 EBML header parsing failed）。
+        # v16.3: 原来按 0.3s 码率量等（修完单位后 225KB），但**画面静止时 scrcpy 出帧很少**，
+        #   文件长得极慢（实测 6.8s 才够），启动被无谓拖长。
+        #   改为: 等 64KB 或 5s；打开失败则重试而不是直接抛（ffmpeg 解析头有竞态）。
+        min_bytes = 65536
+        _deadline = time.time() + 5.0
+        while time.time() <= _deadline:
             if self._file.exists() and self._file.stat().st_size > min_bytes:
                 break
-            time.sleep(0.25)
-        self._cap = cv2.VideoCapture(str(self._file))
-        if not self._cap.isOpened():
+            time.sleep(0.1)
+        _open_deadline = _deadline + 5.0
+        while True:
+            self._cap = cv2.VideoCapture(str(self._file))
+            if self._cap.isOpened():
+                break
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            self._cap = None
+            if time.time() > _open_deadline:
+                break
+            time.sleep(0.2)
+        if self._cap is None or not self._cap.isOpened():
+            # v16.4: 失败必须先"收尸"，否则 scrcpy 变孤儿进程继续写 mkv，
+            #   文件被锁 -> 下次 unlink 静默失败 -> 新 scrcpy 写不进去 -> 连续启动失败
+            #   （实测 12:44/12:45 连挂两次，且第二次把污染扩散到第三次）。
+            self._teardown_pipeline()
             raise RuntimeError(f"无法打开 scrcpy 录制流: {self._file}")
 
     def _teardown_pipeline(self):

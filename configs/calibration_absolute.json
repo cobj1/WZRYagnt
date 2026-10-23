@@ -1,152 +1,164 @@
 {
-  "screen_width": 1280,
-  "screen_height": 720,
-  "points": {
-    "move_stick_center": [
-      196,
-      574
-    ],
-    "dir_up": [
-      192,
-      436
-    ],
-    "dir_left_up": [
-      98,
-      475
-    ],
-    "dir_right_up": [
-      310,
-      458
-    ],
-    "dir_left": [
-      87,
-      572
-    ],
-    "dir_right": [
-      353,
-      561
-    ],
-    "dir_left_down": [
-      129,
-      649
-    ],
-    "dir_right_down": [
-      286,
-      654
-    ],
-    "dir_down": [
-      194,
-      679
-    ],
-    "skill1": [
-      963,
-      634
-    ],
-    "skill2": [
-      1039,
-      497
-    ],
-    "skill3": [
-      1172,
-      419
-    ],
-    "attack": [
-      1182,
-      617
-    ],
-    "recall": [
-      656,
-      645
-    ],
-    "restore": [
-      750,
-      645
-    ],
-    "summoner": [
-      852,
-      647
-    ],
-    "active1": [
-      1168,
-      279
-    ],
-    "active2": [
-      1168,
-      189
-    ],
-    "attack_minion": [
-      1067,
-      654
-    ],
-    "attack_tower": [
-      1233,
-      509
-    ]
-  },
-  "ui_taps": {
-    "scoreboard": [
-      862,
-      28
-    ],
-    "close": [
-      1218,
-      93
-    ]
-  },
-  "panel_rois": {
-    "scoreboard": {
-      "ally_kills": [
-        604,
-        82,
-        658,
-        112
-      ],
-      "enemy_kills": [
-        686,
-        82,
-        744,
-        112
-      ],
-      "ally_gold": [
-        536,
-        84,
-        606,
-        112
-      ],
-      "enemy_gold": [
-        766,
-        84,
-        830,
-        112
-      ]
-    }
-  },
-  "lock_target": {
-    "x0": 578,
-    "x1": 764,
-    "y0": 14,
-    "y1": 31
-  },
-  "top_bar": {
-    "x0": 204,
-    "x1": 396,
-    "y0": 36,
-    "y1": 50,
-    "slots": 5,
-    "ally_only": true
-  },
-  "digit_rois": {
-    "gold": [
-      1150,
-      34,
-      1200,
-      58
-    ],
-    "item_price": [
-      1094,
-      200,
-      1134,
-      218
-    ]
+ "screen_width": 1280,
+ "screen_height": 720,
+ "points": {
+  "move_stick_center": [
+   196,
+   574
+  ],
+  "dir_up": [
+   192,
+   436
+  ],
+  "dir_left_up": [
+   98,
+   475
+  ],
+  "dir_right_up": [
+   310,
+   458
+  ],
+  "dir_left": [
+   87,
+   572
+  ],
+  "dir_right": [
+   353,
+   561
+  ],
+  "dir_left_down": [
+   129,
+   649
+  ],
+  "dir_right_down": [
+   286,
+   654
+  ],
+  "dir_down": [
+   194,
+   679
+  ],
+  "skill1": [
+   963,
+   634
+  ],
+  "skill2": [
+   1039,
+   497
+  ],
+  "skill3": [
+   1172,
+   419
+  ],
+  "attack": [
+   1182,
+   617
+  ],
+  "recall": [
+   656,
+   645
+  ],
+  "restore": [
+   750,
+   645
+  ],
+  "summoner": [
+   852,
+   647
+  ],
+  "active1": [
+   1168,
+   279
+  ],
+  "active2": [
+   1168,
+   189
+  ],
+  "attack_minion": [
+   1067,
+   654
+  ],
+  "attack_tower": [
+   1233,
+   509
+  ]
+ },
+ "ui_taps": {
+  "scoreboard": [
+   862,
+   28
+  ],
+  "close": [
+   1218,
+   93
+  ]
+ },
+ "panel_rois": {
+  "scoreboard": {
+   "ally_kills": [
+    604,
+    82,
+    658,
+    112
+   ],
+   "enemy_kills": [
+    686,
+    82,
+    744,
+    112
+   ],
+   "ally_gold": [
+    536,
+    84,
+    606,
+    112
+   ],
+   "enemy_gold": [
+    766,
+    84,
+    830,
+    112
+   ]
   }
+ },
+ "lock_target": {
+  "x0": 578,
+  "x1": 764,
+  "y0": 14,
+  "y1": 31
+ },
+ "top_bar": {
+  "x0": 204,
+  "x1": 396,
+  "y0": 36,
+  "y1": 50,
+  "slots": 5,
+  "ally_only": true
+ },
+ "digit_rois": {
+  "gold": [
+   1150,
+   34,
+   1200,
+   58
+  ],
+  "item_price": [
+   1094,
+   200,
+   1134,
+   218
+  ]
+ },
+ "minimap_box": {
+  "1280x720": [
+   0,
+   0,
+   242
+  ],
+  "1280x576": [
+   60,
+   0,
+   190
+  ]
+ }
 }

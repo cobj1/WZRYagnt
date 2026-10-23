@@ -197,6 +197,10 @@ def main():
     import m2_agent_v2                                     # noqa: E402
 
     class FakeEx:
+        # v15.3: m2 的"持久触点"(--stick-hold) 特性会读 ex.hold_enabled；
+        #   测试替身必须镜像执行器接口，否则 T8a 抛 AttributeError（与视觉层无关）。
+        hold_enabled = False
+
         def __init__(self):
             self.taps = []
             self.moves = []
@@ -325,6 +329,248 @@ def main():
     check("T11d_recall_blocked_by_near_enemy", a_cl.get("type") != "recall", f"{a_cl}")
     a_rec = m2_agent_v2.decide(_st(0.20, 0), {})
     check("T11e_recall_when_clear", a_rec.get("type") == "recall", f"{a_rec}")
+
+    optimizer.set_scorer(None)
+
+    # T12 v14.2 修复: 红点全在走廊外时 _grid_best 不得崩(原先对空数组 np.min -> ValueError,
+    #     异常在 gen_candidates 之前 -> 规则优化器与 Laya 同时被静默旁路)
+    st_out = make_state(reds=(0.18, 0.20))
+    f_out = optimizer._feat(st_out, 0.9)
+    try:
+        gx_o, gy_o, gv_o = optimizer._grid_best(f_out, "blue")
+        t12_ok = all(isinstance(v, float) for v in (gx_o, gy_o, gv_o))
+        t12_err = ""
+    except Exception as e:                                # noqa: BLE001
+        t12_ok, t12_err = False, f"{type(e).__name__}: {e}"
+    check("T12a_grid_best_empty_corridor_no_crash", t12_ok, t12_err)
+    a_out = optimizer.solve(st_out, dict(FALLBACK), 0.9, "blue")
+    check("T12b_solve_survives_empty_corridor", isinstance(a_out, dict), f"{a_out}")
+
+    # T13 v14.2 修复: 阈值闸门用重排前固定的 r_max, 不得被打分器的排序翻转。
+    #     构造 gv < r_max 的状态(基线走候选分支), 再用"只反转顺序、r 全不变"的打分器:
+    #     旧实现下 scored[0][0] 变成 r_min, gv >= r_min 成立 -> 闸门翻成 grid_best。
+    st_g = make_state(reds=(0.50, 0.35), enemy_scr=((0.52, 0.52),))
+    f_g = optimizer._feat(st_g, 0.9)
+    _, _, gv_g = optimizer._grid_best(f_g, "blue")
+    cands_g = optimizer.gen_candidates(f_g)
+    rs_g = sorted((optimizer.evaluate(c, f_g, "blue") + 0.35 * optimizer._forecast(c, f_g)
+                   for c in cands_g), reverse=True)
+    check("T13a_fixture_gv_below_rmax", gv_g < rs_g[0], f"gv={gv_g} rmax={rs_g[0]}")
+
+    class ReverseScorer:
+        """只把顺序反转(不改任何规则分) -> 模拟打分器把低分候选提到首位。"""
+
+        def reorder(self, scored, f, hp, camp):
+            scored.sort(key=lambda x: x[0])
+            return True
+
+        def log_chosen(self, action):
+            pass
+
+    optimizer.set_scorer(None)
+    base_g = optimizer.solve(st_g, dict(FALLBACK), 0.9, "blue")
+    optimizer.set_scorer(ReverseScorer())
+    rev_g = optimizer.solve(st_g, dict(FALLBACK), 0.9, "blue")
+    optimizer.set_scorer(None)
+    check("T13b_gate_not_order_dependent",
+          base_g.get("reason") != "grid_best" and rev_g.get("reason") != "grid_best",
+          f"base={base_g.get('reason')} rev={rev_g.get('reason')} gv={gv_g} rmax={rs_g[0]}")
+
+    # T14 v14.2 标签唯一化: 屏内 2 敌原先产出两个同名 kite_retreat_pressure
+    st_2e = make_state(reds=(0.70, 0.75), enemy_scr=((0.60, 0.52), (0.58, 0.55)))
+    f_2e = optimizer._feat(st_2e, 0.9)
+    labs_2e = [candidate_label(c) for c in optimizer.gen_candidates(f_2e)]
+    check("T14a_gen_candidates_labels_unique",
+          len(set(labs_2e)) == len(labs_2e),
+          f"n={len(labs_2e)} uniq={len(set(labs_2e))}")
+
+    sc_dup = FakeLaya(lambda labs: [1.0 / len(labs)] * len(labs),
+                      mode="ensemble", beta=1.0)
+    dup = [(1.0, ({"type": "map_move", "nx": 0.1, "ny": 0.1, "reason": "same"}, "same")),
+           (0.9, ({"type": "map_move", "nx": 0.2, "ny": 0.2, "reason": "same"}, "same"))]
+    did_dup = sc_dup.reorder(dup, f_2e, 0.9, "blue")
+    check("T14b_dup_label_fails_open",
+          did_dup is False and sc_dup.stats()["label_dups"] == 1,
+          f"did={did_dup} stats={sc_dup.stats()}")
+    sc_dup.stop()
+
+    # T15 v14.2 latency_ms 两条路径都落盘(P1 门槛 p95<80ms 依赖; 原实现只在 probs 非空时写)
+    p15 = Path(tempfile.mkdtemp()) / "shadow.jsonl"
+    sh15 = FakeLaya(lambda labs: [1.0 / len(labs)] * len(labs),
+                    mode="shadow", beta=0.0, shadow_path=p15, cache_ttl=60.0)
+    optimizer.set_scorer(sh15)
+    optimizer.solve(st, dict(FALLBACK), 0.9, "blue")       # 提交 -> pending#1
+    sh15._run_job(*sh15._q.get_nowait())                   # 同步推理 -> 预测路径写延迟
+    optimizer.solve(st, dict(FALLBACK), 0.9, "blue")       # 缓存命中 -> 落盘#1, 建 pending#2
+    optimizer.solve(st, dict(FALLBACK), 0.9, "blue")       # 缓存命中 -> 落盘#2, 建 pending#3
+    sh15._flush_pending()                                  # 收尾落盘#3
+    recs15 = [json.loads(x) for x in p15.read_text(encoding="utf-8").splitlines() if x]
+    srcs15 = [r.get("latency_src") for r in recs15]
+    check("T15_latency_logged_all_paths",
+          len(recs15) >= 2 and all(r.get("latency_ms") is not None for r in recs15)
+          and "predict" in srcs15 and "cache" in srcs15,
+          f"n={len(recs15)} srcs={srcs15} lats={[r.get('latency_ms') for r in recs15]}")
+    check("T15b_latency_counter", sh15.stats()["latency_logged"] == len(recs15),
+          f"{sh15.stats()}")
+    optimizer.set_scorer(None)
+
+    # T16 v14.2 缓存键含状态粗分箱: 标签集合相同但血量不同不得复用概率
+    p16 = Path(tempfile.mkdtemp()) / "shadow.jsonl"
+    sh16 = FakeLaya(lambda labs: [1.0 / len(labs)] * len(labs),
+                    mode="shadow", beta=0.0, shadow_path=p16, cache_ttl=60.0)
+    scored16 = [(float(i), ({"type": "map_move", "nx": 0.1 + 0.01 * i, "ny": 0.3,
+                             "reason": f"c{i}"}, f"c{i}")) for i in range(10)]
+    f_hi = dict(optimizer._feat(st, 0.9))
+    f_lo = dict(f_hi)
+    f_lo["hp"] = 0.2
+    sh16.reorder(scored16, f_hi, 0.9, "blue")
+    sh16._run_job(*sh16._q.get_nowait())
+    n_before = len(sh16.predict_calls)
+    sh16.reorder(scored16, f_lo, 0.2, "blue")              # 仅血量不同 -> 必须 miss
+    check("T16_cache_key_includes_state",
+          n_before == 1 and sh16.stats()["cache_hits"] == 0,
+          f"predicts={n_before} cache_hits={sh16.stats()['cache_hits']}")
+    sh16.stop()
+
+    # T17 v14.2 shadow 补 session_id/frame_id/executed(执行层实际下发动作)
+    p17 = Path(tempfile.mkdtemp()) / "shadow.jsonl"
+    sh17 = FakeLaya(lambda labs: [1.0 / len(labs)] * len(labs),
+                    mode="shadow", beta=0.0, shadow_path=p17, cache_ttl=60.0)
+    sh17.set_context(session_id="20261015_000000_000000", frame_id=7)
+    optimizer.set_scorer(sh17)
+    optimizer.solve(st, dict(FALLBACK), 0.9, "blue")
+    sh17.log_executed({"type": "map_move", "reason": "guard_rewrote"})
+    optimizer.solve(st, dict(FALLBACK), 0.9, "blue")       # 触发落盘
+    sh17._flush_pending()
+    recs17 = [json.loads(x) for x in p17.read_text(encoding="utf-8").splitlines() if x]
+    hit17 = [r for r in recs17 if r.get("executed") == "guard_rewrote"]
+    check("T17_context_and_executed",
+          len(hit17) == 1 and hit17[0].get("frame_id") == 7
+          and hit17[0].get("session_id") == "20261015_000000_000000"
+          and hit17[0].get("chosen") is not None,
+          f"recs={recs17}")
+    optimizer.set_scorer(None)
+    sh17.stop()
+
+    # T18 v14.2 本期范围硬边界: solve 不输出技能/攻击/连招/回城/恢复
+    st_sk = make_state(reds=(0.70, 0.75), enemy_scr=((0.52, 0.52),))
+    out_sk = optimizer.solve(st_sk, {"type": "map_move", "nx": 0.3, "ny": 0.3,
+                                     "reason": "rule_move"}, 0.9, "blue")
+    check("T18_solve_no_tactical_types",
+          out_sk.get("type") in ("map_move", "none"), f"{out_sk}")
+
+    # T19 v14.2 运行期熔断: 异常数 / 标签重复 超阈值 -> 本局降级 off
+    sh19 = FakeLaya(lambda labs: [1.0 / len(labs)] * len(labs), mode="shadow",
+                    beta=0.0, shadow_path=Path(tempfile.mkdtemp()) / "s.jsonl",
+                    max_errors=2)
+
+    def _boom(_s, _l):
+        raise RuntimeError("boom")
+
+    sh19._predict = _boom
+    did19 = []
+    for it in range(3):
+        # 每轮用不同标签, 避免命中缓存(失败的预测也会被缓存 0.3s -> 不重复报错)
+        cs = [(float(j), ({"type": "map_move", "nx": 0.1 + 0.01 * j, "ny": 0.3,
+                           "reason": f"d{it}_{j}"}, f"d{it}_{j}")) for j in range(6)]
+        did19.append(sh19.reorder(cs, f, 0.9, "blue"))
+        try:
+            sh19._run_job(*sh19._q.get_nowait())
+        except Exception:                                   # noqa: BLE001
+            pass
+    st19 = sh19.stats()
+    check("T19a_breaker_trips_on_errors",
+          st19["tripped"] and st19["errors"] >= 2 and did19[-1] is False
+          and "errors" in st19["trip_reason"],
+          f"did={did19} stats={st19}")
+    sh19.stop()
+
+    sh19b = FakeLaya(lambda labs: [1.0 / len(labs)] * len(labs), mode="ensemble",
+                     beta=1.0, shadow_path=Path(tempfile.mkdtemp()) / "s.jsonl",
+                     max_label_dups=2)
+    dup19 = [(1.0, ({"type": "map_move", "nx": 0.1, "ny": 0.1, "reason": "same"}, "same")),
+             (0.9, ({"type": "map_move", "nx": 0.2, "ny": 0.2, "reason": "same"}, "same"))]
+    d19 = [sh19b.reorder(dup19, f, 0.9, "blue") for _ in range(3)]
+    st19b = sh19b.stats()
+    check("T19b_breaker_trips_on_label_dups",
+          st19b["tripped"] and st19b["label_dups"] == 2 and d19[-1] is False
+          and "label_dups" in st19b["trip_reason"],
+          f"d={d19} stats={st19b}")
+    sh19b.stop()
+
+    # T20 v14.2 提交节流: min_submit_interval 内不重复提交(模型吞吐 < 决策频率时降频)
+    sh20 = FakeLaya(lambda labs: [1.0 / len(labs)] * len(labs), mode="shadow",
+                    beta=0.0, shadow_path=Path(tempfile.mkdtemp()) / "s.jsonl",
+                    min_submit_interval=30.0)
+    cs_a = [(float(j), ({"type": "map_move", "nx": 0.1 + 0.01 * j, "ny": 0.3,
+                         "reason": f"a{j}"}, f"a{j}")) for j in range(6)]
+    cs_b = [(float(j), ({"type": "map_move", "nx": 0.2 + 0.01 * j, "ny": 0.4,
+                         "reason": f"b{j}"}, f"b{j}")) for j in range(6)]
+    sh20.reorder(cs_a, f, 0.9, "blue")
+    sh20.reorder(cs_b, f, 0.9, "blue")
+    st20 = sh20.stats()
+    check("T20_submit_throttled",
+          st20["submits"] == 1 and st20["throttled"] == 1,
+          f"submits={st20['submits']} throttled={st20['throttled']}")
+    sh20.stop()
+
+    # T21 v14.3 OpenVINO 后端(方案 §6.2): IR 解析 + onnxruntime 兼容接口
+    sc320 = LayaScorer(mode="shadow", beta=0.0, backend="openvino", ov_max_len=320)
+    sc512 = LayaScorer(mode="shadow", beta=0.0, backend="openvino", ov_max_len=512)
+    ir320, ir512 = sc320._resolve_ov_ir(), sc512._resolve_ov_ir()
+    check("T21a_ov_ir_resolve_by_max_len",
+          "320" in str(ir320) and str(ir512) != str(ir320),
+          f"320->{ir320} | 512->{ir512}")
+
+    try:
+        from wzry.decision.laya_ov import OVSession
+        _have_ov = ir320.exists()
+    except Exception:                                       # noqa: BLE001
+        _have_ov = False
+
+    if not _have_ov:
+        print("SKIP T21b-e (无 openvino 或 IR 不存在; 先跑 scripts/export_laya_ov.py)")
+    else:
+        sess = OVSession(ir_path=ir320, device="GPU", max_len=320, max_opts=16,
+                         pad_token_id=0)
+        feed = {"input_ids": np.zeros((1, 300), dtype=np.int64),
+                "attention_mask": np.ones((1, 300), dtype=np.int64),
+                "marker_pos": np.arange(1, 5, dtype=np.int64).reshape(1, 4),
+                "marker_mask": np.ones((1, 4), dtype=bool)}
+        out = sess.run(["logits", "act_logits"], feed)
+        check("T21b_ov_session_run_shapes",
+              len(out) == 2 and out[0].shape == (1, 4) and out[1].shape[0] == 1,
+              f"logits={out[0].shape} act={out[1].shape}")
+        check("T21c_ov_session_pads_without_truncating", sess.truncated == 0,
+              f"truncated={sess.truncated}")
+
+        # 超过 IR 上限的输入 -> 截断并计数(正常路径由 laya 按 max_len 先截断)
+        sess.run(["logits", "act_logits"],
+                 dict(feed, input_ids=np.zeros((1, 400), dtype=np.int64),
+                      attention_mask=np.ones((1, 400), dtype=np.int64)))
+        check("T21d_ov_session_truncation_counted", sess.truncated == 1,
+              f"truncated={sess.truncated}")
+
+        # 选项数超编译上限 -> 明确报错(而不是静默出错)
+        try:
+            sess.run(["logits", "act_logits"],
+                     dict(feed, marker_pos=np.arange(1, 21, dtype=np.int64).reshape(1, 20),
+                          marker_mask=np.ones((1, 20), dtype=bool)))
+            _over = False
+        except ValueError:
+            _over = True
+        check("T21e_ov_session_opts_over_limit_raises", _over)
+
+        # 多行(B>1)逐行推理, 结果按行拼接
+        feed_b = dict(feed,
+                      input_ids=np.zeros((2, 300), dtype=np.int64),
+                      attention_mask=np.ones((2, 300), dtype=np.int64),
+                      marker_pos=np.tile(np.arange(1, 5, dtype=np.int64).reshape(1, 4), (2, 1)),
+                      marker_mask=np.ones((2, 4), dtype=bool))
+        out_b = sess.run(["logits", "act_logits"], feed_b)
+        check("T21f_ov_session_batch_rows",
+              out_b[0].shape == (2, 4) and out_b[1].shape[0] == 2,
+              f"logits={out_b[0].shape} act={out_b[1].shape}")
 
     print(f"ALL PASS ({len(_PASS)})")
 

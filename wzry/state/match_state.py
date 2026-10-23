@@ -19,6 +19,8 @@ import time
 import cv2
 import numpy as np
 
+from wzry.vision import colors   # HSV 判据单一事实来源（v15.3）
+
 # 阵营色（BGR），王者荣耀小地图常规配色
 _BLUE_LOW = np.array([150, 60, 30])
 _BLUE_HIGH = np.array([255, 150, 120])
@@ -45,13 +47,19 @@ class MatchPhase(str, enum.Enum):
 class MatchStateMachine:
     def __init__(self, minimap_center_norm=None, minimap_r_norm=0.082,
                  gray_thr=_GRAY_THR, min_dots=3, hold_frames=90, post_hold_s=15.0,
-                 green_thr=_GREEN_THR, blue_max=_BLUE_MAX):
+                 green_thr=_GREEN_THR, blue_max=_BLUE_MAX, hold_s=3.0):
         # minimap_center_norm 保留兼容旧调用（不再用于 ROI 定位，ROI 固定方形）
         self.gray_thr = gray_thr
         self.green_thr = green_thr
         self.blue_max = blue_max
         self.min_dots = min_dots
         self.hold_frames = hold_frames
+        # v16.3: hold_frames 是**按帧计数**的滞回，隐含"主循环 30fps"的假设（90 帧=3s）。
+        #   真机主循环只有 6–9Hz -> 90 帧变成 10–14 秒预热，实测 20 秒的跑里 90 帧全用来
+        #   等进入 IN_MATCH，感知只跑了 38 拍。改为**帧数或时长任一满足**即可（默认 3s，
+        #   与 30fps 下 90 帧等价 -> MuMu 路径行为不变）。
+        self.hold_s = hold_s
+        self._in_since = None
         # 离开对局需要连续失败 3 倍进入帧数（滞回，防抖动）
         self.leave_frames = hold_frames * 3
         self.post_hold_s = post_hold_s   # 结算状态保持秒数，供下游感知"对局结束"
@@ -71,10 +79,8 @@ class MatchStateMachine:
             return False, 0, 0
         gray = float(roi.mean())
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        H = hsv[..., 0].astype(int)
-        S = hsv[..., 1].astype(int)
-        V = hsv[..., 2].astype(int)
-        green = int(np.sum((H >= 35) & (H <= 90) & (S > 80) & (V > 90)))
+        # v15.3 阈值集中到 wzry/vision/colors.py（GREEN_PHASE）
+        green = colors.count(hsv, colors.GREEN_PHASE)
         B = roi[..., 0].astype(int)
         G = roi[..., 1].astype(int)
         R = roi[..., 2].astype(int)
@@ -90,6 +96,8 @@ class MatchStateMachine:
         dark, green, blue = self._minimap_features(frame)
         # v2.13：绿色地图底 = 对局铁证；蓝色超上限（导航栏）= 局外界面
         in_match = dark and green > self.green_thr and blue < self.blue_max
+        # v16.3 诊断: 把本帧判据原始值留出来，供上层在"判定不在对局"时打印归因
+        self.last_feat = (dark, green, blue, in_match)
 
         if in_match:
             # v3.0: POST_MATCH 状态锁定（结算界面绿色元素抖动不得拉回对局）
@@ -99,12 +107,16 @@ class MatchStateMachine:
                 return self.phase
             self._in_match_streak += 1
             self._out_match_streak = 0
-            if self._in_match_streak >= self.hold_frames:
+            if self._in_since is None:
+                self._in_since = time.time()
+            if self._in_match_streak >= self.hold_frames or (
+                    self.hold_s and time.time() - self._in_since >= self.hold_s):
                 self.phase = MatchPhase.IN_MATCH
                 self._post_since = None
         else:
             self._out_match_streak += 1
             self._in_match_streak = 0
+            self._in_since = None
             if self.phase == MatchPhase.IN_MATCH:
                 # 对局画面连续消失 → 判定结算，并"粘住" post_hold_s 秒
                 if self._out_match_streak >= self.leave_frames:

@@ -1,0 +1,11 @@
+CAIActorMgr::UpdateLogic
+CActorManager.UpdateLogic
+CActorDataCenter
+FindActorByObjectId
+GetActorByObjID
+SGCore::BattleLogicUnit
+GetAllHerosNode
+GetAllMonstersNode
+GetHpRate
+GetMaxHpWithOutBuff
+ActorLogicUnitFilter

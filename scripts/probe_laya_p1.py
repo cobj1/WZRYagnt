@@ -46,11 +46,55 @@ def main():
     ap = argparse.ArgumentParser(description="P1 offline gate probe")
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--mode", default="ensemble", choices=["shadow", "ensemble"])
-    ap.add_argument("--beta", type=float, default=0.5)
+    # v14.2 默认 0.5 -> 0.05: 实测规则分 top1-top2 间距只有 0.004~0.25,
+    #   beta=0.5 的 bonus 极差(0.469)足以翻转任意排序, 不是小扰动。
+    ap.add_argument("--beta", type=float, default=0.05)
     ap.add_argument("--hz", type=float, default=10.0, help="决策频率( mimic m2 10Hz)")
+    ap.add_argument("--topk", type=int, default=16, help="送进 Laya 的候选数")
+    ap.add_argument("--throttle", type=float, default=0.0,
+                    help="提交推理的最小间隔(秒), 0=不限; 模型慢时用它降频")
+    # v14.3 后端选择(方案 §6.2): 本机无独显, 用 OpenVINO 跑 Arc 140T 核显
+    ap.add_argument("--backend", default="auto", choices=["auto", "onnx", "torch", "openvino"])
+    ap.add_argument("--device", default="GPU", help="OpenVINO 设备: GPU/NPU/CPU/AUTO")
+    ap.add_argument("--ir", default=None, help="OpenVINO IR; 默认 runs/laya/laya_ov/laya_qfreeze.xml")
+    ap.add_argument("--max-len", type=int, default=320, help="IR 编译时的固定序列长度")
+    ap.add_argument("--offline", action="store_true",
+                    help="HF 缓存离线模式(无外网时必开, 否则加载模型会 ProxyError)")
     args = ap.parse_args()
 
-    sc = LayaScorer(mode=args.mode, beta=args.beta,
+    if args.offline:                      # v14.3 无外网时强制用 HF 本地缓存
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    # v14.2 环境核查: P1 的 80ms 门槛是"T4 GPU 约 40ms"推出来的, 纯 CPU 上必然不过。
+    #   先把真实后端报出来, 免得把环境问题误判成代码问题。
+    _env = []
+    try:
+        import onnxruntime as _ort
+        _env.append(f"onnxruntime={_ort.__version__} providers={_ort.get_available_providers()}")
+        if "CUDAExecutionProvider" not in _ort.get_available_providers():
+            _env.append("  -> 无 CUDA provider: onnxruntime 推理跑在 CPU 上")
+    except Exception as _e:
+        _env.append(f"onnxruntime 不可用({_e})")
+    try:
+        import torch as _t
+        _env.append(f"torch={_t.__version__} cuda={_t.cuda.is_available()}")
+        if not _t.cuda.is_available():
+            _env.append("  -> torch 为 CPU 构建: Router 后端也在 CPU 上")
+    except Exception as _e:
+        _env.append(f"torch 不可用({_e})")
+    try:
+        import openvino as _ov
+        _c = _ov.Core()
+        _env.append(f"openvino={_ov.__version__} devices={_c.available_devices}")
+    except Exception as _e:
+        _env.append(f"openvino 不可用({_e})")
+    print("[probe] 环境: " + " | ".join(_env))
+
+    sc = LayaScorer(mode=args.mode, beta=args.beta, top_k=args.topk,
+                    min_submit_interval=args.throttle,
+                    backend=args.backend, ov_device=args.device, ov_ir=args.ir,
+                    ov_max_len=args.max_len, ov_max_opts=args.topk,
                     shadow_path=ROOT / "runs" / "laya" / "shadow_p1probe.jsonl")
     optimizer.set_scorer(sc, beta=args.beta, mode=args.mode)
     # 计时探针: worker 侧真实推理耗时 + 主线程 reorder 耗时
@@ -92,8 +136,13 @@ def main():
     while time.time() < t_end:
         st = make_state(hp=0.9 if n % 7 else 0.4, n_red=1 + n % 3)
         ta = time.time()
-        optimizer.solve(st, dict(fb), 0.9, "blue")
+        out = optimizer.solve(st, dict(fb), 0.9, "blue")
         solve_ms.append((time.time() - ta) * 1000)
+        # v14.2: 探针无安全层, executed == chosen; 走一遍回调以便记录/覆盖该路径
+        try:
+            sc.log_executed(out)
+        except Exception:
+            pass
         n += 1
         time.sleep(1.0 / args.hz)
 
@@ -108,15 +157,29 @@ def main():
     p95_solve = sorted(solve_ms)[int(0.95 * (len(solve_ms) - 1))] if solve_ms else 0
 
     print(f"\n[probe] 决策 {n} 次 | 推理 {stats['predicts']} | 缓存命中 {stats['cache_hits']}")
+    print(f"[probe] shadow 落盘 {stats['shadow_logged']} 条, 其中带延迟 "
+          f"{stats['latency_logged']} 条 (v14.2: 预测/缓存命中两条路径都写) "
+          f"| 标签重复 fail-open {stats['label_dups']} 次 | executed 记录 "
+          f"{stats['exec_logged']} 次")
     print(f"[probe] Laya 推理延迟: p50={p50}ms p95={p95}ms (样本 {len(lat)}) "
           f"-> {'PASS' if p95 is not None and p95 < 80 else 'FAIL'} (门槛 <80ms)")
     print(f"[probe] 主线程开销: solve p95={p95_solve:.2f}ms, 其中 reorder p95={p95_re:.2f}ms "
           f"(scorer 占比 {'-' if not p95_solve else round(100*p95_re/p95_solve,1)}%)")
     print(f"[probe] 异常数: {stats['errors']} -> "
-          f"{'PASS' if stats['errors'] == 0 else 'FAIL'} (门槛 =0)")
+          f"{'PASS' if stats['errors'] == 0 else 'FAIL'} (门槛 =0)"
+          f" | 标签重复 {stats['label_dups']} | 熔断 {stats.get('tripped')}"
+          f" | 节流跳过 {stats.get('throttled', 0)}")
     ok = (p95 is not None and p95 < 80 and stats["errors"] == 0)
     print(f"\n[probe] P1 离线部分: {'PASS' if ok else 'FAIL'} "
           f"(帧率对比需真机: m2 --laya shadow 前后各跑一场)")
+    if not ok and p95 is not None and p95 >= 80:
+        print("[probe] 未过门槛的原因排查顺序:")
+        print("        1) 后端是否在 GPU 上(见上面'环境'行); 纯 CPU 时模型卡给的 ~40ms 不适用,")
+        print("           需装 onnxruntime-gpu(配 CUDA)或 torch 的 CUDA 版")
+        print("        2) 减候选: --topk 8 (推理耗时随选项数增长)")
+        print("        3) 降频: --throttle 0.5 (模型吞吐跟不上 10Hz 决策环时)")
+        print("        4) 主循环开销: 用 --topk/--throttle 后重测 reorder p95,")
+        print("           它应接近 worker 空闲时的基线(~1.5ms); 明显更高说明与推理抢 CPU")
     return 0 if ok else 1
 
 

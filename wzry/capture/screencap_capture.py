@@ -20,7 +20,8 @@ import numpy as np
 
 from wzry.adb_util import resolve_adb
 
-PROD_SIZE = (1280, 720)          # 下游统一标定的帧尺寸
+PROD_SIZE = (1280, 720)          # 16:9 下的生产尺寸（下游标定基准）
+PROD_MAX_EDGE = 1280             # 长边上限；与 scrcpy 的 --max-size 1280 对齐
 
 
 class ScreencapCapture:
@@ -86,9 +87,15 @@ class ScreencapCapture:
         buf = np.frombuffer(raw[16:need], dtype=np.uint8)
         img_rgba = buf.reshape(h, w, 4)
         img = np.ascontiguousarray(img_rgba[:, :, :3][:, :, ::-1])  # RGBA->BGR
-        if (w, h) != PROD_SIZE:
-            # 缩放统一到生产尺寸(下游标定按 1280x720)
-            img = cv2.resize(img, PROD_SIZE, interpolation=cv2.INTER_AREA)
+        if max(w, h) != PROD_MAX_EDGE:
+            # v16.3 修正: 原来无条件 resize 到 PROD_SIZE(1280x720)，对 20:9 真机
+            #   (3200x1440) 会把纵向拉伸 1.25 倍 —— 正方形小地图被拉成非方形，
+            #   `0.336*h` 一类几何判据与模板匹配全部失真，且**不报错**。
+            #   改为保持宽高比、长边缩到 PROD_MAX_EDGE，与 scrcpy(--max-size 1280)
+            #   输出完全一致: 20:9 -> 1280x576；16:9(1920x1080) -> 1280x720（零变化）。
+            _s = PROD_MAX_EDGE / float(max(w, h))
+            img = cv2.resize(img, (max(1, round(w * _s)), max(1, round(h * _s))),
+                             interpolation=cv2.INTER_AREA)
         # v2.38 RAW 帧偏暗 ~10% -> 增益对齐 PNG 标定色域
         img = np.clip(img.astype(np.float32) * 1.15 + 4.0, 0, 255).astype(np.uint8)
         self.last_ms = (time.perf_counter() - t0) * 1000.0

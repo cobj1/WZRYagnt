@@ -14,9 +14,15 @@ temp/
 # 固件本机私密配置（Wi-Fi 密码）
 secrets.h
 
+# 本机网络状态（板子走 DHCP，IP 随环境变；仅局域网地址，无凭据）
+configs/board.json
+
 # 运行产物与数据（体积大，需选择性提交）
 runs/
 models/
 logs/
 /data/
 /temp/
+out/
+reverse/out/
+reverse/tools/

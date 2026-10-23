@@ -21,6 +21,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from wzry.vision import colors   # HSV 判据单一事实来源（v15.3）
+
 ROOT = Path(__file__).resolve().parents[2]
 CALIB_PATH = ROOT / "configs" / "calibration_absolute.json"
 
@@ -69,11 +71,10 @@ def _bar_masks(frame):
       green -> 己方（`ally_hp_*`，自己那格）
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    H, S, V = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
-    red = (((H <= 15) | (H >= 165)) & (S > 70) & (V > 90)).astype(np.uint8)
-    blue = ((H >= 90) & (H <= 135) & (S > 50) & (V > 70)).astype(np.uint8)
-    green = ((H >= 40) & (H <= 85) & (S > 90) & (V > 70)).astype(np.uint8)
-    return {"red": red, "blue": blue, "green": green}
+    # v15.3 阈值集中到 wzry/vision/colors.py（RED_TOP / BLUE_TOP / GREEN_TOP）
+    return {"red": colors.mask_u8(hsv, colors.RED_TOP),
+            "blue": colors.mask_u8(hsv, colors.BLUE_TOP),
+            "green": colors.mask_u8(hsv, colors.GREEN_TOP)}
 
 
 def find_bars_in_strip(mask, y0, y1, x0, x1):
@@ -154,16 +155,23 @@ def read(frame, cfg=None):
     x1, y1 = min(x1, w), min(y1, h)
     if x1 <= x0 or y1 <= y0:
         return {"found": False, "reason": "top_bar 条带越界"}
+    # v15.2 性能（逐字段等价）：血条掩码只可能落在条带内 —— find_bars_in_strip 本就是
+    #   `sub = mask[y0:y1, x0:x1]`，故先在条带裁剪上做色彩空间转换，避免对整帧(1280x720)
+    #   跑 HSV + 三个全帧布尔掩码（实测 read() 26.7ms，其中掩码转换 ~29ms 级）。
+    #   gray 仍取**整帧**：_ratio 的"空槽向右延伸"要按整行判断，保持原语义不变。
+    strip = frame[y0:y1, x0:x1]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     items = []
     pitch = float(x1 - x0) / slots
     # full_w：满条像素宽（帧空间）。暗空槽 HUD 用它把"实心宽"折算成血量比例；
     # 未标定时退回 pitch*0.75（真机实测满条≈28px / pitch≈38px）。
     full_w = cfg.get("full_w") or (pitch * 0.75)
-    for color, m in _bar_masks(frame).items():
-        for b in find_bars_in_strip(m, y0, y1, x0, x1):
+    for color, m in _bar_masks(strip).items():
+        for b in find_bars_in_strip(m, 0, y1 - y0, 0, x1 - x0):
             b["color"] = color
-            b["ratio"] = _ratio(gray, b["x"], b["w"], b["y"], b["h"], full_w)
+            b["ratio"] = _ratio(gray, b["x"] + x0, b["w"], b["y"] + y0, b["h"], full_w)
+            b["x"] += x0
+            b["y"] += y0
             items.append(b)
     if not items:
         return {"found": False, "reason": "条带内无血条"}

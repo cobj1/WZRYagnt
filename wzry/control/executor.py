@@ -23,10 +23,16 @@ MUMU_ADB_PORTS = (16384, 7555, 16416, 16448, 16480, 16512)
 
 
 def _adb_devices():
-    """执行 adb devices，返回在线序列号列表。"""
+    """执行 adb devices，返回在线序列号列表。
+
+    v14.3 超时 5s -> 20s: 本机同时存在 MuMu 自带 adb(D:\\app\\MuMuPlayer\\nx_main)
+    与项目自带 tools/scrcpy/adb.exe, 两者版本不同、轮流占用 5037, 每次切换都会
+    触发 "daemon not running; starting now" 重启(实测 >5s) -> 旧超时直接超时返回空,
+    表现为"明明连着设备却报未发现 ADB 设备"。用 WZRY_ADB 指定唯一 adb 可避免切换。
+    """
     try:
         out = subprocess.run([ADB, "devices"], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=5).stdout
+                             encoding="utf-8", errors="replace", timeout=20).stdout
     except Exception:
         return []
     return [ln.split("\t")[0] for ln in out.splitlines()[1:] if "\tdevice" in ln]
@@ -215,6 +221,23 @@ class AdbExecutor:
         self._log({"type": "key", "keycode": str(keycode), "source": source,
                    "latency_ms": round(self.last_cmd_ms, 2)})
         return r.returncode == 0
+
+    def type_text(self, text, source="policy"):
+        """输入 ASCII 文本（adb `input text`；中文需输入法，占位不支持）。
+
+        设备端 `input text` 把 %s 当空格，且参数由设备 shell 再解析一次，
+        所以空格转 %s、整体加单引号（内部单引号按 shell 规则闭合转义）。
+        """
+        text = str(text or "")
+        if not text:
+            return False
+        if not text.isascii():
+            raise ValueError("adb input text 仅支持 ASCII 文本（中文需输入法通道）")
+        escaped = text.replace("'", "'\\''").replace(" ", "%s")
+        r = self._run(["shell", f"input text '{escaped}'"])
+        self._log({"type": "type_text", "text": text, "source": source,
+                   "latency_ms": round(self.last_cmd_ms, 2)})
+        return r is not None and r.returncode == 0
 
     def shell(self, cmd):
         """任意 shell 命令（如 getprop 测试往返延迟）。"""

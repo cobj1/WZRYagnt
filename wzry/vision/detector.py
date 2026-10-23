@@ -19,6 +19,8 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
+from wzry.vision import colors   # HSV 判据单一事实来源（v15.3）
+
 CAMP_PAIRS = {"enemy_minion": "ally_minion", "ally_minion": "enemy_minion",
               "enemy_turret": "ally_turret", "ally_turret": "enemy_turret",
               "enemy_crystal": "ally_crystal", "ally_crystal": "enemy_crystal"}
@@ -32,7 +34,7 @@ CAMP_EPS = 0.02
 
 
 def camp_blue_red_fracs(frame, x1, y1, x2, y2):
-    """框内蓝色/红色像素占比（BGR 帧）。"""
+    """框内蓝色/红色像素占比（BGR 帧）。阈值: colors.BLUE_CAMP / colors.RED_CAMP。"""
     h, w = frame.shape[:2]
     x1, y1 = max(0, int(x1)), max(0, int(y1))
     x2, y2 = min(w, int(x2)), min(h, int(y2))
@@ -40,10 +42,8 @@ def camp_blue_red_fracs(frame, x1, y1, x2, y2):
     if crop.size == 0:
         return 0.0, 0.0
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    H, S = hsv[..., 0].astype(int), hsv[..., 1].astype(int)
-    blue = (((H >= 70) & (H <= 135) & (S > 60))).mean()
-    red = ((((H <= 15) | (H >= 165)) & (S > 60))).mean()
-    return float(blue), float(red)
+    return (colors.frac(hsv, colors.BLUE_CAMP, is_hsv=True),
+            colors.frac(hsv, colors.RED_CAMP, is_hsv=True))
 
 
 def camp_correct(frame, dets, eps=CAMP_EPS):
@@ -88,7 +88,8 @@ class Det:
 
 
 class YoloDetector:
-    def __init__(self, model_path, conf=0.3, iou=0.5, device=None, half=False):
+    def __init__(self, model_path, conf=0.3, iou=0.5, device=None, half=False,
+                 intra_threads=None):
         self.model_path = str(model_path)
         self.conf = conf
         self.iou = iou
@@ -100,7 +101,8 @@ class YoloDetector:
         self.model = None           # ultralytics YOLO 句柄(仅 .pt 后端)
         if self.model_path.lower().endswith(".onnx"):
             from wzry.vision.hok_yolov5 import HokYoloV5
-            self._hok = HokYoloV5(self.model_path, conf=conf, iou=iou)
+            self._hok = HokYoloV5(self.model_path, conf=conf, iou=iou,
+                                  intra_threads=intra_threads)
             self.backend = "hok_yolov5_onnx"
             self.names = self._hok.names
         else:

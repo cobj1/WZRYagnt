@@ -28,6 +28,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from wzry.vision import colors   # HSV 判据单一事实来源（v15.3）
+
 ROOT = Path(__file__).resolve().parents[2]
 DEF_ONNX = ROOT / "runs" / "detect" / "hok_yolov5" / "hok_yolov5s.onnx"
 DEF_CLS = ROOT / "runs" / "detect" / "hok_yolov5" / "hok_yolov5s_classes.json"
@@ -116,16 +118,14 @@ def _hero_bar_probe(frame, x1, y1, x2, y2):
 
 
 def _bar_color_fracs(roi):
-    """血条 ROI 的绿/红/蓝像素占比(HSV; 绿/红阈值同 camp_autolabel.bar_colors)。"""
+    """血条 ROI 的绿/红/蓝像素占比(HSV)。阈值: colors.GREEN_BAR / RED_BAR / BLUE_BAR
+    （三者自带 S>=80 & V>=80 的 sat 约束，与旧实现逐像素等价）。"""
     if roi is None or roi.size == 0:
         return 0.0, 0.0, 0.0
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    h_, s_, v_ = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-    sat = (s_ >= 80) & (v_ >= 80)
-    green = ((h_ >= 40) & (h_ <= 85) & sat).mean()
-    red = (((h_ <= 10) | (h_ >= 170)) & sat).mean()
-    blue = ((h_ >= 90) & (h_ <= 140) & sat).mean()
-    return float(green), float(red), float(blue)
+    return (colors.frac(hsv, colors.GREEN_BAR, is_hsv=True),
+            colors.frac(hsv, colors.RED_BAR, is_hsv=True),
+            colors.frac(hsv, colors.BLUE_BAR, is_hsv=True))
 
 
 def _letterbox(img, new_shape=640, color=(114, 114, 114), stride=32, auto=True):
@@ -183,7 +183,8 @@ def _nms(boxes, scores, iou_thres):
 
 
 def camp_blue_red_fracs(frame, x1, y1, x2, y2):
-    """框内蓝色/红色像素占比(BGR 帧)。与 detector.camp_blue_red_fracs 同一实现。"""
+    """框内蓝色/红色像素占比(BGR 帧)。与 detector.camp_blue_red_fracs 同一实现与阈值
+    （colors.BLUE_CAMP / colors.RED_CAMP）。"""
     h, w = frame.shape[:2]
     x1, y1 = max(0, int(x1)), max(0, int(y1))
     x2, y2 = min(w, int(x2)), min(h, int(y2))
@@ -191,17 +192,32 @@ def camp_blue_red_fracs(frame, x1, y1, x2, y2):
     if crop.size == 0:
         return 0.0, 0.0
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    H, S = hsv[..., 0].astype(int), hsv[..., 1].astype(int)
-    blue = (((H >= 70) & (H <= 135) & (S > 60))).mean()
-    red = ((((H <= 15) | (H >= 165)) & (S > 60))).mean()
-    return float(blue), float(red)
+    return (colors.frac(hsv, colors.BLUE_CAMP, is_hsv=True),
+            colors.frac(hsv, colors.RED_CAMP, is_hsv=True))
+
+
+def _sess_options(intra_threads=None):
+    """intra_threads>0 时返回限制线程池的 SessionOptions, 否则 None(ORT 默认)。
+
+    默认 ORT 按物理核数开 intra_op 线程(16 核机器全占满) —— 主循环推理期间采集
+    reader 被饿死(wait_frame 占墙钟 88-97%, v14.3 计时实测), 限到 2-4 给采集让 CPU。
+    inter_op 对 YOLO 这种顺序图无用, 一并设 1 避免第二次线程爆炸。
+    """
+    n = int(intra_threads or 0)
+    if n <= 0:
+        return None
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = n
+    so.inter_op_num_threads = 1
+    return so
 
 
 class HokYoloV5:
     """ONNX 推理 + 解码 + 类别映射 + 阵营分流。"""
 
     def __init__(self, onnx_path=None, classes_path=None, conf=0.35, iou=0.45,
-                 imgsz=640, self_camp="blue"):
+                 imgsz=640, self_camp="blue", intra_threads=None):
         import onnxruntime as ort
         self.onnx_path = Path(onnx_path or DEF_ONNX)
         self.imgsz = int(imgsz)
@@ -212,6 +228,7 @@ class HokYoloV5:
         self.names = {int(k): v for k, v in
                       json.loads(cp.read_text(encoding="utf-8"))["names"].items()}
         self.sess = ort.InferenceSession(str(self.onnx_path),
+                                         sess_options=_sess_options(intra_threads),
                                          providers=["CPUExecutionProvider"])
         self._in = self.sess.get_inputs()[0].name
         self._outs = [o.name for o in self.sess.get_outputs()]
