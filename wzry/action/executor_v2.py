@@ -208,11 +208,11 @@ class ActionExecutor:
         x, y = PTS["restore"]
         return self.ex.tap(x, y, source="policy")
 
-
-if __name__ == "__main__":
-    pass
-
     # ---------- 连招 ----------
+    # 注意：这两个方法曾是 `if __name__ == "__main__":` 块内的嵌套函数，
+    # 导致 ActionExecutor 上根本没有 sequence/_exec_dict，
+    # wzry/policy/env.py 调用 _exec_dict 会抛 AttributeError。
+    # 现改为类方法，缩进无需变动（原本就是 4/8 空格）。
     def sequence(self, steps, gap_ms: int = 120):
         """连招编排。steps: [(callable, args, kwargs), ...] 或原语 dict 列表。
         dict 格式: {"move": {"theta": 0, "r": 1, "duration": 200}} /
