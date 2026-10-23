@@ -294,6 +294,7 @@ class HokShadowWorker:
         self.error: str | None = None
         self.dropped = 0
         self.decisions = 0
+        self.errors = 0
         self._interval = 1.0 / max(0.1, float(hz))
         self._last_submit = 0.0
         self._queue: queue.Queue = queue.Queue(maxsize=1)
@@ -329,7 +330,12 @@ class HokShadowWorker:
             return False
         self._last_submit = now
         try:
-            self._queue.put_nowait(copy.deepcopy(state))
+            snapshot = copy.deepcopy(state)
+        except Exception:
+            self.dropped += 1
+            return False
+        try:
+            self._queue.put_nowait(snapshot)
         except queue.Full:
             self.dropped += 1
             return False
@@ -342,10 +348,13 @@ class HokShadowWorker:
             except queue.Empty:
                 continue
             try:
-                self.shadow.decide(state)
-                self.decisions += 1
+                payload = self.shadow.decide(state)
+                if payload and payload.get("error"):
+                    self.errors += 1
+                else:
+                    self.decisions += 1
             except Exception:
-                pass
+                self.errors += 1
 
     def close(self) -> None:
         self._stop.set()
@@ -357,6 +366,7 @@ class HokShadowWorker:
             "enabled": self.enabled,
             "error": self.error,
             "decisions": self.decisions,
+            "errors": self.errors,
             "dropped": self.dropped,
             "out": str(self.shadow.out_path) if self.enabled else None,
         }

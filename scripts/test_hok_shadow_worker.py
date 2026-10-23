@@ -48,6 +48,20 @@ passes["decisions_written"] = len(rows) >= 1
 passes["no_errors"] = all("error" not in row for row in rows)
 passes["shadow_source"] = all(row.get("source") == "shadow" for row in rows)
 passes["status"] = worker.status()["decisions"] >= 1
+passes["errors_zero"] = worker.status()["errors"] == 0
+passes["dropped_zero"] = worker.status()["dropped"] == 0
+
+# 错误必须计入 errors，而不是伪装成一次成功决策
+out2 = out.parent / "decisions_error.jsonl"
+if out2.exists():
+    out2.unlink()
+worker2 = HokShadowWorker(out_path=out2, hz=100.0).start()
+worker2.shadow.decide = lambda state: {"error": "simulated", "source": "shadow"}
+worker2.submit(state)
+time.sleep(0.15)
+worker2.close()
+passes["error_counted"] = worker2.status()["errors"] >= 1
+passes["error_not_decision"] = worker2.status()["decisions"] == 0
 
 for name, ok in passes.items():
     print(f"{'PASS' if ok else 'FAIL'}  {name}")
