@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 
 from wzry.policy.inference import BCNetInference, ACT_NAMES, BIN_ANGLE
-from scripts.m3_agent_v3 import apply_guards
+from scripts.m3_agent_v3 import apply_guards, decode_action
 
 
 class MockNet(torch.nn.Module):
@@ -40,6 +40,12 @@ class TestBCInference(unittest.TestCase):
         self.inf = BCNetInference.__new__(BCNetInference)
         self.inf.net = self.net
         self.inf.device = "cpu"
+        # __new__ 绕过 __init__，需手工补齐 decide() 依赖的实例属性；
+        # 缺 has_memory 会让三个用例直接 AttributeError。
+        self.inf.has_memory = False
+        self.inf._hidden = None
+        self.inf.last_infer_ms = 0.0
+        self.inf.n_frames = 0
 
     def _state(self):
         return {"t": 100.0, "screen_size": [1280, 720],
@@ -83,6 +89,53 @@ class TestBCInference(unittest.TestCase):
         self.assertEqual(a["type"], "none")
         a2 = apply_guards({"type": "move", "theta": 1.0, "r": 0.8}, 100.2, cd)
         self.assertEqual(a2["type"], "move")
+
+
+class TestDecodeAction(unittest.TestCase):
+    """回归保护：10 个 act_name 必须各自映射到正确动作类型。
+
+    历史缺陷：主循环曾用 `reason.startswith("bc:")` 兜底 pass，把 move / recall /
+    restore / summoner / buy 全部吞掉（move 的 reason 恰为 "bc:move"），
+    导致 BC 策略只能放技能和普攻、完全无法移动。以下用例锁死该行为。
+    """
+
+    EXPECT = {
+        "move": "move", "skill1": "skill", "skill2": "skill", "skill3": "skill",
+        "attack": "attack", "buy": "none", "recall": "recall",
+        "summoner": "summoner", "restore": "restore", "none": "none",
+    }
+
+    def _decide(self, act_name):
+        """用 MockNet 走真实 decide()，确保输入与线上格式一致。"""
+        net = MockNet()
+        net.act_i = ACT_NAMES.index(act_name)
+        inf = BCNetInference.__new__(BCNetInference)
+        inf.net, inf.device = net, "cpu"
+        inf.has_memory, inf._hidden = False, None
+        inf.last_infer_ms, inf.n_frames = 0.0, 0
+        return inf.decide({
+            "t": 100.0, "screen_size": [1280, 720],
+            "units": [{"cls": "enemy_hero", "screen": [0.6, 0.4, 0.1, 0.2]}],
+            "minimap": {"found": True,
+                        "dots": {"blue": [[0.5, 0.5]], "red": [[0.7, 0.6]], "yellow": []}},
+            "ui": {"gold": 1000, "level": 5, "hp": 0.8},
+        })
+
+    def test_all_act_names_dispatch(self):
+        for name in ACT_NAMES:
+            with self.subTest(act_name=name):
+                got = decode_action(self._decide(name))["type"]
+                self.assertEqual(got, self.EXPECT[name],
+                                 f"{name} 分派错误：得到 {got}，期望 {self.EXPECT[name]}")
+
+    def test_move_keeps_theta_and_r(self):
+        act = decode_action(self._decide("move"))
+        self.assertEqual(act["type"], "move")
+        self.assertAlmostEqual(act["theta"], 3.5 * BIN_ANGLE, places=5)
+        self.assertAlmostEqual(act["r"], 0.8, places=5)
+
+    def test_unknown_act_name_is_noop(self):
+        self.assertEqual(decode_action({})["type"], "none")
 
 
 if __name__ == "__main__":

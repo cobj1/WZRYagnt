@@ -185,26 +185,7 @@ def main():
             frame_id += 1
 
             act = policy.decide(st.to_dict())
-            action = {"type": "none"}
-            act_name = act.get("act_name", "")
-            # v3.1 修正：原实现用 `reason.startswith("bc:")` 兜底 pass，把 move / recall /
-            # restore / summoner / buy 全部吃掉（move 的 reason 恰为 "bc:move"），
-            # 使 BC 策略只能放技能和普攻、完全无法移动。改为按 act_name 显式分派。
-            if act.get("skill_id"):
-                action = {"type": "skill", "id": act["skill_id"], "mode": "tap",
-                          "reason": act.get("reason", "bc_skill")}
-            elif act.get("attack"):
-                action = {"type": "attack", "priority": "free", "reason": "bc_attack"}
-            elif act.get("recall"):
-                action = {"type": "recall", "reason": "bc_recall"}
-            elif act.get("restore"):
-                action = {"type": "restore", "reason": "bc_restore"}
-            elif act.get("summoner"):
-                action = {"type": "summoner", "reason": "bc_summoner"}
-            elif act_name == "move" and act.get("move_bin") is not None:
-                action = {"type": "move", "theta": act["theta"], "r": act["r"],
-                          "reason": f"bc:move_bin{act['move_bin']}"}
-            # 其余 act_name（none / buy）保持不动作：无购买原语，且模型判 none 时按设计不动
+            action = decode_action(act)
             action = apply_guards(action, now, cooldowns)
 
             objs = ", ".join(f"{d.cls}:{d.conf:.2f}" for d in dets[:5]) or "无"
