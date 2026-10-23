@@ -62,21 +62,27 @@ def encode_state(st: dict, n_units_max: int = 20) -> dict:
     "grid": (GRID,GRID,GRID_CH) float32, "ui": (len(UI_KEYS),) float32, "meta": dict}。"""
     units = np.zeros((n_units_max, UNIT_DIM), dtype=np.float32)
     mask = np.zeros((n_units_max,), dtype=np.float32)
-    for i, u in enumerate(st.get("units", [])[:n_units_max]):
+    slot = 0
+    for u in st.get("units", [])[:n_units_max]:
         cls = u.get("cls", "")
         cid = CLS2ID.get(cls, -1)
-        if cid >= 0:
-            units[i, cid] = 1.0
+        if cid < 0:
+            # 白名单外类别（如 grass / 未标注类）不占 mask，避免空 one-hot 污染训练特征
+            continue
+        if slot >= n_units_max:
+            break
+        units[slot, cid] = 1.0
         scr = u.get("screen") or [0, 0, 0, 0]
-        units[i, len(CLASSES):len(CLASSES) + 4] = scr[:4]
+        units[slot, len(CLASSES):len(CLASSES) + 4] = scr[:4]
         # conf: build_state 已把检测器置信度写进 Unit.conf；旧数据缺失时回退 1.0
         _c = u.get("conf")
-        units[i, len(CLASSES) + 4] = float(_c) if isinstance(_c, (int, float)) else 1.0
+        units[slot, len(CLASSES) + 4] = float(_c) if isinstance(_c, (int, float)) else 1.0
         # trust: camp_src 是否来自可信判据（bar=血条判色 / color=框内像素 / neutral）。
         # "default" 是判据不显著时的兜底当敌（幻影敌人来源）、"extra" 是草丛噪声 -> 均记 0
-        units[i, len(CLASSES) + 5] = 1.0 if u.get("camp_src") in TRUST_SRC else 0.0
-        units[i, len(CLASSES) + 6] = 1.0 if u.get("dead") else 0.0
-        mask[i] = 1.0
+        units[slot, len(CLASSES) + 5] = 1.0 if u.get("camp_src") in TRUST_SRC else 0.0
+        units[slot, len(CLASSES) + 6] = 1.0 if u.get("dead") else 0.0
+        mask[slot] = 1.0
+        slot += 1
 
     grid = np.zeros((GRID, GRID, GRID_CH), dtype=np.float32)
     mm = st.get("minimap") or {}

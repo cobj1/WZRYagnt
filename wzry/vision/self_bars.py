@@ -42,10 +42,19 @@ HERO_REGION = (500, 300, 800, 550)
 MIN_HERO_AREA = 300
 
 
+def _scale(frame):
+    """HUD 常量以 1280x720 为基准，按实际帧缩放（20:9 生产帧为 1280x576）。"""
+    h, w = frame.shape[:2]
+    return w / 1280.0, h / 720.0
+
+
 def hero_bar_check(frame, cx, cy, half_w=60, y_span=40):
     """v2.75 敌英血条厚度校验: (cx,cy)附近找红条, 返回最高条高(px)。
     >=BAR_H_MIN(5)=英雄; 1-4px=野怪/小兵 -> 由调用方剔除。无条返回 None。"""
     try:
+        sx, sy = _scale(frame)
+        half_w = max(1, int(round(half_w * sx)))
+        y_span = max(1, int(round(y_span * sy)))
         x0 = max(0, int(cx) - half_w)
         x1 = min(frame.shape[1], int(cx) + half_w)
         y0 = max(0, int(cy))
@@ -57,11 +66,14 @@ def hero_bar_check(frame, cx, cy, half_w=60, y_span=40):
         S, V = hsv[..., 1].astype(int), hsv[..., 2].astype(int)
         m = ((S > 60) & (V > 100)).astype(np.uint8)
         n, lab, st, _ = cv2.connectedComponentsWithStats(m, 8)
+        w_min = max(1, int(round(10 * sx)))
+        w_max = max(w_min, int(round(200 * sx)))
+        h_max = max(1, int(round(12 * sy)))
         best = None
         for i in range(1, n):
             x, y, w2, h2, area = st[i]
             # 红条: 宽 10-200, 高 1-12, 长宽比>=3(横条), 红色(R>G*1.4)
-            if not (10 <= w2 <= 200 and 1 <= h2 <= 12 and w2 >= 3 * h2):
+            if not (w_min <= w2 <= w_max and 1 <= h2 <= h_max and w2 >= 3 * h2):
                 continue
             seg = roi[y:y + h2, x:x + w2]
             rmean = float(seg[..., 2].mean())
@@ -117,6 +129,15 @@ def _find_bars(frame, hue_cond, label, hsv=None, bridge=0, y_top=None):
     """
     if hsv is None:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    sx, sy = _scale(frame)
+    w_min = max(1, int(round(BAR_W_MIN * sx)))
+    w_max = max(w_min, int(round(BAR_W_MAX * sx)))
+    h_min = max(1, int(round(BAR_H_MIN * sy)))
+    h_max = max(h_min, int(round(BAR_H_MAX * sy)))
+    area_min = max(1, int(round(BAR_AREA_MIN * sx * sy)))
+    x_limit = EXCLUDE_X * sx
+    y_bottom = EXCLUDE_Y_BOTTOM * sy
+    y_top_default = EXCLUDE_Y_TOP * sy
     if isinstance(hue_cond, tuple):                   # colors 规格 -> inRange 快路径
         mask = _spec_mask_u8(hsv, hue_cond)
     else:
@@ -133,12 +154,12 @@ def _find_bars(frame, hue_cond, label, hsv=None, bridge=0, y_top=None):
     for i in range(1, n):
         w_, h_ = st[i, cv2.CC_STAT_WIDTH], st[i, cv2.CC_STAT_HEIGHT]
         area = st[i, cv2.CC_STAT_AREA]
-        if not (BAR_W_MIN <= w_ <= BAR_W_MAX and BAR_H_MIN <= h_ <= BAR_H_MAX
-                and area >= BAR_AREA_MIN):
+        if not (w_min <= w_ <= w_max and h_min <= h_ <= h_max
+                and area >= area_min):
             continue
         lx, ly = int(cent[i][0]), int(cent[i][1])
-        _yt = EXCLUDE_Y_TOP if y_top is None else y_top
-        if lx > EXCLUDE_X or ly < _yt or ly > EXCLUDE_Y_BOTTOM:
+        _yt = y_top_default if y_top is None else y_top
+        if lx > x_limit or ly < _yt or ly > y_bottom:
             continue
         found.append({"x": lx, "y": ly, "w": w_, "h": h_, "ratio": w_ / 150.0})
     found.sort(key=lambda b: (b["y"], b["x"]))
@@ -155,6 +176,7 @@ def detect_all_bars(frame):
             (左上角小队头像条列 x 220-380 全为 UI)
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)   # v15.2: 三色共用一次全帧转换
+    sx, sy = _scale(frame)
     result = {   # v15.3 阈值集中到 wzry/vision/colors.py；传规格 -> 走 inRange 快路径
         "self": _find_bars(frame, colors.GREEN_SCAN, "self", hsv=hsv),
         "allies": _find_bars(frame, colors.BLUE_SCAN, "ally", hsv=hsv),
@@ -162,7 +184,7 @@ def detect_all_bars(frame):
     }
     # v2.92 敌人红条 UI 带排除: 顶部头像条区(y<300, x<380)与左列小队头像条(x<380)
     result["enemies"] = [b for b in result["enemies"]
-                         if b["y"] >= 300 and b["x"] >= 380]
+                         if b["y"] >= 300 * sy and b["x"] >= 380 * sx]
     # 蓝条过滤：宽条（>80）排除；自己绿条旁 60px 内的蓝条=自己蓝量，排除
     if result["self"]:
         self_bars = result["self"]
@@ -171,11 +193,11 @@ def detect_all_bars(frame):
         if my_x is not None:
             result["allies"] = [
                 b for b in result["allies"]
-                if b["w"] <= 80
-                and not (abs(b["x"] - my_x) < 60 and abs(b["y"] - my_y) < 40)
+                if b["w"] <= 80 * sx
+                and not (abs(b["x"] - my_x) < 60 * sx and abs(b["y"] - my_y) < 40 * sy)
             ]
     else:
-        result["allies"] = [b for b in result["allies"] if b["w"] <= 80]
+        result["allies"] = [b for b in result["allies"] if b["w"] <= 80 * sx]
     return result
 
 
@@ -302,7 +324,8 @@ def death_banner_px(frame):
     """v2.87 死亡横幅检测: 顶部中央(0-46, 500-790)暗红色像素数。
     真死亡('查看死亡回放'深红横幅)>=2500; 击杀播报/存活时<=1800 -> 阈值2500分离。"""
     try:
-        roi = frame[0:46, 500:790]
+        sx, sy = _scale(frame)
+        roi = frame[0:int(round(46 * sy)), int(round(500 * sx)):int(round(790 * sx))]
         if roi.size == 0:
             return 0
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -324,6 +347,9 @@ def self_hp_mp(frame):
       - 修复旧 ratio 用区域宽(200px)作分母导致满血只显示 0.55 的低估 bug
     """
     h, w = frame.shape[:2]
+    sx, sy = _scale(frame)
+    full_bar_w = FULL_BAR_W * sx
+    hero_gap = HERO_BAR_GAP * sy
 
     # v16.0 两处放宽（真机 10-18 出现"分段式血条 + 镜头偏高"，原判据一条都找不到）：
     #   1) bridge=SELF_BAR_BRIDGE：黑色刻度把绿条切成 <21px 的短段，会被开运算(21,1)整条抹掉
@@ -342,20 +368,20 @@ def self_hp_mp(frame):
     if not greens:
         return None, None, None
     # 自己血条 = 最宽的绿条（血条 90-123px，场景绿 <60px）
-    best = max(greens, key=lambda b: b["w"])
-    bx, by, bw = best["x"], best["y"], best["w"]
-    hp = min(1.0, bw / FULL_BAR_W)
-    hero_pos = (bx, by + HERO_BAR_GAP)
+    greatest = max(greens, key=lambda b: b["w"])
+    bx, by, bw = greatest["x"], greatest["y"], greatest["w"]
+    hp = min(1.0, bw / max(1.0, full_bar_w))
+    hero_pos = (bx, by + hero_gap)
 
     # MP：绿条正下方 3-25px。蓝条左端与 HP 条左端对齐、填充连续；
     # 用"最右蓝色列位置"换算抗遮挡（金币飘字/血条被截断时左段法会低估）
     mp = None
-    y0 = max(0, by + 3)
-    y1 = min(h, by + 27)
+    y0 = max(0, by + max(1, int(round(3 * sy))))
+    y1 = min(h, by + max(1, int(round(27 * sy))))
     if y1 > y0:
         bar_left = bx - bw // 2
         x_lo = max(0, bar_left - 2)
-        x_hi = min(w, bar_left + int(FULL_BAR_W) + 4)
+        x_hi = min(w, bar_left + int(full_bar_w) + 4)
         if x_hi > x_lo:
             sub = frame[y0:y1, x_lo:x_hi]
             hsv2 = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
@@ -363,11 +389,11 @@ def self_hp_mp(frame):
             cols = m2.any(axis=0)
             if cols.any():
                 last = int(np.nonzero(cols)[0].max())
-                if last >= 12:
-                    mp = min(1.0, (last + 1) / FULL_BAR_W)
+                if last >= max(1, int(round(12 * sx))):
+                    mp = min(1.0, (last + 1) / max(1.0, full_bar_w))
                 else:
                     mp = None
-    if hp is not None and bw < 25:
+    if hp is not None and bw < max(1, int(round(25 * sx))):
         hp = None
     return hp, mp, hero_pos
 
