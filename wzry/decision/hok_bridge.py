@@ -5,8 +5,11 @@
 """
 from __future__ import annotations
 
+import copy
 import json
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -270,3 +273,90 @@ class HokShadow:
         with self.out_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
         return payload
+
+
+class HokShadowWorker:
+    """主循环旁路：低频、异步、可丢弃；任何异常都不影响动作流。"""
+
+    def __init__(
+        self,
+        *,
+        out_path: Path,
+        hz: float = 1.0,
+        model: str = "base",
+        map_path: Path | None = None,
+        anchors_path: Path | None = None,
+        horizon_s: float = 12.0,
+        beam_width: int = 2,
+        max_candidates: int = 8,
+    ) -> None:
+        self.enabled = False
+        self.error: str | None = None
+        self.dropped = 0
+        self.decisions = 0
+        self._interval = 1.0 / max(0.1, float(hz))
+        self._last_submit = 0.0
+        self._queue: queue.Queue = queue.Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="hok-shadow", daemon=True)
+        linear_path = None
+        if model == "linear":
+            linear_path = _AIKINGS_ROOT / "hokdata" / "value_linear_model.json"
+        try:
+            self.shadow = HokShadow(
+                out_path=Path(out_path),
+                map_path=map_path,
+                anchors_path=anchors_path,
+                linear_model_path=linear_path,
+                horizon_s=horizon_s,
+                beam_width=beam_width,
+                max_candidates=max_candidates,
+            )
+            self.enabled = True
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+
+    def start(self) -> "HokShadowWorker":
+        if self.enabled:
+            self._thread.start()
+        return self
+
+    def submit(self, state: dict[str, Any], now: float | None = None) -> bool:
+        if not self.enabled:
+            return False
+        now = time.monotonic() if now is None else float(now)
+        if now - self._last_submit < self._interval:
+            return False
+        self._last_submit = now
+        try:
+            self._queue.put_nowait(copy.deepcopy(state))
+        except queue.Full:
+            self.dropped += 1
+            return False
+        return True
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                state = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self.shadow.decide(state)
+                self.decisions += 1
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "error": self.error,
+            "decisions": self.decisions,
+            "dropped": self.dropped,
+            "out": str(self.shadow.out_path) if self.enabled else None,
+        }

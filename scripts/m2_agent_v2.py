@@ -1976,6 +1976,16 @@ def main():
     ap.add_argument("--mem-self-id", type=int, default=None,
                     help="本地英雄配置 ID（106=小乔…）。不给则用数组 slot0（实测两局均为本地玩家）")
     ap.add_argument("--mem-hz", type=float, default=2.0, help="内存刷新频率(默认2Hz)")
+    # S1-4 shadow: 只读回放 hok-decision-ai 的宏观决策，不改变任何下发动作。
+    #   默认关；开启时用独立 daemon 线程 + 队列深度 1，主循环只做非阻塞提交。
+    ap.add_argument("--hok-shadow", action="store_true",
+                    help="开启 hok 宏观决策 shadow 日志（只读，不改动作流；默认关）")
+    ap.add_argument("--hok-shadow-hz", type=float, default=1.0,
+                    help="shadow 决策频率(默认1Hz)")
+    ap.add_argument("--hok-shadow-model", choices=["base", "linear"], default="base",
+                    help="base=规则权重(默认)；linear=Tencent 线性价值(未做 WZRY 域校准)")
+    ap.add_argument("--hok-shadow-out", default=None,
+                    help="shadow JSONL 路径；默认 temp/hok_shadow/live.jsonl")
     # v17.0 决策架构：legacy=价值场 argmax（默认，行为不变）；official=官方架构复刻版
     #   （按类别特征向量 -> 打分 -> top-k -> 规则覆盖 -> 回退）。建议与 --mem 同用。
     ap.add_argument("--ai-arch", choices=["legacy", "official"], default="legacy",
@@ -2429,6 +2439,27 @@ def main():
     if do_action:
         threading.Thread(target=_action_worker, daemon=True).start()
         print("执行线程: 动作入队串行执行(主循环不阻塞)")
+
+    # ---- S1-4 hok shadow（只读旁路，默认关）----
+    _hok_shadow = None
+    if getattr(args, "hok_shadow", False):
+        try:
+            from wzry.decision.hok_bridge import HokShadowWorker
+            _shadow_out = Path(args.hok_shadow_out) if args.hok_shadow_out else (
+                ROOT / "temp" / "hok_shadow" / "live.jsonl")
+            _hok_shadow = HokShadowWorker(
+                out_path=_shadow_out,
+                hz=float(args.hok_shadow_hz),
+                model=args.hok_shadow_model,
+            ).start()
+            if _hok_shadow.enabled:
+                print(f"[hok-shadow] 已开启: model={args.hok_shadow_model} "
+                      f"hz={args.hok_shadow_hz} -> {_shadow_out}")
+            else:
+                print(f"[hok-shadow] 启动失败(降级为关闭): {_hok_shadow.error}")
+        except Exception as _e:
+            print(f"[hok-shadow] 启动失败(降级为关闭): {type(_e).__name__}: {_e}")
+            _hok_shadow = None
 
     # ---- v16.2 外部/文件驱动（--drive-stdin）----
     #   读 stdin 逐行动作 -> 同一套 _action_q/_action_worker（所以 hold/release 语义一致）。
@@ -3130,6 +3161,11 @@ def main():
             _td = _t0()
             action = decide(state_dict, cooldowns)
             _t1(_td, "规则决策decide")
+            if _hok_shadow is not None:
+                try:
+                    _hok_shadow.submit(state_dict)
+                except Exception:
+                    pass
             # v16.0 P2 推进: 把本拍的 push 评估结果挂到状态上（render_live_analysis 落盘用）
             _exd = state_dict.get("extra")
             if isinstance(_exd, dict):
@@ -3600,6 +3636,12 @@ def main():
     except KeyboardInterrupt:
         print("\n手动退出。")
     finally:
+        if _hok_shadow is not None:
+            try:
+                _hok_shadow.close()
+                print(f"[hok-shadow] 统计: {_hok_shadow.status()}")
+            except Exception:
+                pass
         # v14.2 退出前 drain 动作队列: 让已入队的动作执行完(或在 5s 后放弃), 再关 recorder,
         #   否则"动作记录"与"实际执行"错位(最后几个动作没发出去却已落盘)。
         if do_action:
