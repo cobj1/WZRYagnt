@@ -197,6 +197,7 @@ class HokShadow:
         out_path: Path,
         map_path: Path | None = None,
         anchors_path: Path | None = None,
+        linear_model_path: Path | None = None,
         horizon_s: float = 12.0,
         beam_width: int = 2,
         max_candidates: int = 8,
@@ -209,6 +210,14 @@ class HokShadow:
         self.horizon_s = horizon_s
         self.beam_width = beam_width
         self.max_candidates = max_candidates
+        self.value_context = None
+        if linear_model_path is not None and Path(linear_model_path).exists():
+            try:
+                from hok_decision.search.linear_value import LinearValueEvaluator
+
+                self.value_context = LinearValueEvaluator.load(linear_model_path)
+            except Exception:
+                self.value_context = None
 
     def decide(self, state: dict[str, Any], *, self_camp: str | None = None) -> dict[str, Any] | None:
         if not self.enabled:
@@ -227,6 +236,7 @@ class HokShadow:
                 beam_width=self.beam_width,
                 action_duration_s=4.0,
                 max_candidates=self.max_candidates,
+                value_context=self.value_context,
                 with_decision_output=True,
             )
             first = best.actions[0] if best and best.actions else None
@@ -245,6 +255,7 @@ class HokShadow:
                 "target_position": output.target_position if output else None,
                 "n_blue": sum(1 for hero in search_state.heroes.values() if hero.side == "blue"),
                 "n_red": sum(1 for hero in search_state.heroes.values() if hero.side == "red"),
+                "value_model": "linear" if self.value_context is not None else "base_weights",
                 "decision_ms": round((time.perf_counter() - started) * 1000.0, 2),
                 "source": "shadow",
             }

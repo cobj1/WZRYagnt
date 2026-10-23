@@ -43,6 +43,8 @@ def main() -> int:
     parser.add_argument("--out", default=None)
     parser.add_argument("--horizon", type=float, default=12.0)
     parser.add_argument("--beam", type=int, default=2)
+    parser.add_argument("--model", choices=["base", "linear"], default="base",
+                        help="base=规则权重；linear=Tencent 线性价值基线（未做 WZRY 域校准）")
     args = parser.parse_args()
 
     if args.states:
@@ -60,7 +62,16 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
         out.unlink()
-    shadow = HokShadow(out_path=out, horizon_s=args.horizon, beam_width=args.beam)
+    linear_model = (
+        ROOT.parent / "hokdata" / "value_linear_model.json"
+        if args.model == "linear" else None
+    )
+    shadow = HokShadow(
+        out_path=out,
+        horizon_s=args.horizon,
+        beam_width=args.beam,
+        linear_model_path=linear_model,
+    )
     rows = _load_states(states_path)
     interval = 1.0 / max(0.1, args.hz)
     selected = []
