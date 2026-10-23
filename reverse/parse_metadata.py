@@ -31,11 +31,15 @@ metadata v29 的表结构解析即可，绕开 .so。
 from __future__ import annotations
 
 import argparse
+import os
 import struct
 import sys
 from pathlib import Path
 
-MD = Path(r"D:\work\aiKings\reverse\hok\global-metadata.dat")
+# 逆向二进制原料所在目录（原 `reverse/` 已改名 `reverse-bin/`，避免与
+# WZRYagnt/reverse/ 同名混淆）。可用环境变量 AIKINGS_ROOT 覆盖工作区根。
+WORKSPACE = Path(os.environ.get("AIKINGS_ROOT", Path(__file__).resolve().parents[2]))
+MD = WORKSPACE / "reverse-bin" / "hok" / "global-metadata.dat"
 TD_SIZE = 88
 FIELD_SIZE = 12
 
