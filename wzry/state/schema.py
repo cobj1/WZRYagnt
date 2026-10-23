@@ -65,6 +65,15 @@ class Unit:
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
+    def t_last_seen(self) -> Optional[float]:
+        """Runtime 协议别名：最后一次观测时刻。"""
+        return self.last_seen_t
+
+    @t_last_seen.setter
+    def t_last_seen(self, value: Optional[float]) -> None:
+        self.last_seen_t = value
+
+    @property
     def hp_rate(self) -> Optional[float]:
         if self.hp is not None:
             return max(0.0, min(1.0, float(self.hp)))
