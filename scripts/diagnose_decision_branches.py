@@ -13,7 +13,7 @@
 
 用法：
   python -X utf8 scripts/diagnose_decision_branches.py --limit 1500
-  python -X utf8 scripts/diagnose_decision_branches.py --limit 0 --json ../hokdata/branch_report.json
+  python -X utf8 scripts/diagnose_decision_branches.py --limit 0 --json runs/eval/branch_report.json
 """
 from __future__ import annotations
 
