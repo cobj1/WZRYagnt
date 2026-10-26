@@ -2653,6 +2653,10 @@ def main():
         _nm_vals = []
         # --result auto: 留最近 12 帧(降采样)给结算页判读，覆盖"横幅晚 1–2 秒出现"
         _recent = deque(maxlen=12) if getattr(args, "result", None) == "auto" else None
+        # 静默空转防护：不进对局时每 30s 打一行原因。
+        # 教训（2026-10-26）：训练营调试面板遮住小地图 → 62407 拍全是 not_in_match，
+        # 日志里一行都没有，只能靠退出时的汇总才发现，白等了 10 分钟。
+        _last_nm_log = 0.0
         while time.time() < t_end and not _drive_done.is_set():
             _tw = _t0()
             frame, lag_ms = cap.wait_frame(timeout=2.0)
@@ -2788,6 +2792,15 @@ def main():
                         _nm_why["green_low"] += 1
                     if _b >= sm.blue_max:
                         _nm_why["blue_high"] += 1
+                    _now_nm = time.time()
+                    if _now_nm - _last_nm_log >= 30.0:
+                        _last_nm_log = _now_nm
+                        print(f"[{datetime.now():%H:%M:%S}] [等待对局] {n_frames} 帧 | "
+                              f"dark={_d} green={_g}(阈值>{sm.green_thr}) "
+                              f"blue={_b}(阈值<{sm.blue_max}) | "
+                              f"累计 not_in_match={_skips['not_in_match']}"
+                              + ("  ← 小地图绿点缺失：确认小地图没被面板遮住/不在对局"
+                                 if _g <= sm.green_thr else ""))
                     _nm_vals.append((_g, _b))
                 except Exception:
                     pass

@@ -53,6 +53,11 @@ class FakeLaya(LayaScorer):
         self.calls = 0
 
     def _predict(self, state_text, labels):
+        # `predicts += 1` 原本写在 LayaScorer._predict 里；本 Fake 把它整体替掉后
+        #   计数器就不再自增，导致测试里的 `wait_predict()` 空等满超时。
+        #   而 `stale_probs_ttl` 按墙钟计时，空等 3s 就会正好把窗口跨过去 ——
+        #   T2 在 run_tests 里失败、单跑又时过时不过，就是这个边界造成的。
+        self._counts["predicts"] += 1
         self.calls += 1
         return self._probs_fn(labels)
 
@@ -72,6 +77,23 @@ def wait_predict(sc, at_least=1, timeout=3.0):
     t0 = time.time()
     while sc.stats().get("predicts", 0) < at_least and time.time() - t0 < timeout:
         time.sleep(0.05)
+
+
+def wait_model(sc, timeout=120.0):
+    """等 worker 把模型加载完。
+
+    本套测试用 `FakeLaya._predict` 替掉了推理，但 `start()` 仍会真的加载 laya 模型
+    （首次要拉 4 个文件、~5s 起步，冷缓存更久）。原先只等 3s —— 模型未就绪时
+    `_submit` 排进去的活没人消费，表现为 `submits=1 / predicts=0 / model_ok=False`，
+    在 `run_tests.py` 里连跑多个套件时必现。这里先等 model_ok 再发任务。
+    """
+    t0 = time.time()
+    while not sc.stats().get("model_ok") and time.time() - t0 < timeout:
+        time.sleep(0.2)
+    ok = bool(sc.stats().get("model_ok"))
+    if not ok:
+        print(f"[warn] 模型 {timeout:.0f}s 内未就绪：{sc.stats().get('last_error') or 'unknown'}")
+    return ok
 
 
 st_hi = make_state(0.9)
@@ -97,6 +119,7 @@ sc1.stop()
 sc2 = FakeLaya(bias_second, mode="ensemble", beta=10.0, cache_ttl=0.30,
                stale_probs_ttl=3.0)
 sc2.start()
+wait_model(sc2)
 wait_predict(sc2, 0, 0.1)
 scored2 = make_scored()
 d1 = sc2.reorder(scored2, f_hi, 0.9, "blue")
@@ -120,6 +143,7 @@ sc2.stop()
 sc3 = FakeLaya(bias_second, mode="ensemble", beta=10.0, cache_ttl=0.30,
                stale_probs_ttl=0.2)
 sc3.start()
+wait_model(sc3)
 wait_predict(sc3, 0, 0.1)
 sc3.reorder(make_scored(), f_hi, 0.9, "blue")
 wait_predict(sc3, 1)
@@ -133,6 +157,7 @@ sc3.stop()
 sc4 = FakeLaya(bias_second, mode="ensemble", beta=10.0, cache_ttl=0.30,
                stale_probs_ttl=3.0)
 sc4.start()
+wait_model(sc4)
 wait_predict(sc4, 0, 0.1)
 sc4.reorder(make_scored(6), f_hi, 0.9, "blue")
 wait_predict(sc4, 1)

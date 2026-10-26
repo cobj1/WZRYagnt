@@ -186,7 +186,31 @@ def _target_dist(a, b):
 
 
 # ---------------------------------------------------------------- 两条决策路径
-def _rule_view(state, hp):
+def _make_prod_fn(cfg):
+    """生产基线：直接调 `m2_agent_v2.decide(state, cooldowns)`。
+
+    为什么必须支持它：`_fallback_action()` 是**评测专用占位兜底**（"走向己方绿点"，恒 map_move）,
+    叠加 `_solve_core` 的 v2.73 白名单会把技能/攻击/回城全换成 map_move, 得到"基线 100% map_move"
+    的假象（产线实际是 move 87.7% / none 8.2% / skill 1.8%）。
+    所以默认基线改为 `decide()`; `--baseline optimizer` 仅用于与旧报告对齐。
+    """
+    if cfg.get("baseline", "prod") != "prod":
+        return None
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import m2_agent_v2                                   # noqa: WPS433
+
+    box = {"sess": None, "cd": {}}
+
+    def prod_fn(name, state):
+        if box["sess"] != name:          # 每局独立的节流状态（技能 CD 依赖它）
+            box["sess"] = name
+            box["cd"] = {}
+        return m2_agent_v2.decide(state, box["cd"])
+
+    return prod_fn
+
+
+def _rule_view(state, hp, prod_fn=None):
     """规则基线: 生产候选集 + 规则分排序 top-k, 以及 solve() 的生产输出。"""
     from wzry.decision import optimizer
 
@@ -201,7 +225,8 @@ def _rule_view(state, hp):
                  or c[0].get("type") == "none"]
     scored = sorted(((optimizer.evaluate(c, f, "blue") + 0.35 * optimizer._forecast(c, f), c)
                      for c in cands), key=lambda x: -x[0])
-    solved = optimizer.solve(state, _fallback_action(state), hp, "blue")
+    solved = (prod_fn(state) if prod_fn is not None
+              else optimizer.solve(state, _fallback_action(state), hp, "blue"))
     ms = (time.perf_counter() - t0) * 1000.0
     self_pt = _self_point(state)
     reds = [(float(p[0]), float(p[1])) for p in f["reds"]]
@@ -250,7 +275,7 @@ def _is_fallback(rule):
         return False
 
 
-def _eval_one(name, state, shadow):
+def _eval_one(name, state, shadow, prod_fn=None):
     """单帧: 两条路径 + 比对。任何一侧异常都记在 rec 里, 不影响其它帧。"""
     hp, hp_src = _hp_of(state)
     rec = {"s": name, "f": state.get("frame_id"),
@@ -260,7 +285,7 @@ def _eval_one(name, state, shadow):
     t_frame = time.perf_counter()
     rule = model = None
     try:
-        rule = _rule_view(state, hp)
+        rule = _rule_view(state, hp, (lambda st_: prod_fn(name, st_)) if prod_fn else None)
     except Exception as exc:
         rec["re"] = type(exc).__name__
         rec["re_msg"] = str(exc)[:120]
@@ -472,6 +497,7 @@ def run_eval(cfg, fixed_keys=None):
     if not session_paths:
         raise SystemExit("没有匹配的会话")
     cov, all_frames = _scan(session_paths)
+    prod_fn = _make_prod_fn(cfg)
     picks = _sample(all_frames, cfg["seed"], cfg["limit"], cfg["hz"])
     by_frame_id = fixed_keys is not None
     keys = (fixed_keys if fixed_keys is not None
@@ -497,7 +523,7 @@ def run_eval(cfg, fixed_keys=None):
         if budget and time.perf_counter() - t_start > budget:
             stopped = True
             break
-        rec = _eval_one(name, st, shadow)
+        rec = _eval_one(name, st, shadow, prod_fn)
         if rec.get("re"):
             err_rule[rec["re"]] += 1
             err_msg[f"rule {rec['re']}: {rec.get('re_msg', '')}"[:130]] += 1
@@ -512,7 +538,7 @@ def run_eval(cfg, fixed_keys=None):
 
     return {
         "config": {k: cfg[k] for k in ("limit", "sessions", "seed", "hz", "max_seconds", "trace",
-                                        "inject_clock")},
+                                        "inject_clock", "baseline")},
         "coverage": cov,
         "sampling": {"evaluable_frames": len(all_frames), "planned": planned,
                      "evaluated": len(records), "truncated": stopped, "hz": cfg["hz"]},
@@ -630,7 +656,7 @@ def _rerun_by_frame_id(cfg, keys):
     for name, st in _iter_selected(session_paths, _keys_to_lines(session_paths, keys),
                                    cfg.get("inject_clock", True),
                                    by_frame_id=False):
-        out.append(_eval_one(name, st, shadow))
+        out.append(_eval_one(name, st, shadow, _make_prod_fn(cfg)))
     out.sort(key=lambda r: (r["s"], r["t"]))
     return out
 
@@ -1044,6 +1070,9 @@ def main(argv=None):
                     metavar="N", help="内置二次运行比对前 N 帧(默认 60), 0=不做")
     ap.add_argument("--report-only", default=None, metavar="JSON",
                     help="不重跑, 直接从已落盘 JSON 重新渲染报告")
+    ap.add_argument("--baseline", default="prod", choices=["prod", "optimizer"],
+                    help="对比基线：prod=生产 decide()（默认，唯一真实口径）；"
+                         "optimizer=optimizer.solve()+占位兜底（仅用于与旧报告对齐）")
     ap.add_argument("--keys-file", default=None,
                     help="固定帧集合 JSON（{session: [行号...]}）；用它可以做跨时间可比的 A/B"
                          "（默认按 seed 抽样，语料增长后抽样会漂移）")
@@ -1069,7 +1098,7 @@ def main(argv=None):
            "sessions": [s.strip() for s in args.sessions.split(",") if s.strip()]
            if args.sessions else None,
            "max_seconds": args.max_seconds, "trace": args.trace,
-           "inject_clock": not args.no_inject_clock}
+           "inject_clock": not args.no_inject_clock, "baseline": args.baseline}
     fixed = None
     if args.keys_file:
         raw = json.loads(Path(args.keys_file).read_text(encoding="utf-8"))
