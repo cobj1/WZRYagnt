@@ -1884,10 +1884,11 @@ def build_arg_parser():
     # v16.0 P3 性能: YOLO ONNX intra_op 线程数。默认 0 = onnxruntime 按物理核数开满
     #   (本机 16 核) —— 推理突发期间把采集 reader 饿死(wait_frame 占墙钟 88-97%)。
     #   限到 2-4 给采集让 CPU; 同局内 A/B 用不同值各跑一段再比。
-    ap.add_argument("--yolo-threads", type=int, default=4,
+    ap.add_argument("--yolo-threads", type=int, default=8,
                     help="YOLO ONNX intra_op 线程数(0=ORT 默认占满物理核)。"
-                         "默认 4：同一份回放帧 A/B 实测 55.1ms→36.0ms，且小地图/渲染同步变快"
-                         "（ORT 占满核会与主循环抢 CPU）")
+                         "默认 8：同帧流水线 A/B 实测 48.0ms(4)→26.4ms(8)，"
+                         "golden 精度不变（imgsz 640 下 F1 0.690 完全一致）；"
+                         "0(=16 线程) 反而最差 55.1ms —— ORT 占满核会抢采集/主循环的 CPU")
     ap.add_argument("--yolo-every", type=int, default=3,
                     help="每 N 个主循环拍做一次 YOLO 检测(默认 3, 保持原行为)。"
                          "实测真机主循环 ~21Hz 而感知块 ~2.3Hz, 故 N=3 时 YOLO 仅 ~0.8Hz;"

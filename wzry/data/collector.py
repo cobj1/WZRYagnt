@@ -211,6 +211,13 @@ class MatchRecorder:
             units = list(units) + _canonical_mem_units(mem_units, self_camp)
             sources["units_memory"] = "memory"
         if units:
+            # UI 区误检剔除（2026-10-26）：小地图/头像/技能按钮区的框占实测误检的 56%，
+            # 决策层早已按坐标过滤，录制层一直没做 —— 这里补齐，保证落盘数据干净。
+            # 只作用于有 screen 坐标的单位；内存单位原样保留。
+            from wzry.vision.ui_zones import filter_units
+            units, _ui_dropped = filter_units(units)
+            if _ui_dropped:
+                sources["units_ui_dropped"] = _ui_dropped
             self._field_hits["units"] += 1
             if any(isinstance(u, dict) and u.get("pos_minimap") for u in units):
                 self._field_hits["units.pos_minimap"] += 1

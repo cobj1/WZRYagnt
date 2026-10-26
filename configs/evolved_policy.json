@@ -1,6 +1,6 @@
 {
  "version": "v11",
- "n": 19818,
+ "n": 20030,
  "buckets": {
   "hp=ok|en=0|red=1|blue=2|d=0": {
    "low_hp_safe_recall": 0.0,
@@ -157,7 +157,7 @@
   },
   "hp=high|en=1|red=2|blue=4|d=0": {
    "enemy_hero_near": 0.0,
-   "support_dps_lane": 0.006,
+   "support_dps_lane": 0.005,
    "engage_enemy": 0.0,
    "dps_lane_push": 0.0,
    "support_dps_lane_hold": 0.0
@@ -172,7 +172,7 @@
    "support_dps_lane_red": 0.0
   },
   "hp=high|en=0|red=2|blue=4|d=0": {
-   "support_dps_lane": 0.018,
+   "support_dps_lane": 0.017,
    "no_target": 0.0,
    "dps_lane_push": 0.0,
    "support_dps_lane_red": 0.0,

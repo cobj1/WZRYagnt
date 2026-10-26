@@ -141,6 +141,29 @@ info8 = rec8.finalize(None, note="exit")
 check("T22_finalize_without_result", info8["result"] is None and info8["gate_ok"] is False,
       f"{info8}")
 
+# ---- 6. UI 区误检剔除（录制边界，2026-10-26） ----
+rec9, base9 = make_recorder()
+rec9.on_state({
+    "clock_s": 4.0, "scoreboard": [{"cid": 1}], "ui": {"hp": 1.0},
+    "units": [
+        {"cls": "enemy_hero", "screen": [0.05, 0.10]},        # 小地图区 -> 剔
+        {"cls": "enemy_hero", "screen": [0.50, 0.50]},        # 正常 -> 留
+        {"cls": "ally_turret", "screen": [0.95, 0.12]},       # 右上头像区 -> 剔
+        {"cls": "ally_hero", "screen": [0.30, 0.92]},         # 底部技能带 -> 剔
+        {"cls": "neutral_monster", "screen": [0.05, 0.10]},   # 野怪不在过滤类 -> 留
+        {"cls": "enemy_minion", "pos_minimap": [0.5, 0.5]},   # 无 screen -> 留
+    ]})
+rec9.close()          # 落盘有缓冲，先关再读
+row9 = json.loads((base9 / "sess_cov" / "states.jsonl")
+                  .read_text(encoding="utf-8").splitlines()[0])
+kept = [u["cls"] for u in row9["units"]]
+check("T23_ui_boxes_dropped",
+      kept == ["enemy_hero", "neutral_monster", "enemy_minion"], f"{kept}")
+check("T24_ui_drop_counted",
+      (row9.get("sources") or {}).get("units_ui_dropped")
+      == {"minimap": 1, "portrait": 1, "skillbar": 1},
+      f"{(row9.get('sources') or {}).get('units_ui_dropped')}")
+
 print()
 if _FAIL:
     print(f"FAILED ({len(_FAIL)}/{len(_PASS) + len(_FAIL)}): " + ", ".join(_FAIL))

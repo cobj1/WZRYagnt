@@ -102,6 +102,43 @@ def main() -> int:
         m2.finalize_recorder(rec, ns, reason="again")
         check("E_finalize_idempotent", True)
 
+    # ---- 6. `--result auto`：结算页识别 -> 落盘（端到端接线） ----
+    import numpy as np
+    from wzry.vision.match_result import BANNER
+
+    def _banner_frame(bgr, size=(720, 1280)):
+        h, w = size
+        img = np.full((h, w, 3), 18, dtype=np.uint8)
+        x0, y0, x1, y1 = BANNER
+        img[int(y0 * h):int(y1 * h), int(x0 * w):int(x1 * w)] = bgr
+        return img
+
+    with tempfile.TemporaryDirectory() as td:
+        rec_a = MatchRecorder(base_dir=td, input_source="test")
+        rec_a.start(session_name="auto_loss")
+        rec_a.on_state({"clock_s": 9.0, "scoreboard": [{"cid": 1}],
+                        "ui": {"hp": 1.0},
+                        "units": [{"cls": "enemy_hero", "pos_minimap": [0.5, 0.5]}]})
+        m2.finalize_recorder(rec_a, argparse.Namespace(result="auto"),
+                             reason="auto", frame=_banner_frame((40, 30, 120)))
+        man_a = json.loads((Path(td) / "auto_loss" / "manifest.json")
+                           .read_text(encoding="utf-8"))
+        check("F_auto_result_writes_loss", man_a.get("result") == "loss",
+              f"{man_a.get('result')}")
+        check("F_auto_result_source",
+              (man_a.get("meta") or {}).get("result", {}).get("source") == "auto")
+
+        # 非结算页帧 -> 不写胜负（不猜）
+        rec_b = MatchRecorder(base_dir=td, input_source="test")
+        rec_b.start(session_name="auto_none")
+        rec_b.on_state({"clock_s": 9.0, "ui": {"hp": 1.0}})
+        m2.finalize_recorder(rec_b, argparse.Namespace(result="auto"),
+                             reason="auto", frame=_banner_frame((90, 90, 90)))
+        man_b = json.loads((Path(td) / "auto_none" / "manifest.json")
+                           .read_text(encoding="utf-8"))
+        check("F_auto_result_absent_on_plain_frame", man_b.get("result") is None,
+              f"{man_b.get('result')}")
+
     print(f"\n结果: {len(PASS)}/{len(PASS) + len(FAIL)} 通过")
     if FAIL:
         print("失败项:", ", ".join(FAIL))
