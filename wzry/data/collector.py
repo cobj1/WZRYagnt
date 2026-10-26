@@ -19,6 +19,58 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+_KIND_TO_CLS = {
+    "hero": "hero", "minion": "minion", "turret": "turret",
+    "monster": "neutral_monster", "building": "crystal",
+}
+
+
+def _canonical_mem_units(mem_units, self_camp: str) -> list[dict]:
+    """内存单位 -> canonical `units` 条目，仅用于录制/审计。
+
+    决策层仍消费视觉 `units`（screen 坐标）；把内存单位混进去会让
+    `screen` 缺失的条目被当成屏幕中心，故**只在 recorder 写盘时合并**。
+    """
+    from wzry.decision.official_ai.geo import world_to_norm
+
+    out: list[dict] = []
+    now = time.time()
+    for u in mem_units or []:
+        x, z = u.get("x"), u.get("z")
+        kind = str(u.get("kind") or "")
+        base = _KIND_TO_CLS.get(kind)
+        if base is None or x is None or z is None:
+            continue
+        camp = str(u.get("camp") or "")
+        if base == "hero":
+            cls = "ally_hero" if camp == self_camp else "enemy_hero"
+        elif base == "minion":
+            cls = "ally_minion" if camp == self_camp else "enemy_minion"
+        elif base == "turret":
+            cls = "ally_turret" if camp == self_camp else "enemy_turret"
+        elif base == "crystal":
+            cls = "ally_crystal" if camp == self_camp else "enemy_crystal"
+        else:
+            cls = "neutral_monster"
+        nx, ny = world_to_norm(float(x), float(z))
+        hp_ratio = u.get("hp_ratio")
+        if hp_ratio is None and u.get("hp") is not None and u.get("hp_max"):
+            hp_ratio = float(u["hp"]) / float(u["hp_max"])
+        out.append({
+            "cls": cls, "kind": base, "camp": camp or None,
+            "uid": f"{camp}:{kind}:{u.get('cid')}:{u.get('actor')}",
+            "hero_cid": u.get("cid") if base == "hero" else None,
+            "cid": u.get("cid"),
+            "screen": None,
+            "pos_world": [float(x), float(z)],
+            "pos_minimap": [float(nx), float(ny)],
+            "coord_src": "memory", "visible": None,
+            "hp": hp_ratio, "hp_abs": u.get("hp"), "hp_max": u.get("hp_max"),
+            "dead": bool(u.get("dead")), "conf": 1.0, "camp_src": "memory",
+            "src": "memory", "last_seen_t": now,
+        })
+    return out
+
 
 class MatchRecorder:
     def __init__(self, base_dir="data/matches", frame_every_s=5.0, max_frames=2000,
@@ -38,6 +90,11 @@ class MatchRecorder:
         self._meta = {}
         self._n_memory_states = 0
         self._n_clock_states = 0
+        # 字段覆盖率计数（写进 manifest；采数后一眼判断这局能不能用）
+        self._field_hits = {
+            "clock_s": 0, "scoreboard": 0, "units.pos_minimap": 0,
+            "ui.hp": 0, "minimap.dots": 0, "units": 0,
+        }
 
     @property
     def active(self):
@@ -115,6 +172,46 @@ class MatchRecorder:
             sources["scoreboard"] = "memory"
             self._n_memory_states += 1
 
+        # 会话相对时间：纯视觉录制没有 clock_s，下游（hok_bridge）只能用墙钟差还原对局时间，
+        # 这里把起点和已过时长直接写进每条状态，避免回放侧各自猜。
+        if self._start_t is not None:
+            now_wall = time.time()
+            state_dict.setdefault("session_start_t", float(self._start_t))
+            state_dict.setdefault("session_elapsed_s", float(now_wall - self._start_t))
+
+        units = state_dict.get("units") or []
+        mem_units = extra.get("mem_units") or []
+        if mem_units:
+            self_camp = (state_dict.get("self_state") or {}).get("camp")
+            if not self_camp:
+                # 不假设 slot0 是本地玩家：按 self 的 cid + 坐标定位，再由其阵营推导敌我
+                from wzry.vision.camp_identity import resolve_self
+                heroes = extra.get("mem_heroes") or []
+                ss = extra.get("self_state") or {}
+                self_id = ss.get("id") or ui.get("hero_id")
+                self_pos = None
+                if ss.get("x") is not None and ss.get("z") is not None:
+                    self_pos = (ss["x"], ss["z"])
+                if self_id and heroes:
+                    res = resolve_self(heroes, int(self_id), self_pos)
+                    self_camp = res.camp
+                    sources["self_camp"] = res.camp_src
+            self_camp = self_camp or "blue"
+            units = list(units) + _canonical_mem_units(mem_units, self_camp)
+            sources["units_memory"] = "memory"
+        if units:
+            self._field_hits["units"] += 1
+            if any(isinstance(u, dict) and u.get("pos_minimap") for u in units):
+                self._field_hits["units.pos_minimap"] += 1
+        if isinstance(ui.get("hp"), (int, float)):
+            self._field_hits["ui.hp"] += 1
+        if isinstance(state_dict.get("clock_s"), (int, float)):
+            self._field_hits["clock_s"] += 1
+        if state_dict.get("scoreboard"):
+            self._field_hits["scoreboard"] += 1
+        if (state_dict.get("minimap") or {}).get("dots"):
+            self._field_hits["minimap.dots"] += 1
+
         state_dict.setdefault("input_source", self.input_source)
         record = state_dict.get("record") or {}
         record.update({
@@ -124,7 +221,8 @@ class MatchRecorder:
         })
         state_dict["record"] = record
 
-        self._states_fp.write(json.dumps(state_dict, ensure_ascii=False,
+        self._states_fp.write(json.dumps({**state_dict, "units": units},
+                                         ensure_ascii=False,
                                          default=self._json_default) + "\n")
         self._n_states += 1
 
@@ -178,6 +276,26 @@ class MatchRecorder:
         payload["source"] = "human"
         self.on_action(payload)
 
+    def field_coverage(self):
+        """各关键字段的覆盖率（0..1）；分母是已写入的状态条数。"""
+        n = max(1, self._n_states)
+        return {k: round(v / n, 4) for k, v in self._field_hits.items()}
+
+    def coverage_gate(self, thresholds=None):
+        """采数闸门：返回 (ok, 未达标项)。
+
+        默认阈值对应 S1-5/S2 下游需求——没有这些字段，决策桥接与价值模型只能走近似：
+          clock_s >= 0.95 / scoreboard >= 0.90 / units.pos_minimap >= 0.90 / ui.hp >= 0.95
+        """
+        need = {"clock_s": 0.95, "scoreboard": 0.90,
+                "units.pos_minimap": 0.90, "ui.hp": 0.95}
+        if thresholds:
+            need.update(thresholds)
+        cov = self.field_coverage()
+        missing = {k: {"got": cov.get(k, 0.0), "need": v}
+                   for k, v in need.items() if cov.get(k, 0.0) < v}
+        return (not missing), missing
+
     def _write_manifest(self, extra=None):
         if not self.session_dir:
             return
@@ -190,6 +308,7 @@ class MatchRecorder:
             "input_source": self.input_source,
             "memory_states": self._n_memory_states,
             "clock_states": self._n_clock_states,
+            "field_coverage": self.field_coverage(),
             "meta": self._meta,
         }
         if extra:

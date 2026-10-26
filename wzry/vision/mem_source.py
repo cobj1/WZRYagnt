@@ -30,6 +30,7 @@ import re
 import struct
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -158,6 +159,30 @@ MAP_X_MIN, MAP_X_MAX = -58700, 58100
 MAP_Z_MIN, MAP_Z_MAX = -55700, 60000
 MAP_HALF = 60000  # 兼容旧调用
 
+# MEM-01: 偏移的唯一文档来源是 configs/mem_offsets.json；这里只做代码值快照，
+#   连接时比对，任何一侧改了而另一侧没改都会立刻报错（读错偏移比读不到更危险）。
+CONSTANT_OFFSETS = {
+    "battle_global": BATTLE_GLOBAL, "actor_mgr_off": ACTOR_MGR_OFF,
+    "actor_hdr": ACTOR_HDR, "actor_attr_off": ACTOR_ATTR_OFF,
+    "actor_pos_off": ACTOR_POS_OFF, "actor_spawn_off": ACTOR_SPAWN_OFF,
+    "attr_max_hp": ATTR_MAX_HP, "attr_hp": ATTR_HP,
+    "pos_x": POS_X, "pos_y": POS_Y, "pos_z": POS_Z,
+    "self_obj_id": SELF_OBJ_ID, "self_obj_level": SELF_OBJ_LEVEL,
+    "self_obj_hp": SELF_OBJ_HP, "self_obj_hp_max": SELF_OBJ_HP_MAX,
+    "self_obj_atk_range": SELF_OBJ_ATK_RANGE, "ep_cur": EP_CUR, "ep_max": EP_MAX,
+    "respawn_left": RESPAWN_LEFT, "self_equip_count": SELF_EQUIP_COUNT,
+    "self_equip_ids": SELF_EQUIP_IDS, "self_obj_x": SELF_OBJ_X,
+    "self_obj_y": SELF_OBJ_Y, "self_obj_z": SELF_OBJ_Z,
+    "self_obj_exp": SELF_OBJ_EXP, "self_obj_kills": SELF_OBJ_KILLS,
+    "self_obj_deaths": SELF_OBJ_DEATHS, "self_obj_assists": SELF_OBJ_ASSISTS,
+    "self_obj_gold": SELF_OBJ_GOLD, "self_obj_gold_avail": SELF_OBJ_GOLD_AVAIL,
+    "self_skill_base": SELF_SKILL_BASE, "skill_slot_stride": SKILL_SLOT_STRIDE,
+    "skill_off_id": SKILL_OFF_ID, "skill_off_level": SKILL_OFF_LEVEL,
+    "skill_off_state": SKILL_OFF_STATE, "skill_off_left_ms": SKILL_OFF_LEFT_MS,
+    "skill_off_total_ms": SKILL_OFF_TOTAL_MS,
+    "hero_arr_stride": HERO_ARR_STRIDE, "hero_arr_count": HERO_ARR_COUNT,
+}
+
 _CLS = {TYPE_HERO: "hero", TYPE_UNIT: "unit", TYPE_OTHER: "other"}
 
 
@@ -208,6 +233,31 @@ class MemUnit:
                 (MAP_Z_MAX - self.z) / (MAP_Z_MAX - MAP_Z_MIN)]
 
 
+def apply_hp(u: MemUnit, mx: Optional[int], cur: Optional[int]) -> bool:
+    """写入 hp/hp_max/dead；返回是否拿到可用值。
+
+    max 不可读（0/None）时只信 current，绝不把 cur 换成 0 后判死。
+    死亡确认由上层连续零帧去抖，避免单帧坏读造成假死。
+    """
+    if mx is None or cur is None:
+        return False
+    if mx > 0:
+        if mx < cur:
+            mx, cur = cur, mx
+        if 0 <= cur <= mx < 300000:
+            u.hp_max, u.hp = mx, cur
+            u.dead = cur <= 0
+            u.extra.pop("hp_max_missing", None)
+            return True
+        return False
+    if 0 <= cur < 300000:
+        u.hp, u.hp_max = cur, None
+        u.dead = False
+        u.extra["hp_max_missing"] = 1
+        return True
+    return False
+
+
 class MemSource:
     def __init__(self, adb: Optional[str] = None, serial: str = "127.0.0.1:16384"):
         self.m = LiveMem(adb=adb or DEFAULT_ADB, serial=serial)
@@ -216,16 +266,33 @@ class MemSource:
         self._self_state_obj = None
         self._hero_arrays: List[int] = []   # 数组对象基址（同帧有 2 份副本）
         self._hero_array_pid = None
-        self._hero_camp: Dict[int, str] = {}
+        self._hero_camp: Dict[int, Optional[str]] = {}
+        self._hero_camp_ambiguous: set = set()
+        self._hero_id_counts: Counter = Counter()   # actor 侧 10 个 cid 的多重集
         self._hero_locate_fail_ts = 0.0     # 定位失败后的退避时间
         self._hero_spent: Dict[int, int] = {}    # 累计买装备花费（差分推导）
         self._hero_gold_prev: Dict[int, int] = {}
         self._hero_match_key: Optional[frozenset] = None
+        self.offset_version: Optional[str] = None
 
     def connect(self) -> str:
+        from wzry.vision.mem_offsets import drift as _drift, load as _load_offsets
+        reg = _load_offsets()
+        bad = _drift(CONSTANT_OFFSETS, reg)
+        if bad:
+            raise RuntimeError(
+                f"内存偏移与注册表 {reg['version']} 不一致，拒绝读取: {bad}")
+        self.offset_version = reg["version"]
         self.pid = self.m.find_pid()
         if not self.pid:
             raise RuntimeError("game process not found")
+        from wzry.vision.offline_gate import verify_token
+        ok, reason = verify_token(self.pid, self.m.serial)
+        if not ok:
+            raise RuntimeError(
+                f"offline gate: {reason}；拒绝读取内存。"
+                " 请在离线训练局内运行 "
+                "`venv/Scripts/python.exe run_offline.py verify` 签发会话 token。")
         self.m.refresh_maps()
         return self.pid
 
@@ -429,19 +496,27 @@ class MemSource:
         if not self.pid:
             return []
         units = [u for u in self.snapshot() if u.is_hero]
-        ids: List[int] = []
-        for u in units:
-            if u.config_id not in ids:
-                ids.append(u.config_id)
-            self._hero_camp[u.config_id] = u.camp
-        # 定位阶段必须拿齐 10 个英雄 ID，且扫描要求 10 槽全部命中：
-        # minhits=8 会让数组内的滑动窗口也通过，产生多个重叠假基址。
-        if len(ids) < HERO_ARR_COUNT:
+        # 镜像局双方可能同英雄：用 10 个 actor 的 cid 多重集，不能去重。
+        actor_ids = [u.config_id for u in units]
+        if len(actor_ids) < HERO_ARR_COUNT:
             return []
-        id_set = set(ids)
+        id_set = set(actor_ids)
+        id_counts = Counter(actor_ids)
+        self._hero_id_counts = id_counts
+        camps: Dict[int, set] = {}
+        for u in units:
+            camps.setdefault(u.config_id, set()).add(u.camp)
+        self._hero_camp = {
+            cid: next(iter(cs)) if len(cs) == 1 else None
+            for cid, cs in camps.items()
+        }
+        self._hero_camp_ambiguous = {cid for cid, cs in camps.items()
+                                     if len(cs) > 1}
+        # 定位阶段必须拿齐 10 个英雄槽，且扫描要求 10 槽全部命中：
+        # minhits=8 会让数组内的滑动窗口也通过，产生多个重叠假基址。
         want = HERO_ARR_COUNT
         cmd = (f"MEMSCAN_ONLY=scudo {MEMSCAN} {self.pid} idbag "
-               f"{','.join(map(str, ids))} 0x{HERO_ARR_STRIDE:x} {want}")
+               f"{','.join(map(str, sorted(id_set)))} 0x{HERO_ARR_STRIDE:x} {want}")
         try:
             out = self.m._run(["shell", cmd]).decode("utf-8", "replace")
         except Exception as exc:          # 设备端工具缺失/扫描失败
@@ -451,8 +526,11 @@ class MemSource:
         for v in re.findall(r"base=0x([0-9a-f]+)", out):
             idbase = int(v, 16)
             base = idbase - SELF_OBJ_ID
-            got = {r["id"] for r in self._read_hero_array_at(base)}
-            if len(got & id_set) < want or base in bases:
+            rows = self._read_hero_array_at(base)
+            got_ids = [r["id"] for r in rows]
+            if len(got_ids) < want or Counter(got_ids) != id_counts:
+                continue
+            if base in bases:
                 continue
             # 边界校验：前后相邻槽不是英雄 ID（排除数组内滑动窗口）
             prev_id = self._u32(base - HERO_ARR_STRIDE + SELF_OBJ_ID)
@@ -468,7 +546,8 @@ class MemSource:
         """读全部英雄的实时金币/等级/HP/坐标（只读内存，不打开面板）。
 
         - 首次定位 ~5s（scudo-only idbag），之后每帧一次 ~110KB 读取；
-        - 同帧两份副本按 (exp, gold) 取新，单槽损坏可由另一份补齐；
+        - 同帧两份副本按 slot 合并、按 (exp, gold) 取新；仅当两份 cid 多重集
+          一致时才互补，避免镜像局（双方同英雄）按 cid 合并丢人或混拼；
         - expected_ids：传入当前局 actor 的英雄 ID 集合，用于防止结算后
           缓存数组仍返回上一局数据（不匹配会重定位一次，再失败返回空）；
         - 金币：`gold` = **可用金币**（HUD 右上角口径，`+0x15D0`）；
@@ -490,20 +569,35 @@ class MemSource:
                 return []
             self._hero_locate_fail_ts = 0.0
         merged: Dict[int, dict] = {}
+        primary_ids: Counter = Counter()
         # 主副本一帧只读一次（~110KB）；缺槽时才读另一份补齐。
         if self._hero_arrays:
-            for r in self._read_hero_array_at(self._hero_arrays[0]):
-                merged[r["id"]] = r
+            primary = self._read_hero_array_at(self._hero_arrays[0])
+            primary_ids = Counter(r["id"] for r in primary)
+            for r in primary:
+                merged[r["slot"]] = r
         need = min(HERO_ARR_MIN_VALID, HERO_ARR_COUNT)
+        expected_counts = self._hero_id_counts or primary_ids
         if len(merged) < HERO_ARR_COUNT:
             for base in self._hero_arrays[1:]:
-                for r in self._read_hero_array_at(base):
-                    old = merged.get(r["id"])
+                rows = self._read_hero_array_at(base)
+                if not rows:
+                    continue
+                ids = Counter(r["id"] for r in rows)
+                # 只接受同一份数组（或 actor 侧完整多重集），避免按 slot 混拼接。
+                if (expected_counts and ids != expected_counts
+                        and ids != primary_ids):
+                    continue
+                if not primary_ids:
+                    primary_ids = ids
+                for r in rows:
+                    old = merged.get(r["slot"])
                     if old is None or (r["exp"], r["gold"]) > (old["exp"], old["gold"]):
-                        merged[r["id"]] = r
+                        merged[r["slot"]] = r
                 if len(merged) >= HERO_ARR_COUNT:
                     break
-        if expected_ids is not None and set(merged) != set(expected_ids):
+        if (expected_ids is not None
+                and {r["id"] for r in merged.values()} != set(expected_ids)):
             # 结算后缓存仍指向上一局数组 / 数组被重建：重定位一次
             if self._hero_arrays and not force_relocate:
                 self._hero_arrays = []
@@ -521,6 +615,7 @@ class MemSource:
         #   导致"已花费"只能靠跨帧差分推导（中途接入就会漏算）。
         for r in states:
             r["camp"] = self._hero_camp.get(r["id"])
+            r["camp_ambiguous"] = r["id"] in self._hero_camp_ambiguous
             r["gold_total"] = r.get("gold_earned", r["gold"])
             r.setdefault("gold_spent", max(0, r["gold_total"] - r["gold"]))
         return states
@@ -868,12 +963,7 @@ class MemSource:
             if attr_ok:
                 mx = field(attr, ATTR_MAX_HP, "<i")
                 cur = field(attr, ATTR_HP, "<i")
-                if mx is not None and cur is not None:
-                    if mx < cur:
-                        mx, cur = cur, mx
-                    if 0 <= cur <= mx < 300000:
-                        u.hp_max, u.hp = mx, cur
-                        u.dead = cur <= 0
+                apply_hp(u, mx, cur)
             # 签名首尾固定 256，中间两位随状态变化（0/1 或 65536/65536）
             sig = fieldv(pos, 0x100, "<4i")
             pos_ok = (pos and field(pos, 0xC, "<I") == pos_sid
@@ -1035,14 +1125,8 @@ class MemSource:
                 if mxv is None or curv is None:
                     if u.actor_type == TYPE_HERO:
                         return None
-                else:
-                    mx, cur = mxv[0], curv[0]
-                    if mx < cur:
-                        mx, cur = cur, mx
-                    if 0 <= cur <= mx < 300000:
-                        u.hp_max, u.hp = mx, cur
-                        u.dead = cur <= 0
-                    elif u.actor_type == TYPE_HERO:
+                elif not apply_hp(u, mxv[0], curv[0]):
+                    if u.actor_type == TYPE_HERO:
                         return None
             elif u.actor_type == TYPE_HERO:
                 return None
@@ -1085,6 +1169,7 @@ class MemSource:
             "ts": t0,
             "ms": (time.time() - t0) * 1000,
             "pid": self.pid,
+            "offset_version": self.offset_version,
             "units": units,
         }
 
@@ -1112,6 +1197,8 @@ class MemSource:
         """
         from wzry.state.schema import GameState, HeroStats, SelfState, Unit
 
+        from wzry.vision.camp_identity import classify, resolve_self
+
         items = self.snapshot()
         usable = [u for u in items if u.x is not None and u.z is not None]
         now = time.time()
@@ -1121,22 +1208,43 @@ class MemSource:
                        sources={"units": "memory", "ui": "memory",
                                 "minimap": "memory"})
         reds, blues = [], []
-        self_unit = None
+        # 先定位自己：不假设"我方=蓝方"，也不假设数组 slot0 是自己。
+        # 同 cid 多实例（镜像/傀儡）且无可靠坐标时宁可不认，也不按 cid 取第一个。
+        self_pos = None
+        ss0 = None
         if self_config_id is not None:
-            self_unit = next((u for u in usable
-                              if u.is_hero and u.config_id == self_config_id), None)
-        self_camp = self_unit.camp if self_unit else "blue"
+            hero_ids = [u.config_id for u in usable if u.is_hero]
+            if hero_ids.count(self_config_id) > 1:
+                ss0 = self.read_self_state(self_config_id)
+                if ss0 and ss0.get("x") is not None and ss0.get("z") is not None:
+                    self_pos = (ss0["x"], ss0["z"])
+        res = (resolve_self(usable, self_config_id, self_pos)
+               if self_config_id is not None else None)
+        self_unit = res.unit if res else None
+        self_camp = res.camp if res else None
+        camp_src = res.camp_src if res else "unknown"
+        if self_camp is None:
+            # 下游契约要求具体阵营；无法判定时如实标注，不再静默当作事实
+            self_camp, camp_src = "blue", "fallback_blue"
+        st.extra["self_resolve"] = {
+            "match": res.match if res else "no_self_cid",
+            "camp_src": camp_src,
+            "candidates": res.candidates if res else 0,
+        }
         for u in usable:
             mm = u.minimap_norm()
             if u.dead:
                 continue          # 死亡单位不进决策视野
             if u.is_hero:
-                if u.camp != self_camp:
+                side = classify(u, self_camp)
+                if side == "enemy":
                     cls = "enemy_hero"
                     reds.append(mm)
-                else:
+                elif side == "ally":
                     cls = "ally_hero"
                     blues.append(mm)
+                else:
+                    cls = "hero"      # 阵营未知：不冒充盟友/敌人
             else:
                 continue
             hp = (u.hp / u.hp_max) if (u.hp is not None and u.hp_max) else None
@@ -1149,7 +1257,8 @@ class MemSource:
                 pos_minimap=[float(mm[0]), float(mm[1])],
                 coord_src="memory",
                 hp=hp, hp_abs=u.hp, hp_max=u.hp_max,
-                dead=u.dead, conf=1.0, camp_src="memory",
+                dead=u.dead, conf=1.0,
+                camp_src=("memory" if u.camp else "unknown"),
                 src="memory", last_seen_t=now,
             ))
         if self_unit is not None:
@@ -1212,7 +1321,7 @@ class MemSource:
         if self_config_id is not None:
             ss = next((r for r in hs if r["id"] == self_config_id), None)
             if ss is None:
-                ss = self.read_self_state(self_config_id)
+                ss = ss0 or self.read_self_state(self_config_id)
         if ss:
             st.ui.update({
                 "gold": ss["gold"], "level": ss["level"],

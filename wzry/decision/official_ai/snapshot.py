@@ -85,6 +85,10 @@ class Snapshot:
     self_x: Optional[float] = None
     self_z: Optional[float] = None
     self_unit: Optional[Unit] = None
+    # 自己的定位来源：cid / cid+pos / ambiguous / missing / fallback_first
+    self_match: str = ""
+    # 自身阵营来源：memory / inferred_base / unknown
+    self_camp_src: str = ""
     heroes: List[Unit] = field(default_factory=list)     # 含自己，共 10
     minions: List[Unit] = field(default_factory=list)
     organs: List[Unit] = field(default_factory=list)
@@ -184,14 +188,16 @@ def _screen_to_world(scr) -> tuple:
     return geo.norm_to_world(nx, ny)
 
 
-def infer_camp(x: Optional[float]) -> Optional[int]:
-    """阵营兜底推断：蓝方基地在负 x 侧、红方在正 x 侧（world->minimap 标定的反向结论）。
+def infer_camp(x: Optional[float], z: Optional[float] = None) -> Optional[int]:
+    """阵营兜底推断：只在"站在某方泉水附近"时由位置判阵营。
 
-    只在内存没给 camp 时使用（实测结算/重连后 actor 表仍可读但 camp 可能为空）。
+    不再用 x 符号推断：英雄可以越界到对面半场，中期会把入侵者判反。
+    仅在内存没给 camp 时使用（实测结算/重连后 actor 表可读但 camp 可能为空）。
     """
-    if x is None:
+    if x is None or z is None:
         return None
-    return 1 if x < 0 else 2
+    from wzry.vision.camp_identity import camp_id, infer_camp_from_base
+    return camp_id(infer_camp_from_base((x, z)))
 
 
 def _kind_of(cid: int, raw_kind: str = "", actor_type: int = 1) -> str:
@@ -287,21 +293,37 @@ def from_state_dict(state: dict, self_id: Optional[int] = None,
                                     atk_range=atk_range, coord_src="screen"))
         snap.coord_src = "screen"
 
-    # camp 缺失时按坐标符号推断（否则 enemies() 恒空，enemy_min_dis 会退化成整图对角线）
+    # camp 缺失时按"是否在泉水附近"推断（不用 x 符号：越界英雄会被判反）。
+    # 判不出的保持 None，宁可算 unknown，也不冒充盟友/敌人。
+    had_camp = {id(h): h.camp is not None for h in snap.heroes}
     if any(h.camp is None for h in snap.heroes):
         for h in snap.heroes:
             if h.camp is None:
-                h.camp = infer_camp(h.x)
+                h.camp = infer_camp(h.x, h.z)
 
-    me = next((h for h in snap.heroes if h.cid == self_id), None)
-    if me is None and snap.heroes:
-        me = snap.heroes[0]
+    # 自己：cid 唯一时直接命中；同 cid 多实例用 self 状态对象的坐标消歧。
+    # 不假设 heroes[0] 就是自己（数组顺序与本地玩家无关）。
+    from wzry.vision.camp_identity import pick_self
+    ss = state.get("self_state") or extra.get("self_state") or {}
+    self_pos = None
+    if isinstance(ss, dict) and ss.get("x") is not None and ss.get("z") is not None:
+        self_pos = (float(ss["x"]), float(ss["z"]))
+    me, self_match = None, "missing"
+    if self_id:
+        me, self_match, _n = pick_self(snap.heroes, self_id, self_pos)
+    if me is None and self_match == "missing" and snap.heroes:
+        me, self_match = snap.heroes[0], "fallback_first"
     snap.self_unit = me
+    snap.self_match = self_match
     if me is not None:
         snap.self_cid, snap.self_camp = me.cid, me.camp
         snap.self_x, snap.self_z = me.x, me.z
         snap.coord_src = me.coord_src
         snap.self_equip = list(me.equip or [])
+        snap.self_camp_src = ("memory" if had_camp.get(id(me))
+                             else ("inferred_base" if me.camp else "unknown"))
+    else:
+        snap.self_camp_src = "unknown"
 
     # ---- 法力（P0.2）：内存没有该字段，走 HUD 视觉比例 ----
     #   `ui.mp` 是 `wzry/vision/self_bars.py`/`ui_reader.find_mp_bar` 给出的 0..1 比例。

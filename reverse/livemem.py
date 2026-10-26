@@ -32,6 +32,11 @@ DEFAULT_SERIAL = "127.0.0.1:16384"
 DEFAULT_PKG = "com.tencent.tmgp.sgame"
 LOCAL_SO = Path(__file__).resolve().parent / "out" / "il2cpp" / "lib" / "arm64-v8a"
 
+# 只读安全：这些映射区不读（GPU/ION/DMA/内核辅助页），
+# 参考 TrueVision 的 mass-scan 重启事故；调用方仍应只做定向读。
+DENY_READ_MARKERS = ("/dev/", "dmabuf", "ion", "gpu", "[vvar]", "[vsyscall]", "[vectors]")
+DEFAULT_MAX_READ = 4 * 1024 * 1024
+
 
 class ElfLayout:
     """本地 ELF：vaddr -> 文件偏移（另有 PT_LOAD 表，可覆盖 .bss）。"""
@@ -88,6 +93,8 @@ class LiveMem:
         self.adb, self.serial, self.pkg = adb, serial, pkg
         self.pid = None
         self.maps = []          # [(start, end, file_off, path)]
+        self.map_perms = {}     # {start: "rwxp"}; 用于识别 exec 段/重复映射
+        self.read_stats = {"ok": 0, "denied": 0, "short": 0, "error": 0, "bytes": 0}
         self._elf = {}
 
     # ---------- 基础 ----------
@@ -106,17 +113,19 @@ class LiveMem:
     def refresh_maps(self):
         raw = self._run(["exec-out", f"cat /proc/{self.pid}/maps"]).decode("utf-8", "replace")
         self.maps = []
+        self.map_perms = {}
         for line in raw.splitlines():
             # 注意：匿名段常只有 5 个字段（无路径名）。旧版要求 len>=6 会把
             # guest 堆这类无名段整段丢掉，导致"指针落点"统计出现大量假未映射。
             parts = line.split(None, 5)
             if len(parts) < 5:
                 continue
-            rng, _perms, off, _dev, _ino = parts[:5]
+            rng, perms, off, _dev, _ino = parts[:5]
             path = parts[5] if len(parts) > 5 else ""
             try:
-                start_s, end_s = rng.split("-")
-                self.maps.append((int(start_s, 16), int(end_s, 16), int(off, 16), path))
+                start, end = (int(x, 16) for x in rng.split("-"))
+                self.maps.append((start, end, int(off, 16), path))
+                self.map_perms[start] = perms
             except ValueError:
                 continue
         return len(self.maps)
@@ -143,10 +152,13 @@ class LiveMem:
             return None
         page_off = ld["off"] & ~0xFFF
         page_vaddr = ld["vaddr"] & ~0xFFF
-        for start, _end, seg_fo, _p in self.segments(so_name):
-            if seg_fo == page_off:
-                return start + (vaddr - page_vaddr)
-        return None
+        cands = [m for m in self.segments(so_name) if m[2] == page_off]
+        if not cands:
+            return None
+        # 跨局可能残留只读副本（无 x 段）；优先 exec 段，避免选错 base。
+        cands.sort(key=lambda m: 0 if "x" in self.map_perms.get(m[0], "") else 1)
+        start = cands[0][0]
+        return start + (vaddr - page_vaddr)
 
     # ---------- 读 ----------
     def read(self, addr: int, size: int) -> bytes:
@@ -198,6 +210,21 @@ class LiveMem:
                 res[p] = self.read(p, page_size)
         return res
 
+    def read_spans_checked(self, spans, max_total: int = DEFAULT_MAX_READ):
+        """校验每个 span 在允许映射内、总量在预算内，再调用 read_spans。"""
+        spans = [(int(s), int(n)) for s, n in spans if n > 0]
+        if not spans:
+            return []
+        total = sum(n for _, n in spans)
+        if total <= 0 or total > max_total:
+            self.read_stats["denied"] += 1
+            return []
+        for start, size in spans:
+            if not self.is_mapped(start, size):
+                self.read_stats["denied"] += 1
+                return []
+        return self.read_spans(spans)
+
     def read_spans(self, spans):
         """一次 adb exec-out 读多个**已映射连续区间** [(start,size), ...]。
 
@@ -242,6 +269,76 @@ class LiveMem:
     def read_so(self, so_name: str, vaddr: int, size: int) -> bytes:
         rt = self.resolve(so_name, vaddr)
         return None if rt is None else self.read(rt, size)
+
+    # ---------- 安全读（只加约束，不改原 read 语义） ----------
+    def segment_info(self, so_name: str):
+        """[(start, end, file_off, path, perms), ...]，用于诊断重复映射。"""
+        return [(s, e, o, p, self.map_perms.get(s, ""))
+                for s, e, o, p in self.segments(so_name)]
+
+    def active_exec_start(self, so_name: str):
+        """含 exec 的映射中最低的起始地址；没有 exec 时回退到最低映射。"""
+        segs = self.segments(so_name)
+        if not segs:
+            return None
+        execs = [m for m in segs if "x" in self.map_perms.get(m[0], "")]
+        return min(m[0] for m in (execs or segs))
+
+    def is_mapped(self, addr: int, size: int,
+                  deny_markers=DENY_READ_MARKERS) -> bool:
+        """检查 [addr, addr+size) 是否全在允许的映射区；允许跨连续段。"""
+        if addr <= 0 or size <= 0:
+            return False
+        end = addr + size
+        pos = addr
+        while pos < end:
+            hit = None
+            for st, en, _off, path in self.maps:
+                if st <= pos < en:
+                    hit = (en, path)
+                    break
+            if hit is None:
+                return False
+            en, path = hit
+            low = (path or "").lower()
+            if any(m in low for m in deny_markers):
+                return False
+            pos = min(end, en)
+        return True
+
+    def read_checked(self, addr: int, size: int,
+                     max_bytes: int = DEFAULT_MAX_READ):
+        """带边界/预算的读；失败返回 None，不抛异常。"""
+        if size <= 0 or size > max_bytes or not self.is_mapped(addr, size):
+            self.read_stats["denied"] += 1
+            return None
+        try:
+            data = self.read(addr, size)
+        except Exception:
+            self.read_stats["error"] += 1
+            return None
+        if len(data) != size:
+            self.read_stats["short"] += 1
+            return None
+        self.read_stats["ok"] += 1
+        self.read_stats["bytes"] += size
+        return data
+
+    def read_ptr_checked(self, addr: int):
+        """读 8 字节指针；0/失败返回 None，并按 ARM64 PAC 规则去 tag。"""
+        b = self.read_checked(addr, 8)
+        if b is None:
+            return None
+        p = struct.unpack_from("<Q", b)[0]
+        return (p & 0xFFFFFFFFFFFF) if p else None
+
+    def read_i32_checked(self, addr: int):
+        b = self.read_checked(addr, 4)
+        return struct.unpack_from("<i", b)[0] if b is not None else None
+
+    def read_xyz_checked(self, addr: int):
+        b = self.read_checked(addr, 12)
+        return struct.unpack_from("<3i", b) if b is not None else None
 
     def cstr(self, so_name: str, vaddr: int, limit=128):
         b = self.read_so(so_name, vaddr, limit)
