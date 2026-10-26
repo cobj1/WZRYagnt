@@ -4,6 +4,18 @@
 > 生成：`D:/app/python/python.exe reverse/gen_rules_triage.py`（以下命令均在 `WZRYagnt/` 下执行）。
 > 现状：已实现 **37** 条；表内可识别的具名函数（去重、去桩）**67** 个，待做 **52** 条。
 >
+> **2026-10-26 复核**：待做表 52 条里有 **7 条**（#4 #6 #10 #12 #14 #33 #35）其实已在
+> `rules.py` 实现、只是表没更新 → **实际未实现 45 条**。复核（地址优先于名字，避免
+> `wait_resurrection_armor` vs `r_wait_revive_armor` 这类近义词改写被当成两条）：
+> `venv/Scripts/python.exe -X utf8 scripts/check_rules_triage.py`。
+>
+> ⚠️ **候选常量不可直接采信**：`rule_consts.py` 的“候选常量”是在 **420 条指令窗口**内扫
+> `cmp/cmn/tbz` 得到的，**不保证属于该规则函数**（相邻函数会被卷进来）。
+> 实测 #1 `IgnoreBailishouyueSkill2 @0x27ee08c`：完整反汇编是
+> `sub w8, w0, #0x51` / `cmp w8, #0xdb` = **单位 ID 范围 [81,300] 过滤 + 取最近**（随后算 dx/dy），
+> 与规则名的字面含义不符 —— 若照名字写“忽略守约二技能”就是错的。
+> **每条必须先用 `D:/app/python/python.exe reverse/disasm_one.py <addr> <n>` 看完整指令流再动笔。**
+>
 > 说明：§8.2 的 141 是 RuleTactics 调度表里的具名规则数；本表按`RuleTactics::` / `rule_` 前缀从 260 行原始注册表里抽，含部分重载与子函数，所以条数会多于 141 —— 以本表为**工作清单**，以 141 为**对账口径**。
 
 工作流（每条 10~20 分钟）：
