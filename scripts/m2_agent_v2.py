@@ -31,6 +31,7 @@ import queue
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -1899,9 +1900,9 @@ def build_arg_parser():
                     help="opt")
     ap.add_argument("--save", action="store_true", help="opt")
     ap.add_argument("--result", default=None,
-                    choices=["win", "loss", "draw", "胜利", "失败", "平局"],
+                    choices=["auto", "win", "loss", "draw", "胜利", "失败", "平局"],
                     help="本局胜负，退出时写进 manifest.result（价值模型的唯一监督信号；"
-                         "不传则该局不可用于训练）")
+                         "auto=读结算页横幅，只自动落 loss；不传则该局不可用于训练）")
     ap.add_argument("--no-selfcheck", action="store_true",
                     help="不启动自我诊断截图器（它依赖渲染后的带标注帧，"
                          "纯性能测试时配合 --no-annot 可整段跳过渲染）")
@@ -2264,7 +2265,7 @@ def build_decision_engine(args):
 
 
 
-def finalize_recorder(recorder, args, reason="", frame=None):
+def finalize_recorder(recorder, args, reason="", frame=None, frames=None):
     """关盘前统一收尾：写胜负 + 打印采数闸门 + close。
 
     对局结束与程序退出两条路径共用，避免"中途结束却没记胜负"。
@@ -2281,7 +2282,16 @@ def finalize_recorder(recorder, args, reason="", frame=None):
         _want, _src = None, "auto"
         try:
             from wzry.vision.match_result import classify
-            _res, _conf, _detail = classify(frame)
+            # 结算页横幅可能比"离开对局"晚出现 1–2 秒，故按"最近若干帧"倒序试，
+            # 取第一个能判读的；都没有就不写（不猜）。
+            _cands = [f for f in (frames or []) if f is not None]
+            if frame is not None:
+                _cands = _cands + [frame]
+            _res, _conf, _detail = None, 0.0, {"reason": "no_frame"}
+            for _f in reversed(_cands):
+                _res, _conf, _detail = classify(_f)
+                if _res:
+                    break
             if _res:
                 _want = _res
                 print(f"[结算页] 识别为 {_res} conf={_conf:.2f} {_detail}")
@@ -2462,7 +2472,8 @@ def main():
     recorder = MatchRecorder(base_dir=ROOT / "data" / "matches",
                              frame_every_s=float(getattr(args, "frame_every", 5.0)))
 
-    _finalize = lambda reason="": finalize_recorder(recorder, args, reason)
+    _finalize = lambda reason="", frame=None, frames=None: finalize_recorder(
+        recorder, args, reason, frame, frames)
 
     from wzry.understanding.behavior import BehaviorTagger
     from wzry.feedback.reward import RewardSystem
@@ -2640,6 +2651,8 @@ def main():
         _phases = {}
         _nm_why = {"not_dark": 0, "green_low": 0, "blue_high": 0}
         _nm_vals = []
+        # --result auto: 留最近 12 帧(降采样)给结算页判读，覆盖"横幅晚 1–2 秒出现"
+        _recent = deque(maxlen=12) if getattr(args, "result", None) == "auto" else None
         while time.time() < t_end and not _drive_done.is_set():
             _tw = _t0()
             frame, lag_ms = cap.wait_frame(timeout=2.0)
@@ -2649,6 +2662,12 @@ def main():
 ##                print("  鏃犲抚堟祦寮傚父)
                 continue
             n_frames += 1
+            if _recent is not None:
+                try:
+                    _recent.append(cv2.resize(frame, (640, 360),
+                                              interpolation=cv2.INTER_AREA))
+                except Exception:
+                    pass
             _ts = _t0()
             phase = sm.update(frame)
             _phases[getattr(phase, "value", str(phase))] = \
@@ -2747,7 +2766,7 @@ def main():
                     #   必须经队列让 worker 真正 t_up(主循环按设计不直接碰 ex)。
                     _action_q.put(({"type": "stick_release"}, cooldowns))
                 if recorder.active:
-                    _finalize(reason="match_end")
+                    _finalize(reason="match_end", frame=frame)
                     print(f"[{datetime.now():%H:%M:%S}] 对局结束，会话已归档。")
                 # learning log dump (throttled: cooldown 60s + learner 60s)
                 try:
@@ -3791,7 +3810,8 @@ def main():
         if recorder.active:
             # 胜负是价值模型的唯一监督信号。历史 44 局全缺这一列，导致"域内价值模型"
             # 无从训练；这里在关盘前落一次，并顺手打印采数闸门，避免白采一局。
-            _finalize(reason="exit")
+            _finalize(reason="exit",
+                                     frames=list(_recent) if _recent is not None else None)
         cap.stop()
         if _dtrace is not None:
             _dtrace.close()

@@ -626,6 +626,7 @@ class MemWorker:
         self.latest: Dict[str, object] = {}
         self.ts = 0.0
         self.err: Optional[str] = None
+        self.clock_err: Optional[str] = None   # 时钟扫描专用：不被 _run 的成功轮擦掉
         self.n_pub = 0                 # 成功发布的快照数（自检用）
         self._stop = threading.Event()
         self._th: Optional[threading.Thread] = None
@@ -645,10 +646,13 @@ class MemWorker:
         return self
 
     def _clock_run(self):
-        for _ in range(3):
-            if self._stop.is_set() or self.mb.read_clock() is not None:
+        # 扫描失败才算一次尝试；"还没进对局所以拿不到锚点"只是等待，不烧次数。
+        # 旧实现是一个 for _ in range(3)：进程在开局前启动时，三次等待全花在大厅里，
+        # 进局后再也不扫，整局 clock_s 恒缺（实测 1284 帧 0 命中）。
+        tries = 0
+        while not self._stop.is_set() and tries < 3:
+            if self.mb.read_clock() is not None:
                 return
-            exp = None
             try:
                 exp = self.expected_clock_fn()
             except Exception:
@@ -656,10 +660,11 @@ class MemWorker:
             if exp is None:
                 self._stop.wait(2.0)
                 continue
+            tries += 1
             try:
                 self.mb.locate_clock(int(exp))
             except Exception as e:
-                self.err = f"clock: {type(e).__name__}: {e}"
+                self.clock_err = f"clock: {type(e).__name__}: {e}"
             if self.mb.read_clock() is not None:
                 return
             self._stop.wait(5.0)
@@ -680,6 +685,11 @@ class MemWorker:
                     self.ts = time.time()
                     self.n_pub += 1
                     self.err = None
+                    # 时钟是唯一没有视觉旁路的字段（HUD 计时器从不进 state），
+                    # 扫不到就整局静默缺列，所以入局 30s 仍无值时显式喊一次。
+                    if snap["clock"] is None and self.n_pub == 60:
+                        print(f"[mem] 时钟未定位: {self.clock_err or '差分扫描无命中'}"
+                              f" —— 本局 clock_s 将全程缺失", flush=True)
             except Exception as e:      # 读失败不清空 latest（下一轮再试）
                 self.err = f"{type(e).__name__}: {e}"
             self._stop.wait(self.interval)
@@ -693,15 +703,37 @@ class MemWorker:
         extra = state_dict.setdefault("extra", {})
         summary: Dict[str, object] = {}
 
+        sources = state_dict.setdefault("sources", {})
         clk = self.latest.get("clock")
         if isinstance(clk, int) and clk >= 0:
             ui["match_clock"] = clk
             extra["mem_clock_s"] = clk
+            # canonical 字段：录制/闸门读的是顶层 clock_s，光写 ui.match_clock
+            # 会让 coverage["clock_s"] 永远是 0（历史 44 局 0.15% 的直接原因）。
+            if state_dict.get("clock_s") is None:
+                state_dict["clock_s"] = int(clk)
+                sources["clock_s"] = "memory"
             summary["clock"] = clk
 
         heroes = self.latest.get("heroes") or []
         if heroes:
             extra["mem_heroes"] = heroes
+            # canonical scoreboard（patch_state 里早就有，apply 漏了 —— 这就是
+            # 历史 scoreboard 覆盖率 0% 的原因）。字段与 patch_state 保持一致。
+            if not state_dict.get("scoreboard"):
+                state_dict["scoreboard"] = [
+                    {"cid": h.get("id"), "camp": h.get("camp"),
+                     "gold": h.get("gold"), "gold_total": h.get("gold_total"),
+                     "gold_spent": h.get("gold_spent"), "level": h.get("level"),
+                     "exp": h.get("exp"), "kills": h.get("kills", 0),
+                     "deaths": h.get("deaths", 0), "assists": h.get("assists", 0),
+                     "hp": h.get("hp"), "hp_max": h.get("hp_max"),
+                     "equip": list(h.get("equip_ids") or []),
+                     "respawn_s": h.get("respawn_s"), "dead": bool(h.get("dead")),
+                     "x": h.get("x"), "z": h.get("z"), "src": "memory"}
+                    for h in heroes
+                ]
+                sources["scoreboard"] = "memory"
             me = None
             if self.self_id is not None:
                 me = next((h for h in heroes if h.get("id") == self.self_id), None)
