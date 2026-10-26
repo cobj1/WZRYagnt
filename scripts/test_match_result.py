@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 """结算页胜负识别回归（`wzry/vision/match_result.py`）。
 
+两类判据都用**真机样本**标定并锁在测试里（样本已入库 `docs/samples/`）：
+  - `settlement_win.png`  胜利 VICTORY：青蓝翼 + 金字
+  - `settlement_loss.png` 失败 DEFEAT：暗红/酒红
+
 覆盖：
-  T1  合成暗红横幅 → loss（真机样本已验，这里锁阈值）
-  T2  合成金黄横幅 → 默认返回 None（win 待真机样本，不猜）
-  T3  同上 + allow_unverified_win=True → win
-  T4  纯色/随机帧 → None（不得在普通画面上误报）
-  T5  真机结算页样本（若存在 temp/probe/live.png）→ loss
-  T6  真机对局帧（若存在 data/matches）→ None
-  T7  is_settlement 与 classify 一致
+  T1  合成暗红横幅 → loss
+  T2  合成青蓝横幅 → win
+  T3  纯色/随机帧 → None（普通画面不得误报）
+  T4  真机胜利样本 → win（早期"金色=胜利"的假设就是被这条纠正的）
+  T5  真机失败样本 → loss
+  T6  真机对局帧 → None
+  T7  allow_unverified_win=False → win 分支可关（保守开关仍可用）
+  T8  is_settlement 与 classify 一致
 
 运行：python -X utf8 scripts/test_match_result.py
 """
@@ -27,6 +32,7 @@ from wzry.vision.match_result import (BANNER, classify,  # noqa: E402
                                       is_settlement)
 
 PASS, FAIL = [], []
+SAMPLES = ROOT / "docs" / "samples"
 
 
 def check(name, cond, extra=""):
@@ -48,44 +54,48 @@ def synth(bgr, size=(720, 1280)):
 
 
 def main() -> int:
-    # 失败横幅：暗红（BGR）
-    loss_img = synth((40, 30, 120))
-    r, c, d = classify(loss_img)
+    # 合成：暗红 = 失败（BGR）
+    r, c, d = classify(synth((40, 30, 120)))
     check("T1_crimson_banner_is_loss", r == "loss" and c > 0.6, f"{r}/{c:.2f} {d}")
 
-    # 胜利横幅：金黄（BGR）
-    win_img = synth((60, 190, 235))
-    r2, c2, d2 = classify(win_img)
-    check("T2_gold_banner_awaits_sample", r2 is None and d2.get("rule") == "gold_banner",
-          f"{r2} {d2}")
-    r3, c3, _ = classify(win_img, allow_unverified_win=True)
-    check("T3_gold_banner_win_when_allowed", r3 == "win" and c3 > 0.5, f"{r3}/{c3:.2f}")
+    # 合成：青蓝 = 胜利（BGR：B 高、R 低）
+    r2, c2, d2 = classify(synth((200, 120, 40)))
+    check("T2_cyan_banner_is_win", r2 == "win" and c2 > 0.6, f"{r2}/{c2:.2f} {d2}")
 
     # 普通画面不得误报
     flat = np.full((720, 1280, 3), 90, dtype=np.uint8)
-    check("T4_flat_frame_no_result", classify(flat)[0] is None)
+    check("T3_flat_frame_no_result", classify(flat)[0] is None)
     rng = np.random.default_rng(7)
     noise = rng.integers(0, 256, (720, 1280, 3), dtype=np.uint8)
-    check("T5_noise_frame_no_result", classify(noise)[0] is None)
+    check("T3b_noise_frame_no_result", classify(noise)[0] is None)
 
-    # 真机样本（有则验，无则跳过）
-    live = ROOT / "temp" / "probe" / "live.png"
-    if live.is_file():
-        img = cv2.imread(str(live))
-        r4, c4, d4 = classify(img)
-        check("T6_real_settlement_is_loss", r4 == "loss" and c4 > 0.6,
-              f"{r4}/{c4:.2f} {d4}")
-        check("T7_is_settlement_matches", is_settlement(img) is True)
+    # 真机样本（已入库）
+    win_p = SAMPLES / "settlement_win.png"
+    loss_p = SAMPLES / "settlement_loss.png"
+    if win_p.is_file():
+        img = cv2.imread(str(win_p))
+        r3, c3, d3 = classify(img)
+        check("T4_real_victory_is_win", r3 == "win" and c3 > 0.8, f"{r3}/{c3:.2f} {d3}")
+        check("T8_victory_is_settlement", is_settlement(img) is True)
+        r3b, _, _ = classify(img, allow_unverified_win=False)
+        check("T7_win_branch_can_be_disabled", r3b is None, f"{r3b}")
     else:
-        print("SKIP T6/T7（没有 temp/probe/live.png 真机样本）")
+        print("SKIP T4/T8/T7（缺 docs/samples/settlement_win.png）")
+
+    if loss_p.is_file():
+        img = cv2.imread(str(loss_p))
+        r4, c4, d4 = classify(img)
+        check("T5_real_defeat_is_loss", r4 == "loss" and c4 > 0.6, f"{r4}/{c4:.2f} {d4}")
+    else:
+        print("SKIP T5（缺 docs/samples/settlement_loss.png）")
 
     mdir = ROOT / "data" / "matches"
     frames = sorted(mdir.glob("*/frames/*.png"))[:5] if mdir.is_dir() else []
     if frames:
         bad = [p.name for p in frames if classify(cv2.imread(str(p)))[0] is not None]
-        check("T8_in_match_frames_no_result", not bad, f"{bad}")
+        check("T6_in_match_frames_no_result", not bad, f"{bad}")
     else:
-        print("SKIP T8（没有 data/matches 帧）")
+        print("SKIP T6（没有 data/matches 帧）")
 
     print(f"\n结果: {len(PASS)}/{len(PASS) + len(FAIL)} 通过")
     if FAIL:

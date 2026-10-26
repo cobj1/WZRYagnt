@@ -25,6 +25,26 @@ _KIND_TO_CLS = {
 }
 
 
+def _mem_units_from_heroes(mem_heroes) -> list[dict]:
+    """`read_units()` 空时由 `mem_heroes` 还原英雄单位（同样带世界坐标）。
+
+    为什么需要：`mem_units` 走 actor 全量扫描，实测在 --mem 会话里长期为空，
+    而 `mem_heroes` 每帧都有 x/z —— 不兜底则 `units.pos_minimap` 恒为 0，
+    桥接层只能退回小地图色点。
+    """
+    out: list[dict] = []
+    for h in mem_heroes or []:
+        if h.get("x") is None or h.get("z") is None:
+            continue
+        out.append({"cid": h.get("id"), "kind": "hero", "camp": h.get("camp"),
+                    "hp": h.get("hp"), "hp_max": h.get("hp_max"),
+                    "hp_ratio": (float(h["hp"]) / h["hp_max"])
+                    if (h.get("hp") is not None and h.get("hp_max")) else None,
+                    "x": h.get("x"), "z": h.get("z"), "actor": h.get("obj"),
+                    "dead": bool(h.get("dead"))})
+    return out
+
+
 def _canonical_mem_units(mem_units, self_camp: str | None) -> list[dict]:
     """内存单位 -> canonical `units` 条目，仅用于录制/审计。
 
@@ -169,13 +189,17 @@ class MatchRecorder:
             if clock is not None:
                 ui["match_clock"] = clock
         if clock is not None:
-            state_dict.setdefault("clock_s", clock)
+            # 上游 state 会先放一个 clock_s=None 的占位键，`setdefault` 因此永远写不进去
+            # （实测 44 局 clock_s 覆盖 0.1% 就是这么来的），只在值缺失时覆盖。
+            if state_dict.get("clock_s") is None:
+                state_dict["clock_s"] = clock
             sources["clock_s"] = "memory" if extra.get("mem_clock_s") is not None else "vision"
             self._n_clock_states += 1
 
         mem_heroes = extra.get("mem_heroes") or []
         if mem_heroes:
-            state_dict.setdefault("scoreboard", self._scoreboard_from_mem(mem_heroes))
+            if not state_dict.get("scoreboard"):
+                state_dict["scoreboard"] = self._scoreboard_from_mem(mem_heroes)
             sources["scoreboard"] = "memory"
             self._n_memory_states += 1
 
@@ -187,7 +211,8 @@ class MatchRecorder:
             state_dict.setdefault("session_elapsed_s", float(now_wall - self._start_t))
 
         units = state_dict.get("units") or []
-        mem_units = extra.get("mem_units") or []
+        mem_units = extra.get("mem_units") or _mem_units_from_heroes(
+            extra.get("mem_heroes"))
         if mem_units:
             self_camp = (state_dict.get("self_state") or {}).get("camp")
             if not self_camp:

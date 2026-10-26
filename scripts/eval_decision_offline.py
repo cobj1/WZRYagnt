@@ -429,7 +429,7 @@ def _session_start_t(path):
     return None
 
 
-def _iter_selected(session_paths, keys, inject_clock=True):
+def _iter_selected(session_paths, keys, inject_clock=True, by_frame_id=False):
     """按 (session -> 行号集合) 流式回读, 只 yield 选中的帧。
 
     inject_clock: 给每帧补 `session_start_t`。纯视觉 states.jsonl 没有 clock_s,
@@ -442,11 +442,13 @@ def _iter_selected(session_paths, keys, inject_clock=True):
         start = _session_start_t(path) if inject_clock else None
         with path.open("r", encoding="utf-8") as fh:
             for idx, line in enumerate(fh):
-                if idx not in want:
+                if not by_frame_id and idx not in want:
                     continue
                 try:
                     st = json.loads(line)
                 except Exception:
+                    continue
+                if by_frame_id and st.get("frame_id") not in want:
                     continue
                 if start is not None and "session_start_t" not in st:
                     st["session_start_t"] = start
@@ -461,6 +463,7 @@ def run_eval(cfg, fixed_keys=None):
         raise SystemExit("没有匹配的会话")
     cov, all_frames = _scan(session_paths)
     picks = _sample(all_frames, cfg["seed"], cfg["limit"], cfg["hz"])
+    by_frame_id = fixed_keys is not None
     keys = (fixed_keys if fixed_keys is not None
             else defaultdict(set, {n: set() for n, _, _ in picks}))
     if fixed_keys is None:
@@ -479,7 +482,8 @@ def run_eval(cfg, fixed_keys=None):
     t_start = time.perf_counter()
     stopped = False
     planned = sum(len(v) for v in keys.values())
-    for name, st in _iter_selected(session_paths, keys, cfg.get("inject_clock", True)):
+    for name, st in _iter_selected(session_paths, keys, cfg.get("inject_clock", True),
+                                   by_frame_id=by_frame_id):
         if budget and time.perf_counter() - t_start > budget:
             stopped = True
             break
@@ -614,7 +618,8 @@ def _rerun_by_frame_id(cfg, keys):
     shadow = HokShadow(out_path=trace)
     out = []
     for name, st in _iter_selected(session_paths, _keys_to_lines(session_paths, keys),
-                                   cfg.get("inject_clock", True)):
+                                   cfg.get("inject_clock", True),
+                                   by_frame_id=False):
         out.append(_eval_one(name, st, shadow))
     out.sort(key=lambda r: (r["s"], r["t"]))
     return out
@@ -1029,6 +1034,11 @@ def main(argv=None):
                     metavar="N", help="内置二次运行比对前 N 帧(默认 60), 0=不做")
     ap.add_argument("--report-only", default=None, metavar="JSON",
                     help="不重跑, 直接从已落盘 JSON 重新渲染报告")
+    ap.add_argument("--keys-file", default=None,
+                    help="固定帧集合 JSON（{session: [行号...]}）；用它可以做跨时间可比的 A/B"
+                         "（默认按 seed 抽样，语料增长后抽样会漂移）")
+    ap.add_argument("--dump-keys", default=None,
+                    help="把本次抽样到的 {session: [行号...]} 写到该路径，供 --keys-file 复用")
     ap.add_argument("--no-inject-clock", action="store_true",
                     help="不给回放帧补 session_start_t（回到对局时间恒 0 的旧行为，用于 A/B 对照）")
     ap.add_argument("--quiet", action="store_true")
@@ -1050,7 +1060,23 @@ def main(argv=None):
            if args.sessions else None,
            "max_seconds": args.max_seconds, "trace": args.trace,
            "inject_clock": not args.no_inject_clock}
-    res = run_eval(cfg)
+    fixed = None
+    if args.keys_file:
+        raw = json.loads(Path(args.keys_file).read_text(encoding="utf-8"))
+        fixed = defaultdict(set, {str(k): {int(i) for i in v} for k, v in raw.items()})
+        print(f"[keys] 固定帧集合 {len(fixed)} 会话 / {sum(len(v) for v in fixed.values())} 帧")
+    res = run_eval(cfg, fixed_keys=fixed)
+    if args.dump_keys:
+        # 用 frame_id 而不是行号：行号会随语料追加而漂移，frame_id 是帧的稳定标识
+        picked = defaultdict(list)
+        for rec in res["records"]:
+            if isinstance(rec.get("f"), int):
+                picked[rec["s"]].append(int(rec["fid"]))
+        kp = Path(args.dump_keys)
+        kp.parent.mkdir(parents=True, exist_ok=True)
+        kp.write_text(json.dumps({k: sorted(v) for k, v in picked.items()},
+                                 ensure_ascii=False), encoding="utf-8")
+        print(f"[keys] 已写出 {kp}（按 frame_id）")
     agg = _agg(res["records"])
     lat = _lat(res["records"])
     buckets = _by_bucket(res["records"])
