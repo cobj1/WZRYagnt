@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SUITES = [
     ("protocols", "scripts/test_protocols.py", False),
     ("m2_assembly", "scripts/test_m2_assembly.py", False),
+    ("match_result", "scripts/test_match_result.py", False),
     ("decision_output", "scripts/test_decision_output.py", False),
     ("action_dispatch", "scripts/test_action_dispatch.py", False),
     ("context", "scripts/test_context.py", False),

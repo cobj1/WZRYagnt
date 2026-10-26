@@ -1884,8 +1884,10 @@ def build_arg_parser():
     # v16.0 P3 性能: YOLO ONNX intra_op 线程数。默认 0 = onnxruntime 按物理核数开满
     #   (本机 16 核) —— 推理突发期间把采集 reader 饿死(wait_frame 占墙钟 88-97%)。
     #   限到 2-4 给采集让 CPU; 同局内 A/B 用不同值各跑一段再比。
-    ap.add_argument("--yolo-threads", type=int, default=0,
-                    help="YOLO ONNX intra_op 线程数(0=ORT 默认占满物理核; 建议试 2-4)")
+    ap.add_argument("--yolo-threads", type=int, default=4,
+                    help="YOLO ONNX intra_op 线程数(0=ORT 默认占满物理核)。"
+                         "默认 4：同一份回放帧 A/B 实测 55.1ms→36.0ms，且小地图/渲染同步变快"
+                         "（ORT 占满核会与主循环抢 CPU）")
     ap.add_argument("--yolo-every", type=int, default=3,
                     help="每 N 个主循环拍做一次 YOLO 检测(默认 3, 保持原行为)。"
                          "实测真机主循环 ~21Hz 而感知块 ~2.3Hz, 故 N=3 时 YOLO 仅 ~0.8Hz;"
@@ -1899,6 +1901,9 @@ def build_arg_parser():
                     choices=["win", "loss", "draw", "胜利", "失败", "平局"],
                     help="本局胜负，退出时写进 manifest.result（价值模型的唯一监督信号；"
                          "不传则该局不可用于训练）")
+    ap.add_argument("--no-selfcheck", action="store_true",
+                    help="不启动自我诊断截图器（它依赖渲染后的带标注帧，"
+                         "纯性能测试时配合 --no-annot 可整段跳过渲染）")
     ap.add_argument("--no-annot", dest="no_annot", action="store_true",
                     help="不写 temp/live_annot 的标注预览 PNG（纯人工看图，不参与决策；"
                          "真机追帧率时用，省 2 张 PNG/拍的编码与磁盘开销）")
@@ -2218,15 +2223,22 @@ def start_mem_worker(args, cooldowns):
     return _memw
 
 
-def start_diagnostics():
-    """启动自我诊断截图器与行为习惯学习器；任一不可用则返回 None（不影响主链路）。"""
+def start_diagnostics(args=None):
+    """启动自我诊断截图器与行为习惯学习器；任一不可用则返回 None（不影响主链路）。
+
+    `--no-selfcheck` 时不建诊断器：它的输入是渲染后的带标注帧，关掉它
+    才能让主循环整段跳过渲染（纯性能测试路径）。
+    """
     # v2.81 自我诊断(截图留存, 供 DeepSeek 视觉审检)
-    try:
-        from wzry.diagnose.self_check import SelfCheckDiagnostician
-        self_check = SelfCheckDiagnostician(interval_s=20.0)
-        self_check.start()
-    except Exception:
+    if args is not None and getattr(args, "no_selfcheck", False):
         self_check = None
+    else:
+        try:
+            from wzry.diagnose.self_check import SelfCheckDiagnostician
+            self_check = SelfCheckDiagnostician(interval_s=20.0)
+            self_check.start()
+        except Exception:
+            self_check = None
     # v2.83 行为习惯学习器(对面/队友/自己)
     try:
         from wzry.learning.behavior_mine import BehaviorMiner
@@ -2251,26 +2263,43 @@ def build_decision_engine(args):
 
 
 
-def finalize_recorder(recorder, args, reason=""):
+def finalize_recorder(recorder, args, reason="", frame=None):
     """关盘前统一收尾：写胜负 + 打印采数闸门 + close。
 
     对局结束与程序退出两条路径共用，避免"中途结束却没记胜负"。
+    `--result auto` 时用结算页横幅判胜负（`wzry/vision/match_result.py`）：
+    只有暗红横幅（失败）会**自动**落盘；金色横幅（胜利）在拿到真机样本前
+    只打印提示、不写盘——宁可缺一列，也不写不确定的标签。
     幂等：recorder 不 active 时直接返回。
     """
     if not recorder.active:
         return
+    _want = getattr(args, "result", None)
+    _src = "cli"
+    if _want == "auto":
+        _want, _src = None, "auto"
+        try:
+            from wzry.vision.match_result import classify
+            _res, _conf, _detail = classify(frame)
+            if _res:
+                _want = _res
+                print(f"[结算页] 识别为 {_res} conf={_conf:.2f} {_detail}")
+            else:
+                print(f"[结算页] 未识别出胜负（{_detail.get('reason')}）"
+                      f" crimson={_detail.get('crimson_frac')} gold={_detail.get('gold_frac')}")
+        except Exception as _e:
+            print(f"[结算页] 识别失败(降级为未记录): {type(_e).__name__}: {_e}")
     try:
-        _info = recorder.finalize(getattr(args, "result", None),
-                                  note=reason, source="cli")
+        _info = recorder.finalize(_want, note=reason, source=_src)
     except ValueError as _e:
         print(f"[录制] 胜负取值非法，未记录: {_e}")
         _info = recorder.finalize(None, note=reason, source="cli")
     if not _info:
         return
     if _info["result"]:
-        print(f"[录制] 胜负已记录: {_info['result']}")
+        print(f"[录制] 胜负已记录: {_info['result']} (source={_src})")
     else:
-        print("[录制] 未记录胜负：补 `--result win|loss` 该局才能用于价值模型训练")
+        print("[录制] 未记录胜负：补 `--result win|loss`（或 `--result auto` 走结算页识别）")
     print(f"[采数闸门] {'PASS' if _info['gate_ok'] else 'FAIL'} "
           f"coverage={json.dumps(_info['coverage'], ensure_ascii=False)}"
           + ("" if _info["gate_ok"]
@@ -2576,7 +2605,7 @@ def main():
     frame_id = 0
     prev_phase = None
     n_frames = 0
-    self_check, behavior_miner = start_diagnostics()
+    self_check, behavior_miner = start_diagnostics(args)
     n_ticks = 0
     _decision_engine, _dtrace = build_decision_engine(args)
     n_actions = 0
@@ -3626,14 +3655,22 @@ def main():
             # v14.3 注: 曾把渲染移到后台线程, 实测反而更慢(218/284 帧 < 同步 334 帧) ——
             #   渲染线程与主循环抢 GIL 形成"护航效应", 把采集 reader 饿得更狠。故保持同步。
             #   render_live_analysis 本身已优化(_ltext 只转文字小块 55x + PNG 限流 4Hz)。
-            try:
-                _tr = _t0()
-                vis_out = render_live_analysis(frame, dets, mm, state_dict, action, beh,
-                                               reward.total, now)
-                _t1(_tr, "渲染标注render_live")
-            except Exception as e:
-                print(f"[annot] 渲染异常: {e}")
-                vis_out = frame.copy()
+            # 渲染只有在"有人消费"时才做：窗口显示 / 标注 PNG / 自我诊断。
+            # 三者都关时（--no-annot --no-selfcheck 且未开 --show）直接复用原帧，
+            # 省掉 frame.copy() + 几十次 cv2 绘制（实测 18.7ms/拍）。
+            _need_vis = (bool(getattr(args, "show", False)) or _LA_ANNOT
+                         or self_check is not None)
+            if not _need_vis:
+                vis_out = frame
+            else:
+                try:
+                    _tr = _t0()
+                    vis_out = render_live_analysis(frame, dets, mm, state_dict, action, beh,
+                                                   reward.total, now)
+                    _t1(_tr, "渲染标注render_live")
+                except Exception as e:
+                    print(f"[annot] 渲染异常: {e}")
+                    vis_out = frame.copy()
 
             # v2.81 self-diagnose: 带标注帧 + 血条读数 一起送 AI 审检
             try:
