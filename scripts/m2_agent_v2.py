@@ -1838,6 +1838,103 @@ def build_executor(args, do_action: bool):
     return ex
 
 
+def prepare_runtime_env(args):
+    """P3 装配点：--adb / --laya-offline 的环境准备（**必须在 LayaScorer 创建之前**）。
+
+    - `--adb` 要 patch `wzry.control.executor.ADB`：executor 在 import 时就把 ADB 解析成常量，
+      改环境变量不够，必须同时改模块属性。
+    - `--laya-offline` 把 HF/transformers 置为离线，避免无外网时卡在下载。
+    """
+    if getattr(args, "adb", None):                # v14.3 --adb 覆盖(须 patch 模块常量,
+        import os as _os2                         #   因为 executor.ADB 在 import 时就已解析)
+        _os2.environ["WZRY_ADB"] = args.adb
+        try:
+            from wzry.control import executor as _exec_mod
+            _exec_mod.ADB = args.adb
+        except Exception:
+            pass
+
+    if getattr(args, "laya_offline", False):      # v14.3 无外网时强制用 HF 本地缓存
+        import os as _os
+        _os.environ["HF_HUB_OFFLINE"] = "1"
+        _os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
+def start_laya_scorer(args):
+    """P3 装配点：Laya 打分器（off = 零改动）。返回句柄或 None。
+
+    调用前必须先跑 `prepare_runtime_env(args)`（--laya-offline 的环境变量要在模型加载前生效）。
+    """
+    if getattr(args, "laya", "off") == "off":
+        return None
+    from wzry.decision import optimizer as _opt_laya
+    from wzry.decision.laya_scorer import LayaScorer as _LayaScorer
+    _laya = _LayaScorer(mode=args.laya, beta=float(args.laya_beta),
+                        model_path=args.laya_model,
+                        top_k=int(getattr(args, "laya_topk", 16)),
+                        min_submit_interval=float(getattr(args, "laya_hz", 0.0)),
+                        max_errors=int(getattr(args, "laya_max_errors", 20)),
+                        max_label_dups=int(getattr(args, "laya_max_dups", 5)),
+                        backend=getattr(args, "laya_backend", "auto"),
+                        ov_device=getattr(args, "laya_device", "GPU"),
+                        ov_ir=getattr(args, "laya_ov_ir", None),
+                        ov_max_len=int(getattr(args, "laya_max_len", 320)))
+    _opt_laya.set_scorer(_laya, beta=float(args.laya_beta), mode=args.laya)
+    _laya.start()
+    _bdev = (f"{_laya.backend}:{_laya.ov_device}"
+             if _laya.backend == "openvino" else _laya.backend)
+    print(f"[Laya] mode={args.laya} beta={args.laya_beta} "
+          f"topk={_laya.top_k} 节流={_laya.min_submit_interval or '不限'}s "
+          f"后端={_bdev} model={args.laya_model or 'default'}")
+    return _laya
+
+
+def start_policy(args):
+    """P3 装配点：BCNet 策略（shadow/on）+ 事件记忆层。返回 (policy, mode, log_path)。"""
+    _policy = None
+    _policy_mode = getattr(args, "policy", "off")
+    _policy_log = ROOT / "runs" / "bc" / "policy_shadow.jsonl"
+    if _policy_mode != "off":
+        if not getattr(args, "policy_checkpoint", None):
+            print("[policy] 未给 --policy-checkpoint -> 等价 off")
+            _policy_mode = "off"
+        else:
+            try:
+                from wzry.policy.inference import BCNetInference as _BCInf
+                _policy = _BCInf(args.policy_checkpoint)
+                print(f"[policy] mode={_policy_mode} ckpt={args.policy_checkpoint} "
+                      f"memory={_policy.has_memory}")
+            except Exception as _pe:
+                print(f"[policy] 加载失败 -> 等价 off: {type(_pe).__name__}: {_pe}")
+                _policy, _policy_mode = None, "off"
+    return _policy, _policy_mode, _policy_log
+
+
+def start_uiq(args, ex):
+    """P3 装配点：UI 导航/信息查询层。返回 (navigator, is_panel_open)。
+
+    ⚠️ 必须在 `ex = build_executor(...)` **之后**调用。原实现写在它之前，而 `_PanelNav`
+    需要 `getattr(ex, "tap", None)` -> 那时 `ex` 还未定义，NameError 被 except 吞掉，
+    `_uiq` 恒为 None，**--ui-nav 的 death_recap 读数从来没生效过**（主循环只看到 None）。
+    搬到这里既修了这个静默失败，也让 main 少了 15 行。
+    """
+    mode = getattr(args, "ui_nav", "off")
+    if mode == "off":
+        return None, None
+    try:
+        from wzry.uiquery.panel import PanelNavigator as _PanelNav
+        from wzry.uiquery.panel import is_panel_open as _ipo
+        _btns = ((json.loads((ROOT / "configs" / "calibration_absolute.json")
+                             .read_text(encoding="utf-8-sig"))).get("panel_buttons") or {})
+        _uiq = _PanelNav(tap=getattr(ex, "tap", None), taps=_btns, timeout=3.0)
+        print(f"[ui-nav] mode={mode} panel_buttons={list(_btns.keys()) or '无'}"
+              f"（无标定则只读游戏自动弹出的面板）")
+        return _uiq, _ipo
+    except Exception as _ue:
+        print(f"[ui-nav] 初始化失败(不影响主链): {type(_ue).__name__}: {_ue}")
+        return None, None
+
+
 def start_mem_worker(args, cooldowns):
     """--mem 时启动内存直读后台线程（~2Hz）；失败降级为纯视觉，返回 None。"""
     # ---- v16.3 内存直读（Route C）: 后台线程 ~2Hz 刷新，主循环零 adb 往返 ----
@@ -1981,40 +2078,9 @@ def main():
     _laya = None  # v14.0 LayaScorer 句柄(finally 里 stop + 输出统计, P1 门槛: 异常数=0)
 
     # v14.0 Laya 打分器接线 (laya-fusion-plan C3): off=零改动; shadow=仅记录; ensemble=混合排序
-    if getattr(args, "adb", None):                # v14.3 --adb 覆盖(须 patch 模块常量,
-        import os as _os2                         #   因为 executor.ADB 在 import 时就已解析)
-        _os2.environ["WZRY_ADB"] = args.adb
-        try:
-            from wzry.control import executor as _exec_mod
-            _exec_mod.ADB = args.adb
-        except Exception:
-            pass
-
-    if getattr(args, "laya_offline", False):      # v14.3 无外网时强制用 HF 本地缓存
-        import os as _os
-        _os.environ["HF_HUB_OFFLINE"] = "1"
-        _os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
-    if getattr(args, "laya", "off") != "off":
-        from wzry.decision import optimizer as _opt_laya
-        from wzry.decision.laya_scorer import LayaScorer as _LayaScorer
-        _laya = _LayaScorer(mode=args.laya, beta=float(args.laya_beta),
-                            model_path=args.laya_model,
-                            top_k=int(getattr(args, "laya_topk", 16)),
-                            min_submit_interval=float(getattr(args, "laya_hz", 0.0)),
-                            max_errors=int(getattr(args, "laya_max_errors", 20)),
-                            max_label_dups=int(getattr(args, "laya_max_dups", 5)),
-                            backend=getattr(args, "laya_backend", "auto"),
-                            ov_device=getattr(args, "laya_device", "GPU"),
-                            ov_ir=getattr(args, "laya_ov_ir", None),
-                            ov_max_len=int(getattr(args, "laya_max_len", 320)))
-        _opt_laya.set_scorer(_laya, beta=float(args.laya_beta), mode=args.laya)
-        _laya.start()
-        _bdev = (f"{_laya.backend}:{_laya.ov_device}"
-                 if _laya.backend == "openvino" else _laya.backend)
-        print(f"[Laya] mode={args.laya} beta={args.laya_beta} "
-              f"topk={_laya.top_k} 节流={_laya.min_submit_interval or '不限'}s "
-              f"后端={_bdev} model={args.laya_model or 'default'}")
+    #   P3: 环境准备与打分器装配已抽为两个装配点（见 prepare_runtime_env / start_laya_scorer）
+    prepare_runtime_env(args)
+    _laya = start_laya_scorer(args)
 
     from wzry.calib import load_calibration
     from wzry.capture.scrcpy_stream import ScrcpyStreamCapture
@@ -2022,42 +2088,15 @@ def main():
     from wzry.state.fuser import build_state
     from wzry.state.match_state import MatchPhase, MatchStateMachine
     # ---- v15.0 BCNet 策略接线 + 事件记忆层 + Hero Profile ----
-    _policy = None
-    _policy_mode = getattr(args, "policy", "off")
-    _policy_log = ROOT / "runs" / "bc" / "policy_shadow.jsonl"
-    if _policy_mode != "off":
-        if not getattr(args, "policy_checkpoint", None):
-            print("[policy] 未给 --policy-checkpoint -> 等价 off")
-            _policy_mode = "off"
-        else:
-            try:
-                from wzry.policy.inference import BCNetInference as _BCInf
-                _policy = _BCInf(args.policy_checkpoint)
-                print(f"[policy] mode={_policy_mode} ckpt={args.policy_checkpoint} "
-                      f"memory={_policy.has_memory}")
-            except Exception as _pe:
-                print(f"[policy] 加载失败 -> 等价 off: {type(_pe).__name__}: {_pe}")
-                _policy, _policy_mode = None, "off"
+    #   P3: 策略装配抽为 start_policy()；imports 留在 main（主循环要用这些名字）
+    _policy, _policy_mode, _policy_log = start_policy(args)
     from wzry.memory.event_log import EventLog as _EventLog
     _events = _EventLog(persist=bool(args.save))
-    # ---- v15.1 UI导航/信息查询层（按 wzry/uiquery/panel.py 的接口）：
-    #   点击=执行层 UI 触发动作 / 面板=辅助UI感知 / 内容回填状态层+记忆层。
-    #   模态锁保证"同一时刻只有一个面板占用整屏"，且 run() 必定 close + release。
+    # ---- v15.1 UI导航/信息查询层：**初始化移到 `ex = build_executor()` 之后**（P3）。
+    #   原位置在 ex 之前，而 _PanelNav 需要 ex.tap -> NameError 被 except 吞掉，
+    #   `_uiq` 恒为 None，--ui-nav 的 death_recap 读数从来没生效过。
     _uiq = None
     _is_panel_open = None
-    _uiq_mode = getattr(args, "ui_nav", "off")
-    if _uiq_mode != "off":
-        try:
-            from wzry.uiquery.panel import PanelNavigator as _PanelNav
-            from wzry.uiquery.panel import is_panel_open as _ipo
-            _is_panel_open = _ipo
-            _btns = ((json.loads((ROOT / "configs" / "calibration_absolute.json")
-                                 .read_text(encoding="utf-8-sig"))).get("panel_buttons") or {})
-            _uiq = _PanelNav(tap=getattr(ex, "tap", None), taps=_btns, timeout=3.0)
-            print(f"[ui-nav] mode={_uiq_mode} panel_buttons={list(_btns.keys()) or '无'}"
-                  f"（无标定则只读游戏自动弹出的面板）")
-        except Exception as _ue:
-            print(f"[ui-nav] 初始化失败(不影响主链): {type(_ue).__name__}: {_ue}")
     _profile = None
     try:
         from wzry.decision import hero_profile as _hp0
@@ -2113,6 +2152,9 @@ def main():
     wall_sensor = WallSensor()
 
     ex = build_executor(args, do_action)
+
+    # P3: UI 导航层必须在 ex 之后（需要 ex.tap）。这里才是它第一次真正被初始化。
+    _uiq, _is_panel_open = start_uiq(args, ex)
 
     recorder = MatchRecorder(base_dir=ROOT / "data" / "matches",
                              frame_every_s=float(getattr(args, "frame_every", 5.0)))
