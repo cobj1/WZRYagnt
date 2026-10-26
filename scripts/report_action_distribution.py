@@ -63,7 +63,61 @@ def _load_eval():
     return mod
 
 
-def scan(ev, limit: int, sessions_prefix: str | None, prod: bool = False):
+def _self_pt(state):
+    """自己在小地图坐标系里的位置（0..1）；取不到返回 None。"""
+    ss = state.get("self_state") or {}
+    for k in ("pos_minimap", "pos"):
+        p = ss.get(k)
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            try:
+                return (float(p[0]), float(p[1]))
+            except (TypeError, ValueError):
+                pass
+    mm = state.get("minimap") or {}
+    dots = mm.get("dots") or {}
+    blue = dots.get("blue") or []
+    return (float(blue[0][0]), float(blue[0][1])) if blue else None
+
+
+def _dump_row(ev, session, st, act, tt):
+    """一行 = 一帧的决策 + 判据所需的最小状态。只做审计用，不进生产。"""
+    import math as _m
+    hp, hp_src = ev._hp_of(st)
+    mm = st.get("minimap") or {}
+    dots = mm.get("dots") or {}
+    red = [(float(d[0]), float(d[1])) for d in (dots.get("red") or []) if len(d) >= 2]
+    blue = dots.get("blue") or []
+    me = _self_pt(st)
+    near = min((_m.hypot(p[0] - me[0], p[1] - me[1]) for p in red), default=None) if me and red else None
+
+    # 小地图红点在 61.7% 的帧里为空（全语料统计），不能当"敌人距离"用。
+    # 可靠的敌人在场证据是 units 里的 enemy_hero（屏幕检测）。
+    hero_scr = []
+    for u in st.get("units") or []:
+        if u.get("cls") != "enemy_hero":
+            continue
+        b = u.get("screen") or u.get("bbox") or []
+        if len(b) >= 4:
+            hero_scr.append((float(b[0]) + float(b[2]) / 2.0, float(b[1]) + float(b[3]) / 2.0))
+    # units.screen 是**归一化** [x, y, w, h]（0..1），不是像素。
+    # 这里按 m2 的 dist_width 口径算：hypot(nx-0.5, (ny-0.5)*aspect)，DANGER_FRAC=0.45 可直接比。
+    w, h = (st.get("screen_size") or (1280.0, 720.0))[:2]
+    aspect = (float(h) / float(w)) if w else 0.5625
+    near_scr = min((_m.hypot(px - 0.5, (py - 0.5) * aspect) for px, py in hero_scr), default=None)
+
+    return json.dumps({
+        "s": session, "fid": st.get("frame_id"), "t": st.get("t"),
+        "type": tt, "reason": act.get("reason"), "hp": round(float(hp), 3) if hp is not None else None,
+        "hp_src": hp_src, "n_red": len(red), "n_blue": len(blue),
+        "n_enemy_screen": len(hero_scr),
+        "near_enemy_screen": round(near_scr, 3) if near_scr is not None else None,
+        "me": [round(me[0], 3), round(me[1], 3)] if me else None,
+        "near_red": round(near, 3) if near is not None else None,
+        "nx": act.get("nx"), "ny": act.get("ny"),
+    }, ensure_ascii=False)
+
+
+def scan(ev, limit: int, sessions_prefix: str | None, prod: bool = False, dump=None):
     """遍历 states.jsonl，产出每帧的动作类型与是否兜底。
 
     prod=True 时调用生产决策 `m2_agent_v2.decide(state, cooldowns)`（**唯一真实口径**），
@@ -117,6 +171,8 @@ def scan(ev, limit: int, sessions_prefix: str | None, prod: bool = False):
                     continue
                 tt = act.get("type")
                 is_fb = str(act.get("reason", "")).startswith(("eval_rule_fb", "fb"))
+                if dump:
+                    dump.write(_dump_row(ev, name, st, act, tt) + "\n")
             else:
                 hp, _src = ev._hp_of(st)
                 try:
@@ -182,13 +238,25 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="最多扫描帧数，0=全部")
     ap.add_argument("--sessions", default=None, help="会话名前缀过滤")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--dump", default=None,
+                    help="仅在 --prod 下有效：把逐帧决策+判据状态写成 jsonl（审计用）")
     ap.add_argument("--prod", action="store_true",
                     help="调用生产决策 m2_agent_v2.decide（真实口径）；默认走 eval 口径")
     args = ap.parse_args()
 
     t0 = time.time()
     ev = _load_eval()
-    r = scan(ev, args.limit, args.sessions, prod=args.prod)
+    dump_fh = None
+    if args.dump and args.prod:
+        dp = Path(args.dump)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        dump_fh = dp.open("w", encoding="utf-8")
+    try:
+        r = scan(ev, args.limit, args.sessions, prod=args.prod, dump=dump_fh)
+    finally:
+        if dump_fh is not None:
+            dump_fh.close()
+            print(f"逐帧决策 -> {args.dump}")
     dt = time.time() - t0
     if not r["frames"]:
         print("没有可评估帧（先确认 data/matches 下有 states.jsonl）")
