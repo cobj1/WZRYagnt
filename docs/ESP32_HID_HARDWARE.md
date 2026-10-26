@@ -247,7 +247,7 @@ adb shell getevent -lt /dev/input/eventN
 | 命令回 `err no free contact` | 5 个触点全被占住 | 检查是否有触点忘了 `t_up` |
 | **触点整体偏移** | `TOUCH_SURFACE_W/H` 与手机分辨率不一致 | 改 `secrets.h` 后重新烧写 |
 | 触点位置正常但游戏无响应 | 触点被识别成 hover 而非 touch | 检查描述符的 Tip Switch / In Range 位；用"显示指针位置"确认 |
-| 链路断开后手机上手指卡住 | —— | 固件已在断开时自动 `releaseAllTouches()`，无需处理 |
+| 链路断开后手机上手指卡住 | 正常断开时固件会自动 `releaseAllTouches()`；但 PC 静默消失（休眠/断网/被 kill）属半开连接，`connected()` 仍为 true → 不会松手 | 半开连接**不会自动恢复**（见 `ARCH_CONTROL_CHANNEL.md §5.9`）。临时对策：暂停前手动断开电脑侧 Wi-Fi，或重启板子 |
 | 电脑连不上 7300 | IP 错 / 不同网段 / 防火墙 | 看串口打印的 IP；确认同一 Wi-Fi；关防火墙试 |
 
 ---

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Interactive YOLO box annotator for zhongkui screenshots (11 classes).
+"""Interactive YOLO box annotator for zhongkui screenshots.
 
-Supports loading existing same-name .txt labels on navigation and via 'l'.
+Class list is loaded from `configs/classes.json` so annotation ids stay aligned
+with `scripts/train/prepare_dataset.py` (currently 13 classes).
 
 Controls:
     n        next image (auto-saves if new boxes were drawn)
@@ -12,15 +13,14 @@ Controls:
     d        delete last drawn box
     q        quit
 """
+import json
 import cv2
 import sys
 from pathlib import Path
 
-CLASSES = [
-    'enemy_hero', 'ally_hero', 'enemy_minion', 'ally_minion',
-    'enemy_turret', 'ally_turret', 'enemy_crystal', 'ally_crystal',
-    'neutral_monster', 'hook_aim', 'skill_effect'
-]
+_ROOT = Path(__file__).resolve().parents[2]
+_CLASSES_FILE = _ROOT / "configs" / "classes.json"
+CLASSES = json.loads(_CLASSES_FILE.read_text(encoding="utf-8-sig"))
 
 current_class = 0
 drawing = False

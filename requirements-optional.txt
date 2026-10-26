@@ -1,0 +1,7 @@
+# Optional model backends / capture backends. Core runtime and base tests do not need these.
+ultralytics==8.4.176
+openvino==2026.4.1
+laya==0.4.6
+transformers==5.19.0
+mss==10.2.0
+pywin32==312

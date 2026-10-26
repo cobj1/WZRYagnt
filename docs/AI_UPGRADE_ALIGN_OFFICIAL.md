@@ -3,8 +3,16 @@
 > 依据：`docs/wzry-ai-data-inputs.md`（官方数据面逆向）+ `docs/wzry-ai-reverse.md`（规则链）。
 > 原则：**只借架构与口径，不复刻权重**；每一步都能单独开关、单独回退。
 > 现状基线：`wzry/decision/official_ai/`（复刻实现）、`wzry/decision/optimizer.py`（legacy 价值场 argmax）。
-> 最后更新：2026-10-21 00:30。§4 待办现状：P0.1–P0.3、P0.5、P1–P4 全部完成；仅剩 **P0.4（buff，需一次局内吃 buff）**、
-> **P5.2（10 局胜负率，需 20 局 `--mem` 录制）** 与 §10.6 的规则长尾。三者都已给出可复现步骤。
+> 最后更新：2026-10-23 23:10（正文）；**2026-10-25 数字口径复核**。
+> 当前剩余：**P0.4（buff）**、**P5.2（10 局胜负率，需 20 局 `--mem` 录制）** 与 §10.6 的规则长尾。三项都已给出可复现步骤。
+>
+> **2026-10-25 核对校正（下文旧数字以此为准）**
+> - 规则：`official_ai/rules.py` 当前 **38 条 CHAIN / 37 条已实现**（5 汇编 + 32 名字级，1 条未实现）；`RULES_TRIAGE.md` 按其 67 个具名函数口径重生成后为 **37 已实现 / 52 待做**。旧 17/20/22/25/28 是历史增量。
+> - 特征：`self` 为 18 维（含 `summoner_cd` / `heal_cd`），`FeaturePack` 合计 **1383 维**，不是 1381。
+> - 回归：`test_official_ai_replica.py` **123 条**（T01–T123）；`test_new_modules.py` **198/198**；`test_laya_fusion.py` 工作树 **56/56**（HEAD 53）。
+> - 内存：兵/野/血包**未打通**（`mem_units` 稳定提供的是 organ）；`16100/16101` 是红方高地塔，不是野怪。建筑用 `assign_measured()` 按 cid 定层级，静态拓扑仅兜底。
+> - 会话/录制：当前 **44 个 session**，不是 45；人机计划为“每架构 10 局、共 20 局”。
+> - bench：以 `out/bench_official_ai.md` 当前产物为准（整帧 **1.59 ms** / 特征 0.42 ms）；正文 2.41/2.13/1.98 ms 为旧运行。
 
 ---
 
@@ -21,7 +29,7 @@
 | 技能状态 | `SkillInfo{usable, cd}` 参与决策 | 上一轮刚打通 | 🟢 已对齐 | 🟢 10/10 英雄 3 槽 |
 
 **结论（不变）**：不需要换掉价值函数，缺的是它**上游的特征层**和**下游的动作语义**。
-本轮把这层补上后，剩余硬缺口只有三个：装备栏、buff 标记、以及 141 条规则里 124 条尚未实现（其中 137 条连反汇编都没做）。
+本轮把这层补上后，剩余硬缺口只有两个：buff 标记、以及规则长尾（装备栏已打通，仅缺 ID→名称表）。
 
 ---
 
@@ -33,7 +41,7 @@ L0 取数   内存优先（MemWorker 后台 2Hz） → 视觉兜底（只在内�
              │  纪律由机制保证：Snapshot.data_src ∈ {mem,mixed,vision,none} + require_mem 严格模式
              │  本轮补齐：ui.mp（法力比例）、22 槽位、技能 CD
 L1 特征   UnitFeatures（与官方同构的 6 张表 + 归一化 + 动作历史）
-             │  FeaturePack（1381 维：self16 global9 hero170 soldier168 organ936 monster64 cake18）
+             │  FeaturePack（1383 维：self18 global9 hero170 soldier168 organ936 monster64 cake18）
              │  本轮补齐：organ 走槽位序、view_distance 裁剪、ep/ep_rate
 L2 决策   ① 双手动作枚举（目标手 × 技能手）+ 网格动作（走位，8 向 + 价值场最优点）
            ② 打分器（LinearScorer，接口不变；将来可换模型）
@@ -58,7 +66,7 @@ L3 执行   现有 ADB/HID 层（不变）；bridge 转 map_move / skill / attac
 | 当前法力 `ep` | ✅ | 内存 `+0x1C4`(cur) / `+0x1C8`(max)（施法差分定位）；HUD 蓝条比例作兜底（§10.1） |
 | 装备栏 | ✅ | `+0x1928` count + `+0x192C` 起 stride 4 的 ID 数组（10 英雄同帧比对，`gold_spent` 正相关）；复活甲判定仍缺 ID→名称表（§10.2） |
 | buff 标记 | ⛔ 仅差一次局内事件 | 平坦数组里不存在；差分探针已就绪（`reverse/probe_fields.py`），需"吃红 buff"那一下（§10.3） |
-| 建筑 22 槽位 | ✅（静态拓扑） | 用固定地图拓扑 + 位置最近邻落槽，**不依赖 cid**（§7.2） |
+| 建筑 22 槽位 | ✅（活体槽位） | 用 `assign_measured()` 按 cid 定层级、z 序定分路；静态拓扑仅兜底（§10.4） |
 
 ### P1 特征层 ✅
 
@@ -81,12 +89,12 @@ L3 执行   现有 ADB/HID 层（不变）；bridge 转 map_move / skill / attac
 
 前置过滤：射程 `dist <= atk_range×1.15`；技能需 `cd_left_ms==0`；标签唯一（同类目标只留最近）。
 
-### P3 规则覆盖层 ✅（17/141）
+### P3 规则覆盖层 ✅（38 条 CHAIN / 37 已实现）
 
 - 三态接口 `PASS / VETO / REWRITE`，命中即短路，顺序近似官方调度器槽位序；
 - **证据分级**：`evidence="disasm"`（5 条：地址 + 常量都可核）/ `"name"`（12 条：只有规则名或只有日志串地址，常量是工程值）；
 - 开关 `--ai-rules {all, disasm}`：默认全跑；做 A/B 或怀疑误伤时只跑有汇编证据的 5 条；
-- 命中带 `rule/verdict/reason/evidence/addr`，m2 侧把首条命中拼进 `action.reason` 便于回放对账。
+- 命中带 `rule/verdict/reason/evidence/addr`，m2 侧把首条命中写进 `action.ai_rule` / `action.ai_scene`（`action.reason` 不改，避免污染训练标签）。
 
 ### P4 节拍与延迟 ✅
 
@@ -112,7 +120,7 @@ L3 执行   现有 ADB/HID 层（不变）；bridge 转 map_move / skill / attac
 | push_no_enemy | 29 | 14 | 52% | 2.40ms | 0.56ms | 22/22 |
 | jungle_full | 28 | 11 | 61% | 2.19ms→GridBest | 0.46ms | 22/22 |
 
-均值：候选 **30.3 → 15.0（-51%）**，单帧 2.41ms（其中特征 0.57ms）。
+均值：候选 **30.3 → 15.0（-51%）**，单帧 2.41ms（其中特征 0.57ms；当前 bench 产物为 1.59ms / 0.42ms，见顶部校正）。
 
 ---
 
@@ -123,12 +131,12 @@ L3 执行   现有 ADB/HID 层（不变）；bridge 转 map_move / skill / attac
 - [x] **P0.2** 当前法力**内存**定位 — **已定位 `+0x1C4`（当前）/ `+0x1C8`（上限）**，施法差分实测；`mem_source` 已暴露 `ep/ep_max/ep_rate`，见 §10.1
 - [x] **P0.3** 装备栏 — **已定位**：`+0x1928`(count) + `+0x192C`(ID, stride 4)；`mem_source` 暴露 `equip_ids`，`snap.self_equip` 可用（§10.2）
 - [ ] **P0.4** buff 标记 — 差分探针已备（`reverse/probe_fields.py --event buff`），**只差局内吃一次红 buff**（§10.3）
-- [x] **P0.5** 建筑 22 槽位 — 静态拓扑落槽，22/22 命中；真机复核脚本已备（§10.4）
+- [x] **P0.5** 建筑 22 槽位 — 活体走 `assign_measured()`（cid 定层级 / z 序定分路），静态拓扑仅兜底；真机复核脚本已备（§10.4）
 
 ### P1 特征层
 - [x] **P1.1** 6 张表 + 归一化（`schema.py` + `features.py`）
 - [x] **P1.2** `self` / `heroes` 接 `extra.mem_heroes`（含技能向量、法力）
-- [x] **P1.3** `minions` / `monsters` / `cakes` 接 `extra.mem_units` + 视野裁剪
+- [x] **P1.3** `minions` / `monsters` / `cakes` 走视觉；**内存侧只稳定接入 organ**（兵/野/血包 cid 未定位）
 - [x] **P1.4** `organs` 接 22 槽位表（槽位序，不遍历）
 - [x] **P1.5** 动作历史环形缓冲（`last_actions`，默认 8 步，进打分器）
 - [x] **P1.6** 单测 — T36–T43、T55–T59 覆盖槽位/法力/裁剪/节拍/延迟档位
@@ -143,7 +151,7 @@ L3 执行   现有 ADB/HID 层（不变）；bridge 转 map_move / skill / attac
 - [x] **P3.1** `rule_override` 三态接口（`rules.apply_rules`）
 - [x] **P3.2** 迁移 `official_rules` 三个谓词为 VETO/REWRITE 规则
 - [x] **P3.3** 新增越塔/血包/出生/回防/卡墙/打野/无目标/泉水共 12 条名字级规则
-- [x] **P3.4** 命中日志（rule/verdict/reason/evidence/addr；m2 写入 action.reason）
+- [x] **P3.4** 命中日志（rule/verdict/reason/evidence/addr；m2 写入 `action.ai_rule` / `action.ai_scene`）
 
 ### P4 节拍
 - [x] **P4.1** `--ai-predict-interval` + 场景化 `SCENE_INTERVAL`
@@ -173,7 +181,7 @@ L3 执行   现有 ADB/HID 层（不变）；bridge 转 map_move / skill / attac
 | 风险 | 影响 | 对策 |
 | --- | --- | --- |
 | 内存读取被反作弊关注 | 封号 | 只读、离线对局、不上线上真人对局（既有纪律） |
-| 特征层拖慢主循环 | 决策延迟 | 实测特征 0.57ms、整帧决策 2.13ms；节拍点重算 + 缓存 |
+| 特征层拖慢主循环 | 决策延迟 | 当前 bench 产物：整帧 1.59ms、特征 0.42ms；节拍点重算 + 缓存 |
 | 内存字段跨版本失效 | 数据静默错误 | 保留校验阈值（如 `0<total<=300000`），失败返回 None 而非 0 |
 | 双手动作标签改动打断历史标定 | 价值函数失真 | legacy 路径完全不动，official 独立枚举；两套并存开关 |
 | 22 槽位标定跨局漂移 | 塔判断错 | 固定拓扑 + 位置最近邻 + 门限 0.10；`verify_organ_slots.py --live` 一局一验 |
@@ -213,14 +221,14 @@ L3 执行   现有 ADB/HID 层（不变）；bridge 转 map_move / skill / attac
 | 视野裁剪 | `view_distance` 裁剪兵/野/血包，英雄与建筑不裁 | T10（top-N）+ 档位参数 |
 | 动作历史 | `last_actions` + `repeat_penalty`（防原地抖） | T56 不劣化 |
 | 场景节拍 | `SCENE_INTERVAL` 6 档 + `scene_of()` | T55：残血走 0.25s 档 |
-| 规则扩链 | 5 → 28 条（5 汇编 + 23 名字级，带 `evidence`） | T44–T54、T80–T101 |
+| 规则扩链 | 5 → 37 条（5 汇编 + 32 名字级，含收尾批次，带 `evidence`） | T44–T54、T80–T123 |
 
 ### 7.4 回归
 
 ```
-scripts/test_official_ai_replica.py   59/59 通过   （本轮 +29 条）
+scripts/test_official_ai_replica.py  123/123 通过（T01–T123；写作时 59/59）
 scripts/test_new_modules.py          198/198 通过
-scripts/test_laya_fusion.py           53/53 通过
+scripts/test_laya_fusion.py           56/56 通过（工作树；HEAD 53）
 ```
 
 ---
@@ -238,12 +246,16 @@ wzry/decision/official_ai/
   features.py    抽样 / 视野裁剪 / 拼定长向量
   actions.py     双手动作：目标手 × 技能手
   field.py       走位价值场（grid action 打分的替身）
-  rules.py       规则覆盖层（17 条，证据分级）
+  rules.py       规则覆盖层（29 CHAIN / 28 已实现，证据分级）
+  targeting.py   多过滤器目标检索（第二批）              ← 新增
+  motion.py      方向量化 / 单步限幅 / 场景偏差           ← 新增
+  lanes.py       分路优先级                              ← 新增
+  tactics.py     tactics_config_file 字段 schema         ← 新增
   policy.py      主管线：特征 → 打分 → top-k → 规则 → 回退
   config.py      难度参数四元组 + 场景间隔
   bridge.py      决策 -> m2 的 action dict
 scripts/
-  test_official_ai_replica.py   56 条回归（无需设备）
+  test_official_ai_replica.py   123 条回归（无需设备；T01–T123）
   run_official_ai_replica.py    --fixture / --live 演示
   bench_official_ai.py          legacy vs official 对照台   ← 本轮新增
   verify_organ_slots.py         槽位校验（静态 / --live）    ← 本轮新增
@@ -260,7 +272,7 @@ scripts/
 | 动作空间 | 目标手 × 技能手 + grid action | 同 | ✅ 复刻 |
 | 决策顺序 | 概率 top-k → 规则否决 → 回退 | 同（MODEL/RULE/FALLBACK/CACHED） | ✅ 复刻 |
 | 节拍 | predict_freq / delay_frame / 场景间隔 | 同（`AIParams` + `SCENE_INTERVAL`） | ✅ 复刻 |
-| 规则链 | 141 条 | **28 条**（5 汇编 + 23 名字级；60+ 条已定位到函数地址） | ⚠️ 部分 |
+| 规则链 | 141 条 | **37 条**（5 汇编 + 32 名字级；190 条具名规则已定位到地址） | ⚠️ 部分 |
 | **模型前向** | tensorflow/caffe 权重 | `LinearScorer`（可替换） | ⚠️ **替换** |
 | 走位打分 | 模型输出 grid action 概率 | `field.py` 显式价值场 | ✅ 形式等价 |
 
@@ -308,7 +320,7 @@ python scripts/m2_agent_v2.py ... --mem --ai-arch official --ai-level hard \
 | push_no_enemy | 29 | 14 | 52% | 0.00 | 1.77 | 0.52 | AtkSoldierSkill3 | model | atk_soldier | 22/22 |
 | jungle_full | 28 | 11 | 61% | 0.00 | 1.82 | 0.51 | GridBest | model | default | 22/22 |
 
-**均值：候选 30.3 → 15.0（−51%）；特征构建 0.57ms；整帧决策 1.98ms。**
+**均值：候选 30.3 → 15.0（−51%）；特征构建 0.57ms；整帧决策 1.98ms（旧运行；当前产物 1.59ms / 0.42ms）。**
 
 > 表内为 `--repeat 20` 的一次代表性运行；同一台机器的逐次波动约 ±0.2ms（见 §9.1 自检记录）。
 
@@ -329,7 +341,7 @@ python scripts/m2_agent_v2.py ... --mem --ai-arch official --ai-level hard \
 | 法力是否只有一种表示 | 全仓 grep `ep` / `mp` 字段与读取点 | ❌ `Unit` 上同时存在 `ep/ep_rate` 与 `mp/mp_max` 两套且只接了一条。已统一为 `ep/ep_max` + `ep_rate` 属性（与官方 `HeroBaseInfo.ep` 同名），`ui.mp` 作为数据来源 |
 | 规则命中是否污染训练标签 | 追 `action["reason"]` 落盘路径（`state_action_recorder` 写数据集） | ❌ 原实现把规则名拼进 `reason`。已改为旁挂字段 `ai_rule` / `ai_scene`，`reason` 保持原样 |
 | 规则证据分级是否名副其实 | 逐条核对 `evidence` 与手头实际证据（地址 / 常量 / 日志串） | ❌ `FrdFzDonotTakeBloodPack` 原标 `disasm`，实际只有日志串地址、阈值是工程值。已降 `name` 并补 `addr=0x027d9030`；统计变为 **4 disasm + 13 name** |
-| 编译 / 三套回归 | `py_compile` + 3 个 test 脚本 | ✅ 59/59、198/198、53/53 |
+| 编译 / 三套回归 | `py_compile` + 3 个 test 脚本 | ✅ 123/123、198/198、56/56（工作树；HEAD 53） |
 | 槽位表跨视角 | 以红方视角（`self_camp=2`）重建 22 栋再分配 | ✅ 22/22，`friend/enemy` 前缀正确翻转（T59） |
 | 视野裁剪真实生效 | 1200 vs 5000 两种可见半径，比较特征里的兵数 | ✅ 1 → 2（T57） |
 | 文档数字与实测一致 | 重跑 bench 对照文档表 | ✅ 已同步为本次运行值（均值 1.98ms） |
@@ -643,7 +655,7 @@ $ venv/Scripts/python.exe -X utf8 scripts/ab_replay.py --games 10
 - 两套动作词表要归一（`map_move`→`move`），否则永远不一致。
 
 **不能做的**：胜负率/经济差。回放改变不了游戏进程，属于反事实问题。
-需要 10 局 × 2 架构 = 20 局人机，且录制时要带 `--mem`（当前 45 个 session 里只有 3 个带内存单位）。
+需要 10 局 × 2 架构 = 20 局人机，且录制时要带 `--mem`（当前 44 个 session 里只有 3 个带内存单位）。
 在补足录制之前，这一项**不填数字**。
 
 ### 10.6 规则长尾 —— 已给出分诊表（59 条待做，不再是"124 条一锅"）
@@ -652,8 +664,8 @@ $ venv/Scripts/python.exe -X utf8 scripts/ab_replay.py --games 10
 不适合当工作清单。用 `reverse/out/il2cpp/rules_table.tsv` 去重、去桩（指令数 < 8 的丢弃）后：
 
 - 表内可识别的具名函数：**67**
-- 已实现：**17**（5 汇编 + 12 名字级）
-- 待做：**59**，已按**指令数升序**排好（先做短的）：`docs/RULES_TRIAGE.md`
+- 已实现：**37**（Triage 的 67 个具名函数口径；`rules.py` CHAIN 为 38 条、37 条 implemented）
+- 待做：**52**（`docs/RULES_TRIAGE.md` 已按当前代码重新生成），按**指令数升序**排好（先做短的）
 
 配套工具（本轮新增）：
 
@@ -702,11 +714,11 @@ $ venv/Scripts/python.exe -X utf8 scripts/ab_replay.py --games 10
 | `wzry/decision/official_ai/snapshot.py` | 坐标改走 geo；新增 `ep/ep_max/slot/stuck_frames/last_actions/view_distance/organ_notes/self_ep_rate`；槽位自动分配 |
 | `wzry/decision/official_ai/features.py` | organ 槽位序；hero 含自己；view_distance 裁剪；ep/ep_rate；塔下兵数实算 |
 | `wzry/decision/official_ai/bridge.py` | `world_to_norm` 改走 geo（修 z 轴反向） |
-| `wzry/decision/official_ai/rules.py` | 证据分级 + `mode` + 12 条新规则（17/141） |
+| `wzry/decision/official_ai/rules.py` | 证据分级 + `mode` + 12 条新规则（当前 29 CHAIN / 28 已实现） |
 | `wzry/decision/official_ai/policy.py` | 场景节拍、卡墙检测、动作历史、`rule_mode`、覆盖参数、stats 扩展 |
 | `wzry/decision/official_ai/config.py` | `SCENE_INTERVAL` 六档 |
 | `wzry/decision/official_ai/__init__.py` | 导出 geo/organ_slots/field |
-| `scripts/m2_agent_v2.py` | `--ai-rules` / `--ai-predict-interval` / `--ai-delay-frames`；命中写进 reason |
+| `scripts/m2_agent_v2.py` | `--ai-rules` / `--ai-predict-interval` / `--ai-delay-frames`；命中写进 `action.ai_rule` / `ai_scene` |
 | `scripts/run_official_ai_replica.py` | 夹具补 22 栋真实坐标建筑；打印槽位覆盖/法力/场景/证据等级 |
 | `scripts/audit_frames.py` | 新增：逐帧不变量审计（I1–I9），用带 `--mem` 的录制跑 |
 | `scripts/test_logic_units.py` | 新增：0xD0 记录的离线回归（5 项，含"整体平移应拒绝"） |
@@ -774,7 +786,7 @@ $ venv/Scripts/python.exe -X utf8 scripts/ab_replay.py --games 10
 | **地图物件**（3） | `PushHeroOutofPortal`、`AttackHeroInPortal`、`AvoidStuckDoor` | 需要传送门/门的坐标表，内存里没有对应实体 |
 | **已在别处覆盖**（3） | `RuleStuckWallV3`、`AvoidDasimingStuckWall`、`AvoidFeiStuckWall` | 都是"卡墙"的特化，已由 `IsStuckWall` + 价值场脱困点覆盖 |
 
-**结论**：能通用复刻的规则基本做完了（25/37 有地址的），剩下的都需要逐英雄/逐模式的真机标定，
+**结论（截至第三批）**：能通用复刻的规则基本做完了（25/37 有地址的），剩下的都需要逐英雄/逐模式的真机标定，
 属于"再做也只能靠猜"的区间。
 
 
@@ -840,3 +852,150 @@ $ venv/Scripts/python.exe -X utf8 scripts/ab_replay.py --games 10
 只有世界坐标时**退化为 tap** 并在 reason 里标 `no_frame_target` —— 宁可不拖，也不乱拖。
 
 测试 T102–T105（含坐标空间退化用例）。
+
+
+---
+
+## 十四、第五批：召唤师技能全链 + 官方走位点生成（2026-10-25）
+
+### 14.1 新增两个模块
+
+| 模块 | 复刻的官方部件 | 证据 |
+| --- | --- | --- |
+| `summoner.py` | `SUMMON_SKILL_*_CONFIG_ID` 的本地替代：技能 id → 角色（flash/heal/recall/smite/teleport） | 实测 id（80115/90003/90005）+ CD 窗口兜底（惩击 30s 唯一） |
+| `grid.py` | `RuleTactics::GenMovePos @0x027ecc5c`：**144 格（12×12）解码** | 日志 `multi_task_vec_model_result[%d].size():%d < 144`、`top1:%d top2:%d ... dist:%d`、`too far or in obstacle pos:%d,%d`；立即数 1000（格距）/10000/20000（距离上下限） |
+
+**GenMovePos 是本轮最有价值的发现**：官方的走位不是连续点，而是
+「英雄周围 12×12 = 144 个格子 → 取模型分最高的 top1/top2 → 距离与障碍二次校验」。
+我们把格子分数换成价值场，**其余流程逐字保留**，`policy` 里 `GridBest` 现在走这条路径，
+`FieldBest`（连续粗搜索）作为网格外的补充并存。
+
+### 14.2 新增五条规则（28 → 33）
+
+| 规则 | 地址 | 判据（日志原文 / 立即数） |
+| --- | --- | --- |
+| `UseChengji` | `0x027e0ba0` | `kUseSummonSkill monster` / `kUseSummonSkill hero` / `no enemy hero nearby, not use`；野怪进斩杀线优先，其次残血英雄 |
+| `UseHanbingChengji` | `0x027e09b0` | `summon_skill_frame_no:%d + 15 < m_cur_frame_no:%d`（15 帧防连发）+ `out of range, dis:%d`（射程 ×1.4） |
+| `UseChuanSongSkill` | `0x027f3f00` | `chuansong target:%d`（打的是**具名槽位**）+ 配置键 `MIN_CRYSTAL_DIST_CHUANSONG` |
+| `OptimizePosSkillWhenNotarget` | `0x027f0000` | `cannot find target in range %d` / `change the target to the backup target. & new Dist is %d` |
+| `OptimizeDirSkillWhenNotarget` | `0x027f02a8` | `reset the direction at frame :%d` —— 无目标技能重置方向（本执行层等价于否决） |
+
+### 14.3 GetRetreatPos 也补上了
+
+`RuleTactics::GetRetreatPos @0x027e1b98`（277 条指令）的四个日志量正好构成判据：
+
+```
+[GetRetreatPos] search_tower_dis:%d         搜索到的塔的距离
+[GetRetreatPos] crystal_hero_dis:%d         英雄 -> 水晶
+[GetRetreatPos] crystal_tower_dis:%d        塔   -> 水晶
+[GetRetreatPos] retreat_pos:%d,%d,%d
+```
+
+**判据（由四个量的语义直接推出）**：英雄离水晶比塔离水晶更近 → 直接回水晶；否则退到那座塔。
+塔的搜索半径用立即数 **15000**。已接进 `field.retreat_pos`，`rules._retreat` 全部走它。
+
+### 14.4 一个必须防的误判
+
+`summoner.slots_of` 早期版本按"CD 落在 25–35s"判惩击，结果**英雄大招（30s CD）被误判成惩击**，
+离线对照台上表现为 `lane_1v1` 场景莫名输出 `UseChengjiHero`。现在加了三重排除：
+
+1. 槽位 1–3 恒为英雄技能；
+2. `id // 100 == 英雄 id`（10610/10620 这种）一律排除；
+3. CD 兜底只在**召唤师号段（80000–90000）**内生效。
+
+测试 T118 专门守这条。
+
+### 14.5 回归
+
+| 套件 | 结果 |
+| --- | --- |
+| `test_official_ai_replica.py` | **118/118**（新增 T106–T118） |
+| `test_new_modules.py` | 198/198 |
+| `test_laya_fusion.py` | 56/56 |
+| `test_operate_commands.py` | 59/59 |
+
+离线对照台（`out/bench_official_ai.md`）：候选 **30.3 → 16.0（-47%）**，单帧 **4.16ms**（特征 0.63ms）。
+耗时比上一版（2.41ms）高，原因是 144 格 + 121 点两次价值场评估；相对 125ms 帧预算仍只占 3.3%。
+
+### 14.6 传送为什么默认不生效（诚实说明）
+
+`summoner.KNOWN_IDS` 里只有实测到的三个 id（80115 闪现 / 90003 治疗 / 90005 回城）。
+**传送的 skill_config_id 没有实测到**，所以 `UseChuanSongSkill` 默认惰性。
+真机确认后写进 `configs/summoner_skills.json` 即生效：
+
+```json
+{"summoner_skill_ids": {"80115": "flash", "90003": "heal", "90005": "recall", "80xxx": "teleport"}}
+```
+
+宁可这条规则不触发，也不要把闪现当传送交出去。
+
+
+---
+
+## 十五、第六批：安全点 / 终结 / 撤退闪现 / 打野蓝量 / 塔方向（2026-10-25 续）
+
+### 15.1 新增四条规则 + 一项打分修正
+
+| 项 | 地址 | 判据（日志原文） |
+| --- | --- | --- |
+| `IsNowEPTooLow` | `0x027df1e8` | `Attacking monster.` / `EP Too Low, No Enemy Around.` / `EP Too Low` —— 打野时蓝低就停，**附近有敌人例外** |
+| `IsInSavePlace` | `0x027db060` | `[IsInSavePlace] Tower` / `[IsInSavePlace] Crystal` —— 谓词：在己方塔/水晶安全圈内 |
+| `GetHeroSpeedUpSkill` | `0x027de90c` | `[GetHeroSpeedUpSkill] res: %d` / `IsSummonSkillUsableToRetreat` / `is_use_model_shanxian:%d` —— 撤退时交闪现拉开 |
+| `CheckUseZhongjie` | `0x027e126c` | 15 帧防连发 + `not zhongjie, skill_config_id:%d` + `target_rumtime_id:%d hp_rate:%f dis:%d` + `m_summon_skill_frame_cnt >= MAX_SUMMON_SKILL_FRAME_CNT` |
+| `CalTowerDirValue` | `0x027e4494` | `[CalTowerDirValue] tower_dir_value:%f` / `model y_action not move dir` —— 走位方向朝塔才加分（`field.tower_dir_value`） |
+
+`IsNowEPTooLow` 是**法力打通之后才第一次有意义的规则**：此前 `ep` 恒 0，这条永远不会触发。
+
+### 15.2 一个真实的行为 bug（这轮最重要的修复）
+
+规则链原来是「命中即短路」，而 `CheckReturnCity` 排第 1、`CheckUseZhiliao` 排第 28。
+后果：**残血时先回城，治疗永远不触发** —— 阈值正好卡住（回城 <0.60、治疗 <0.40）。
+
+现在把召唤师技能类规则整体提到链首：
+
+```
+1 CheckUseZhiliao   2 CheckUseZhongjie  3 UseChengji  4 UseHanbingChengji
+5 UseChuanSongSkill 6 IsNowEPTooLow     7 CheckReturnCity ...
+```
+
+实测验证：`hp=0.30 + 治疗就绪` → 输出 `UseHeal`（rule），不再是 `ReturnCity`。
+
+### 15.3 新增收尾层 `POST_CHAIN`
+
+`GetHeroSpeedUpSkill` 要作用于"撤退"动作，但撤退由 `DangerousPlaceRetreat` 产生并短路，
+放在主链里永远轮不到。官方在模型之后本来就有 `SetPostOptimze` 这一层，于是照做：
+
+```python
+POST_CHAIN = [IsInSavePlace, GetHeroSpeedUpSkill]   # 只接受 REWRITE，不允许 VETO
+```
+
+主链决定"做什么"，收尾层只负责"把它升级成更合适的形态"（撤退 → 撤退+闪现）。
+
+### 15.4 性能：一个必须做的缓存
+
+加了 144 格 + 塔方向打分后，单帧从 2.41ms 涨到 **5.31ms**。
+根因是 `enemy_tower_pts()` 在 `field_value` 和 `tower_dir_value` 里被反复重建（每帧 ~265 次）。
+给它加按快照缓存后回到 **2.34ms**（比加功能前还低）。
+
+### 15.5 回归
+
+| 套件 | 结果 |
+| --- | --- |
+| `test_official_ai_replica.py` | **123/123**（新增 T106–T123） |
+| `test_new_modules.py` | 198/198 |
+| `test_laya_fusion.py` | 56/56 |
+| `test_operate_commands.py` | 59/59 |
+
+离线对照台：候选 **30.3 → 16.0（-47%）**，单帧 **2.3–3.6ms**（多次运行波动），特征 0.45–0.64ms。
+
+### 15.6 规则表盘点（新发现的资源）
+
+`reverse/out/il2cpp/rules_table.tsv` 里其实有 **190 条具名规则**（地址 + 指令数 + 常量 + 内存偏移），
+比之前以为的 60+ 多得多。以后扩规则**先查这张表**，不要重复反汇编。
+
+其中已识别但未实现的高价值部件：
+- `SeckillCombo`（`0x27bc54c` 等 6 个函数）：**秒杀连招**，含 `CalComboHurt` / `CalRealHurt` /
+  `CheckAllSkillUsable` / `GetNextSkillDis` —— 需要逐英雄连招表，不随包。
+- `AtkUnit` / `AtkUnitUseSkill`（`0x27e9154` / `0x27e9544`）：攻击单位 + 技能选择。
+- `ChooseFindTargetWhenRule`（`0x27e51a0`）：规则态下的目标选择。
+- 11 条英雄专属技能规则（`UseSunquanSkill3` 等）：必须逐英雄真机标定。

@@ -64,7 +64,8 @@ def mumu_render_hwnd(manager_paths=None, vm_index=0):
     from pathlib import Path
 
     defaults = [
-        r"E:\MuMuPlayer\nx_main\MuMuManager.exe",
+        r"D:\app\MuMuPlayer\nx_main\MuMuManager.exe",
+
         r"C:\Program Files\Netease\MuMu Player 12\shell\MuMuManager.exe",
         r"D:\Program Files\Netease\MuMu Player 12\shell\MuMuManager.exe",
         r"C:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe",

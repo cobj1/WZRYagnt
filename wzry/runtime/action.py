@@ -44,6 +44,10 @@ class Action:
     occupies_screen: bool = False
     requires_screen: bool = True
     on_fail: str = "abort_task"
+    # 决策语义（非执行原语）：保留给日志、回放与审计；执行器可用 duration_ms
+    # 还原"持续按住"的时长。params 里不再重复这两个键。
+    reason: str = ""
+    duration_ms: int | None = None
 
     def __post_init__(self) -> None:
         if self.type not in ACTION_TYPES:
@@ -54,6 +58,8 @@ class Action:
             raise ValueError(f"非法 on_fail: {self.on_fail}")
         if int(self.deadline_ms) <= 0:
             raise ValueError("deadline_ms 必须为正")
+        if self.duration_ms is not None and int(self.duration_ms) <= 0:
+            raise ValueError("duration_ms 必须为正")
 
     @property
     def critical(self) -> bool:
@@ -75,6 +81,8 @@ class Action:
             "occupies_screen": bool(self.occupies_screen),
             "requires_screen": bool(self.requires_screen),
             "on_fail": self.on_fail,
+            "reason": self.reason,
+            "duration_ms": self.duration_ms,
         }
 
     @classmethod
@@ -90,7 +98,35 @@ class Action:
             occupies_screen=bool(payload.get("occupies_screen", False)),
             requires_screen=bool(payload.get("requires_screen", True)),
             on_fail=str(payload.get("on_fail", "abort_task")),
+            reason=str(payload.get("reason") or ""),
+            duration_ms=(int(payload["duration_ms"])
+                         if payload.get("duration_ms") is not None else None),
         )
+
+    @classmethod
+    def from_decision(cls, payload: dict[str, Any]) -> "Action | None":
+        """决策 dict -> Action；none/stick_* 返回 None。"""
+        if not isinstance(payload, dict) or payload.get("type") not in ACTION_TYPES:
+            return None
+        duration = payload.get("duration_ms")
+        params = {k: v for k, v in payload.items()
+                  if k not in ("type", "reason", "duration_ms")}
+        return cls(
+            type=str(payload["type"]),
+            params=params,
+            deadline_ms=int(duration or 250),
+            reason=str(payload.get("reason") or ""),
+            duration_ms=int(duration) if duration else None,
+        )
+
+    def to_legacy_dict(self) -> dict[str, Any]:
+        """还原执行器使用的 dict；与 from_decision 逐键等价。"""
+        out: dict[str, Any] = {"type": self.type, **dict(self.params)}
+        if self.reason:
+            out["reason"] = self.reason
+        if self.duration_ms is not None:
+            out["duration_ms"] = int(self.duration_ms)
+        return out
 
     @classmethod
     def for_type(

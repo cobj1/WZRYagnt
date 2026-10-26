@@ -21,6 +21,7 @@ configs/board.json
 runs/
 models/
 logs/
+/runtime/
 /data/
 /temp/
 out/

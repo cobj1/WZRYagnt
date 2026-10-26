@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]   # scripts/ -> E:\WZRYagent
+ROOT = Path(__file__).resolve().parents[1]   # 相对 WZRYagnt 仓根
 OUT = ROOT / "configs" / "evolved_policy.json"
 
 # 状态关键特征桶化 (离散化): hp_bin, n_enemy, n_red, n_blue, 近敌, dead

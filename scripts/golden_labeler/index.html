@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>golden 标注台</title>
+<style>
+:root{
+  --bg:#0b0d11; --panel:#141821; --panel2:#1b2130; --line:#252c3b;
+  --fg:#e6ebf5; --muted:#8794ab; --accent:#4da3ff; --ok:#3ddc84;
+  --warn:#ffb84d; --err:#ff5a5f;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--fg); overflow:hidden;
+  font:13px/1.5 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;
+  display:flex; flex-direction:column;
+}
+button{font:inherit; color:inherit; cursor:pointer}
+.top{
+  display:flex; align-items:center; gap:14px; padding:8px 14px;
+  background:var(--panel); border-bottom:1px solid var(--line); flex:0 0 auto;
+}
+.brand{font-weight:700; letter-spacing:.3px; white-space:nowrap}
+.brand span{color:var(--accent)}
+.stat{color:var(--muted); white-space:nowrap}
+.stat b{color:var(--fg); font-variant-numeric:tabular-nums}
+.pos{font-variant-numeric:tabular-nums; background:var(--panel2); border:1px solid var(--line);
+  border-radius:6px; padding:2px 8px; white-space:nowrap}
+.classes{display:flex; gap:5px; overflow-x:auto; padding-bottom:2px; flex:1; min-width:0}
+.chip{
+  border:1px solid var(--line); background:var(--panel2); border-radius:999px;
+  padding:3px 9px; white-space:nowrap; display:flex; align-items:center; gap:5px;
+  font-size:12px; color:var(--muted); flex:0 0 auto;
+}
+.chip:hover{border-color:#3a4560; color:var(--fg)}
+.chip.on{color:#fff; border-color:var(--accent); background:#123152}
+.chip i{width:8px;height:8px;border-radius:2px;display:inline-block}
+.chip kbd{font:11px/1 ui-monospace,Consolas,monospace; background:#0d1220; border:1px solid var(--line);
+  border-radius:3px; padding:2px 3px; color:#9fb0cc}
+.warnbar{
+  flex:0 0 auto; padding:6px 14px; background:#2a1a1d; color:#ffc9cb;
+  border-bottom:1px solid #4a2529; font-size:12.5px; display:flex; gap:10px; align-items:center;
+}
+.warnbar b{color:#ff8f93}
+.warnbar.dup{background:#2a2413; border-bottom-color:#4a3f1d; color:#ffe1a8}
+.warnbar.dup b{color:#ffcc66}
+.warnbar[hidden]{display:none}
+main{flex:1; display:flex; min-height:0}
+.stage{flex:1; position:relative; min-width:0; background:#080a0e; overflow:hidden}
+#cv{position:absolute; inset:0; width:100%; height:100%; display:block; cursor:crosshair; touch-action:none}
+.empty{
+  position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  color:var(--muted); font-size:14px; pointer-events:none; text-align:center; padding:20px;
+}
+.empty[hidden]{display:none}
+.hud{
+  position:absolute; right:10px; bottom:10px; background:rgba(15,19,28,.88);
+  border:1px solid var(--line); border-radius:8px; padding:8px 10px; min-width:190px;
+  font-size:11.5px; color:var(--muted); backdrop-filter:blur(4px); pointer-events:none;
+}
+.hud div{display:flex; justify-content:space-between; gap:14px; white-space:nowrap}
+.hud b{color:var(--fg); font-weight:600; font-variant-numeric:tabular-nums}
+.bad{color:var(--err)!important; font-weight:700}
+aside{
+  width:336px; flex:0 0 336px; border-left:1px solid var(--line); background:var(--panel);
+  display:flex; flex-direction:column; min-height:0;
+}
+.phead{
+  padding:7px 11px; font-size:11.5px; letter-spacing:.4px; text-transform:uppercase;
+  color:var(--muted); border-bottom:1px solid var(--line); display:flex; align-items:center;
+  gap:8px; justify-content:space-between; flex:0 0 auto;
+}
+.phead label{text-transform:none; letter-spacing:0; display:flex; align-items:center; gap:5px; cursor:pointer}
+.boxes{max-height:34%; overflow:auto; padding:6px; flex:0 0 auto}
+.muted{color:var(--muted); font-size:12px; padding:4px 6px}
+.brow{display:flex; align-items:center; gap:7px; padding:4px 6px; border-radius:5px; cursor:pointer}
+.brow:hover{background:var(--panel2)}
+.brow.active{background:#123152}
+.brow .sw{width:9px;height:9px;border-radius:2px;flex:0 0 auto}
+.brow .bc{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.brow .bn{color:var(--muted); font-size:11px; font-variant-numeric:tabular-nums}
+.brow button{
+  background:transparent; border:0; color:var(--muted); font-size:15px; line-height:1;
+  padding:0 3px; border-radius:3px;
+}
+.brow button:hover{color:var(--err); background:#2a1a1d}
+.noterow{padding:0 8px 8px; flex:0 0 auto}
+.noterow input{
+  width:100%; background:var(--bg); border:1px solid var(--line); color:var(--fg);
+  border-radius:6px; padding:6px 8px; font:inherit; font-size:12px;
+}
+.noterow input:focus{outline:none; border-color:var(--accent)}
+.list{flex:1; overflow:auto; min-height:0}
+.row{
+  display:flex; align-items:center; gap:7px; padding:5px 10px; cursor:pointer;
+  border-left:2px solid transparent; font-size:12px;
+}
+.row:hover{background:var(--panel2)}
+.row.active{background:#123152; border-left-color:var(--accent)}
+.row.nontest{opacity:.62}
+.row .dot{width:7px;height:7px;border-radius:50%;background:#3a4560;flex:0 0 auto}
+.row .dot.saved{background:var(--ok)}
+.row .dot.skip{background:#6b7891}
+.row .dot.flag{background:var(--err)}
+.row .fn{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  font-family:ui-monospace,Consolas,monospace; font-size:11.5px}
+.tag{font-size:10px; padding:1px 5px; border-radius:4px; background:#1d2536; color:var(--muted); flex:0 0 auto}
+.tag.test{background:#123a26; color:#7ee2a8}
+.tag.train{background:#3a1618; color:#ff9a9e}
+.tag.val{background:#3a2f16; color:#ffd28a}
+.tag.unknown{background:#2a2a2a; color:#aaa}
+.dup{font-size:10px; font-weight:700; color:#ffcc66; border:1px solid #6b5a24; border-radius:3px; padding:0 3px}
+.check{color:var(--ok); font-weight:700}
+footer{
+  flex:0 0 auto; padding:5px 14px; background:var(--panel); border-top:1px solid var(--line);
+  color:var(--muted); font-size:11.5px; display:flex; flex-wrap:wrap; gap:12px;
+}
+footer kbd{font:11px/1 ui-monospace,Consolas,monospace; background:#0d1220; border:1px solid var(--line);
+  border-radius:3px; padding:2px 4px; color:#c7d4ea}
+.toast{
+  position:fixed; left:50%; bottom:44px; transform:translate(-50%,10px); opacity:0;
+  background:#1d2637; border:1px solid var(--line); border-radius:8px; padding:8px 16px;
+  pointer-events:none; transition:.18s; font-size:12.5px; max-width:70vw; text-align:center;
+}
+.toast.show{opacity:1; transform:translate(-50%,0)}
+.toast.ok{border-color:#2a5a3d; color:#a8f0c6}
+.toast.err{border-color:#5a2a2d; color:#ffc0c2}
+</style>
+</head>
+<body>
+<div class="top">
+  <div class="brand">golden <span>标注台</span></div>
+  <div class="pos" id="pos">0/0</div>
+  <div class="stat" id="stat">已标注 <b>0</b></div>
+  <div class="stat" id="dupstat"></div>
+  <div class="classes" id="classes"></div>
+</div>
+<div class="warnbar" id="warnbar" hidden></div>
+
+<main>
+  <section class="stage" id="stage">
+    <canvas id="cv"></canvas>
+    <div class="empty" id="empty">正在加载…</div>
+    <div class="hud" id="hud"></div>
+  </section>
+  <aside>
+    <div class="phead"><span>当前帧标注框 <b id="boxcount">0</b></span><span id="prefillhint" class="muted" style="padding:0"></span></div>
+    <div class="boxes" id="boxes"></div>
+    <div class="noterow"><input id="note" placeholder="备注（D 标记重复/坏图时建议写原因）" maxlength="200"></div>
+    <div class="phead">
+      <span>帧列表 <b id="listcount"></b></span>
+      <label><input type="checkbox" id="testonly" checked> 只看 test</label>
+    </div>
+    <div class="list" id="list"></div>
+  </aside>
+</main>
+
+<footer>
+  <span><kbd>1</kbd>–<kbd>9</kbd> 选类别</span>
+  <span>拖拽画框 / 拖动框体移动 / 抓角缩放</span>
+  <span><kbd>Backspace</kbd> 删框</span>
+  <span><kbd>Enter</kbd> 保存并下一张</span>
+  <span><kbd>U</kbd> 撤销</span>
+  <span><kbd>S</kbd> 跳过</span>
+  <span><kbd>D</kbd> 重复/坏图</span>
+  <span><kbd>←</kbd><kbd>→</kbd> 翻帧</span>
+</footer>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const COLORS = ["#ff6b6b","#4dabf7","#fcc419","#51cf66","#ff922b","#22b8cf",
+                "#e64980","#845ef7","#94d82d","#f06595","#20c997"];
+
+let MANIFEST = null;
+let ITEMS = [];
+let ORDER = [];
+let CUR = 0;
+let item = null;
+let boxes = [];
+let sel = -1;
+let curCls = 0;
+let testOnly = true;
+let img = null;
+let view = { s: 1, ox: 0, oy: 0 };
+let drag = null;
+let dpr = window.devicePixelRatio || 1;
+const imgCache = new Map();
+const cv = $("#cv");
+const stage = $("#stage");
+const ctx = cv.getContext("2d");
+
+/* ------------------------------------------------ 启动 */
+async function boot() {
+  try {
+    const r = await fetch("/api/manifest");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    MANIFEST = await r.json();
+  } catch (e) {
+    $("#empty").textContent = "无法读取 /api/manifest：" + e.message;
+    return;
+  }
+  ITEMS = MANIFEST.items || [];
+  buildClasses();
+  $("#dupstat").textContent = MANIFEST.counts.dup_groups
+    ? `MD5 重复 ${MANIFEST.counts.dup_groups} 组 / ${MANIFEST.counts.dup_images} 张`
+    : "";
+  applyFilter(null);
+  new ResizeObserver(() => layout()).observe(stage);
+}
+
+function buildClasses() {
+  const names = MANIFEST.class_names || [];
+  $("#classes").innerHTML = names.map((n, i) =>
+    `<button class="chip${i === curCls ? " on" : ""}" data-cls="${i}" title="${n}">
+       <i style="background:${color(i)}"></i>${i < 9 ? `<kbd>${i + 1}</kbd>` : ""}${n}
+     </button>`).join("");
+  $("#classes").onclick = (e) => {
+    const b = e.target.closest(".chip");
+    if (b) setCls(+b.dataset.cls);
+  };
+}
+
+function applyFilter(keepId) {
+  testOnly = $("#testonly").checked;
+  ORDER = [];
+  ITEMS.forEach((it, i) => { if (!testOnly || it.split === "test") ORDER.push(i); });
+  CUR = 0;
+  if (keepId) {
+    const p = ORDER.findIndex((i) => ITEMS[i].id === keepId);
+    if (p >= 0) CUR = p;
+  }
+  renderList();
+  loadCurrent();
+}
+
+/* ------------------------------------------------ 帧切换 */
+function loadCurrent() {
+  if (!ORDER.length) {
+    item = null; boxes = []; sel = -1; img = null;
+    $("#empty").hidden = false;
+    $("#empty").textContent = testOnly
+      ? "没有可标注的 test 帧。取消勾选「只看 test」可查看全部图片。"
+      : "当前目录没有图片。";
+    draw(); updateHead(); updateBoxes(); $("#hud").innerHTML = ""; return;
+  }
+  item = ITEMS[ORDER[CUR]];
+  boxes = (item.status === "saved" ? (item.boxes || []) : (item.prefill || [])).map((b) => ({ ...b }));
+  sel = -1;
+  $("#note").value = item.note || "";
+  $("#empty").hidden = false;
+  $("#empty").textContent = "加载图片…";
+  updateHead(); updateBoxes(); updateMeta(); renderActive();
+  loadImage(item);
+}
+
+function loadImage(it) {
+  const cached = imgCache.get(it.id);
+  if (cached && cached.complete && cached.naturalWidth) { img = cached; layout(); return; }
+  const im = new Image();
+  im.onload = () => { if (item && item.id === it.id) { img = im; layout(); } };
+  im.onerror = () => {
+    if (item && item.id === it.id) { img = null; $("#empty").hidden = false; $("#empty").textContent = "图片加载失败：" + it.name; draw(); }
+  };
+  im.src = "/img/" + encodeURIComponent(it.name) + "?v=" + it.md5.slice(0, 8);
+  imgCache.set(it.id, im);
+  img = null;
+  draw();
+}
+
+function layout() {
+  const r = stage.getBoundingClientRect();
+  cv.width = Math.max(1, Math.round(r.width * dpr));
+  cv.height = Math.max(1, Math.round(r.height * dpr));
+  if (img && img.naturalWidth) {
+    const s = Math.min(r.width / img.naturalWidth, r.height / img.naturalHeight);
+    view = { s, ox: (r.width - img.naturalWidth * s) / 2, oy: (r.height - img.naturalHeight * s) / 2 };
+  } else {
+    view = { s: 1, ox: 0, oy: 0 };
+  }
+  draw();
+}
+
+/* ------------------------------------------------ 绘制 */
+function color(cls) { return COLORS[cls % COLORS.length]; }
+
+function draw() {
+  const r = stage.getBoundingClientRect();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, r.width, r.height);
+  if (img && img.naturalWidth) {
+    $("#empty").hidden = true;
+    ctx.drawImage(img, view.ox, view.oy, img.naturalWidth * view.s, img.naturalHeight * view.s);
+  }
+  boxes.forEach((b, i) => drawBox(b, i === sel, false));
+  if (drag && drag.mode === "new" && drag.box) drawBox(drag.box, true, true);
+}
+
+function drawBox(b, active, dashed) {
+  const x = view.ox + b.x1 * view.s;
+  const y = view.oy + b.y1 * view.s;
+  const w = (b.x2 - b.x1) * view.s;
+  const h = (b.y2 - b.y1) * view.s;
+  const c = color(b.cls);
+  ctx.save();
+  if (dashed) ctx.setLineDash([5, 4]);
+  ctx.lineWidth = active ? 2.5 : 1.5;
+  ctx.strokeStyle = c;
+  ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+  ctx.setLineDash([]);
+  const label = (b.cls + 1) + " " + ((MANIFEST.class_names || [])[b.cls] || b.cls);
+  ctx.font = "600 11px ui-monospace,Consolas,monospace";
+  const tw = ctx.measureText(label).width;
+  const ly = y > 15 ? y - 15 : y + 1;
+  ctx.fillStyle = c;
+  ctx.fillRect(x, ly, tw + 8, 14);
+  ctx.fillStyle = "#08111c";
+  ctx.fillText(label, x + 4, ly + 10.5);
+  if (active) {
+    ctx.fillStyle = "#fff";
+    ctx.strokeStyle = "#0b0d11";
+    ctx.lineWidth = 1;
+    [[b.x1, b.y1], [b.x2, b.y1], [b.x1, b.y2], [b.x2, b.y2]].forEach(([px, py]) => {
+      const sx = view.ox + px * view.s, sy = view.oy + py * view.s;
+      ctx.fillRect(sx - 3.5, sy - 3.5, 7, 7);
+      ctx.strokeRect(sx - 3.5, sy - 3.5, 7, 7);
+    });
+  }
+  ctx.restore();
+}
+
+/* ------------------------------------------------ 交互 */
+function toImg(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left - view.ox) / view.s, y: (e.clientY - r.top - view.oy) / view.s };
+}
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function hitTest(x, y) {
+  const tol = 9 / view.s;
+  for (let i = boxes.length - 1; i >= 0; i--) {
+    const b = boxes[i];
+    if (x < b.x1 - tol || x > b.x2 + tol || y < b.y1 - tol || y > b.y2 + tol) continue;
+    const l = Math.abs(x - b.x1) < tol, rr = Math.abs(x - b.x2) < tol;
+    const t = Math.abs(y - b.y1) < tol, bb = Math.abs(y - b.y2) < tol;
+    if (l && t) return { i, mode: "nw" };
+    if (rr && t) return { i, mode: "ne" };
+    if (l && bb) return { i, mode: "sw" };
+    if (rr && bb) return { i, mode: "se" };
+    if (l) return { i, mode: "w" };
+    if (rr) return { i, mode: "e" };
+    if (t) return { i, mode: "n" };
+    if (bb) return { i, mode: "s" };
+    return { i, mode: "move" };
+  }
+  return null;
+}
+
+cv.addEventListener("pointerdown", (e) => {
+  if (!item || !img || e.button !== 0) return;
+  cv.setPointerCapture(e.pointerId);
+  const p = toImg(e);
+  const hit = hitTest(p.x, p.y);
+  if (hit) {
+    sel = hit.i;
+    drag = { mode: hit.mode, i: hit.i, start: p, orig: { ...boxes[hit.i] } };
+  } else {
+    sel = -1;
+    drag = { mode: "new", start: p, box: { cls: curCls, x1: p.x, y1: p.y, x2: p.x, y2: p.y } };
+  }
+  updateBoxes();
+  draw();
+});
+
+cv.addEventListener("pointermove", (e) => {
+  if (!drag || !item || !img) return;
+  const W = item.width, H = item.height;
+  const p = toImg(e);
+  const x = clamp(p.x, 0, W), y = clamp(p.y, 0, H);
+
+  if (drag.mode === "new") {
+    drag.box.x1 = Math.min(drag.start.x, x);
+    drag.box.y1 = Math.min(drag.start.y, y);
+    drag.box.x2 = Math.max(drag.start.x, x);
+    drag.box.y2 = Math.max(drag.start.y, y);
+  } else if (drag.mode === "move") {
+    const o = drag.orig;
+    const dx = clamp(x - drag.start.x, -o.x1, W - o.x2);
+    const dy = clamp(y - drag.start.y, -o.y1, H - o.y2);
+    boxes[drag.i] = { cls: o.cls, x1: o.x1 + dx, y1: o.y1 + dy, x2: o.x2 + dx, y2: o.y2 + dy };
+  } else {
+    const o = drag.orig;
+    const b = { ...o };
+    if (drag.mode.includes("w")) b.x1 = clamp(x, 0, o.x2 - 3);
+    if (drag.mode.includes("e")) b.x2 = clamp(x, o.x1 + 3, W);
+    if (drag.mode.includes("n")) b.y1 = clamp(y, 0, o.y2 - 3);
+    if (drag.mode.includes("s")) b.y2 = clamp(y, o.y1 + 3, H);
+    boxes[drag.i] = b;
+  }
+  draw();
+});
+
+cv.addEventListener("pointerup", () => {
+  if (!drag) return;
+  if (drag.mode === "new") {
+    const b = drag.box;
+    if (b && b.x2 - b.x1 > 3 && b.y2 - b.y1 > 3) {
+      boxes.push({ cls: b.cls, x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 });
+      sel = boxes.length - 1;
+    } else {
+      sel = -1;
+    }
+  }
+  drag = null;
+  updateBoxes();
+  draw();
+});
+
+cv.addEventListener("dblclick", (e) => {
+  if (!item || !img) return;
+  const p = toImg(e);
+  const hit = hitTest(p.x, p.y);
+  if (hit) {
+    boxes.splice(hit.i, 1);
+    sel = -1;
+    updateBoxes();
+    draw();
+    toast("已删除该框");
+  }
+});
+
+/* ------------------------------------------------ 面板 */
+function updateHead() {
+  const scope = testOnly ? ITEMS.filter((i) => i.split === "test") : ITEMS;
+  const done = scope.filter((i) => i.status === "saved").length;
+  $("#stat").innerHTML = `已标注 <b>${done}</b> / ${scope.length}${testOnly ? " test" : ""}`;
+  $("#pos").textContent = ORDER.length ? `${CUR + 1}/${ORDER.length}` : "0/0";
+  const wb = $("#warnbar");
+  const msgs = [];
+  let kind = "";
+  if (item) {
+    if (item.split !== "test") {
+      msgs.push(`<b>split=${item.split}</b> — golden 只允许 test 帧，保存已被拒绝，请按 <b>S</b> 跳过`);
+      kind = "err";
+    }
+    if (item.dup_count > 1) {
+      const same = ITEMS.filter((i) => i.md5 === item.md5).map((i) => i.name.replace(/^.*__/, "")).slice(0, 4).join("、");
+      msgs.push(`<b>MD5 重复</b> 同图出现 ${item.dup_count} 次（${same}${item.dup_count > 4 ? " …" : ""}）——确认是同一画面后按 <b>D</b> 标记`);
+      kind = kind === "err" ? "err" : "dup";
+    }
+  }
+  if (!msgs.length) { wb.hidden = true; wb.innerHTML = ""; wb.className = "warnbar"; }
+  else { wb.hidden = false; wb.className = "warnbar" + (kind === "dup" ? " dup" : ""); wb.innerHTML = msgs.join(" &nbsp;|&nbsp; "); }
+}
+
+function updateMeta() {
+  if (!item) { $("#hud").innerHTML = ""; return; }
+  const bad = item.split !== "test";
+  const pf = (item.prefill || []).length;
+  const src = item.prefill_source ? item.prefill_source.split("/")[0] : "无预填";
+  $("#hud").innerHTML = `
+    <div><span>game_id</span><b>${item.game_id}</b></div>
+    <div><span>split</span><b class="${bad ? "bad" : ""}">${item.split}${bad ? " 禁止标注" : ""}</b></div>
+    <div><span>frame</span><b>${item.frame_id ?? "-"}</b></div>
+    <div><span>md5</span><b>${item.md5.slice(0, 8)}</b></div>
+    <div><span>尺寸</span><b>${item.width}×${item.height}</b></div>
+    <div><span>预填</span><b>${pf} 框 · ${src}</b></div>`;
+  $("#prefillhint").textContent = pf ? `预填 ${pf} 框` : "无预填";
+}
+
+function updateBoxes() {
+  $("#boxcount").textContent = boxes.length;
+  const el = $("#boxes");
+  if (!boxes.length) {
+    el.innerHTML = `<div class="muted">暂无框。在画面上拖拽新建，或切换其他帧。</div>`;
+    return;
+  }
+  el.innerHTML = boxes.map((b, i) => `
+    <div class="brow${i === sel ? " active" : ""}" data-i="${i}">
+      <span class="sw" style="background:${color(b.cls)}"></span>
+      <span class="bc">${b.cls + 1} ${(MANIFEST.class_names || [])[b.cls] || b.cls}</span>
+      <span class="bn">${Math.round(b.x2 - b.x1)}×${Math.round(b.y2 - b.y1)}</span>
+      <button data-del="${i}" title="删除">×</button>
+    </div>`).join("");
+}
+$("#boxes").onclick = (e) => {
+  const del = e.target.closest("[data-del]");
+  if (del) {
+    boxes.splice(+del.dataset.del, 1);
+    sel = -1; updateBoxes(); draw(); return;
+  }
+  const row = e.target.closest(".brow");
+  if (row) { sel = +row.dataset.i; updateBoxes(); draw(); }
+};
+
+function renderList() {
+  $("#list").innerHTML = ORDER.map((idx, pos) => {
+    const it = ITEMS[idx];
+    const st = it.status || "unlabeled";
+    const dup = it.dup_count > 1 ? `<span class="dup" title="MD5 与其它帧相同">D</span>` : "";
+    return `<div class="row${pos === CUR ? " active" : ""}${it.split !== "test" ? " nontest" : ""}" data-pos="${pos}">
+      <span class="dot ${st}"></span>
+      <span class="fn" title="${it.name}">${it.name.replace(/^.*__/, "")} · ${it.session.slice(-6)}</span>
+      ${dup}
+      <span class="tag ${it.split}">${it.split}</span>
+      ${st === "saved" ? `<span class="check">✓</span>` : ""}
+    </div>`;
+  }).join("");
+  $("#listcount").textContent = ORDER.length + " 帧";
+}
+function renderActive() {
+  document.querySelectorAll("#list .row").forEach((r) => {
+    const on = +r.dataset.pos === CUR;
+    r.classList.toggle("active", on);
+    if (on) r.scrollIntoView({ block: "nearest" });
+  });
+}
+$("#list").onclick = (e) => {
+  const row = e.target.closest(".row");
+  if (!row) return;
+  CUR = +row.dataset.pos;
+  loadCurrent();
+};
+$("#testonly").onchange = () => applyFilter(item ? item.id : null);
+
+/* ------------------------------------------------ 动作 */
+function setCls(i) {
+  if (!MANIFEST || i < 0 || i >= (MANIFEST.class_names || []).length) return;
+  curCls = i;
+  document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("on", +c.dataset.cls === i));
+  if (sel >= 0 && boxes[sel]) { boxes[sel].cls = i; updateBoxes(); draw(); }
+  toast("当前类别：" + (MANIFEST.class_names[i] || i));
+}
+
+function next() { if (!ORDER.length) return; CUR = (CUR + 1) % ORDER.length; loadCurrent(); }
+function prev() { if (!ORDER.length) return; CUR = (CUR - 1 + ORDER.length) % ORDER.length; loadCurrent(); }
+
+function goNextUnlabeled() {
+  if (!ORDER.length) return;
+  for (let k = 1; k <= ORDER.length; k++) {
+    const p = (CUR + k) % ORDER.length;
+    if (ITEMS[ORDER[p]].status === "unlabeled") { CUR = p; loadCurrent(); return; }
+  }
+  toast("这一轮都过完了，按 → 复核已标注帧", "ok");
+}
+
+async function post(url, payload) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  let j = {};
+  try { j = await r.json(); } catch (_) { j = { error: "响应不是 JSON" }; }
+  return { ok: r.ok, status: r.status, data: j };
+}
+
+async function save(action) {
+  if (!item) return;
+  if (item.split !== "test" || item.width <= 0) {
+    toast(`split=${item.split}，golden 只允许 test，保存已拒绝`, "err");
+    return;
+  }
+  if (action === "save" && !boxes.length && !confirm("这一帧没有任何框，仍保存为空标注？")) return;
+  const note = $("#note").value.trim();
+  const payload = {
+    id: item.id,
+    boxes: boxes.map((b) => ({ cls: b.cls, x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 })),
+    verified: true,
+    note,
+    action,
+    labeler: MANIFEST.labeler,
+  };
+  const res = await post("/api/save", payload);
+  if (!res.ok) { toast(res.data.error || "保存失败", "err"); return; }
+  item.status = action === "save" ? "saved" : action;
+  item.boxes = action === "save" ? boxes.map((b) => ({ ...b })) : [];
+  item.note = note;
+  item.labeled_at = res.data.ts;
+  updateHead(); renderList(); renderActive();
+  toast(action === "save" ? `已保存 ${boxes.length} 个框` :
+        action === "skip" ? "已跳过" : "已标记重复/坏图", "ok");
+  goNextUnlabeled();
+}
+
+async function undo() {
+  if (!item) return;
+  const keep = item.id;
+  const res = await post("/api/undo", { id: keep, labeler: MANIFEST.labeler });
+  if (!res.ok) { toast(res.data.error || "撤销失败", "err"); return; }
+  const r = await fetch("/api/manifest");
+  MANIFEST = await r.json();
+  ITEMS = MANIFEST.items;
+  const pos = CUR;
+  applyFilter(keep);
+  if (!ORDER.length) return;
+  CUR = Math.min(pos, ORDER.length - 1);
+  loadCurrent();
+  toast("已撤销该帧最近一条记录", "ok");
+}
+
+let toastTimer = null;
+function toast(msg, kind) {
+  const el = $("#toast");
+  el.textContent = msg;
+  el.className = "toast show " + (kind || "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = "toast"; }, 2400);
+}
+
+/* ------------------------------------------------ 键盘 */
+window.addEventListener("keydown", (e) => {
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) {
+    if (e.key === "Escape") t.blur();
+    return;
+  }
+  if (e.isComposing || e.ctrlKey || e.altKey || e.metaKey) return;
+  const k = e.key;
+  if (k >= "1" && k <= "9") { setCls(+k - 1); e.preventDefault(); return; }
+  if (k === "Backspace" || k === "Delete") {
+    if (boxes.length) {
+      const i = sel >= 0 ? sel : boxes.length - 1;
+      boxes.splice(i, 1);
+      sel = -1; updateBoxes(); draw(); toast("已删除 1 个框");
+    }
+    e.preventDefault(); return;
+  }
+  if (k === "Enter") { save("save"); e.preventDefault(); return; }
+  if (k === "u" || k === "U") { undo(); return; }
+  if (k === "s" || k === "S") { save("skip"); return; }
+  if (k === "d" || k === "D") { save("flag"); return; }
+  if (k === "ArrowRight" || k === "n" || k === "N") { next(); return; }
+  if (k === "ArrowLeft" || k === "p" || k === "P") { prev(); return; }
+  if (k === "Escape") { sel = -1; updateBoxes(); draw(); }
+});
+
+window.addEventListener("resize", () => { dpr = window.devicePixelRatio || 1; layout(); });
+boot();
+</script>
+</body>
+</html>

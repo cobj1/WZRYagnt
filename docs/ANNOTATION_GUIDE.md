@@ -1,25 +1,33 @@
-# 11 类标注复核与扩充指引（M1）
+# 标注复核与扩充指引（M1 · 历史指南，当前 13 类）
 
-> 目标：把现有 4 类标签（已迁移为 11 类 id）复核正确，并补标缺失的 6 类
-> （ally_hero / ally_minion / ally_turret / 水晶 / 野怪 / skill_effect），
-> 为 11 类 YOLO 重训准备数据。
+> **2026-10-25 现状**：当前类别定义以 `configs/classes.json` 为准，共 **13 类**
+> （比早期 M1 多出 `dragon`、`jungle_buff`，`hook_aim`/`skill_effect` 顺延到 11/12）。
+> `scripts/vision/annotate.py` 与 `scripts/train/prepare_dataset.py` 都已读取这份配置。
+>
+> **数据缺失**：本文写作时的 `data/screenshots/zhongkui`、`data/yolo_dataset/zhongkui`
+> 与 `models/yolo/yolov8n.pt` 已不在当前工作区；下文的 1379 框等数字是历史快照，不能当作现状。
+> 重做标注前需先恢复截图与标签，并按下面的 13 类 id 检查旧标签（旧 9/10 需要重映射到 11/12）。
 
-## 现状
+## 当前类别（`configs/classes.json`）
 
-| 类 id | 类名 | 框数 | 状态 |
-|---|---|---|---|
-| 0 | enemy_hero | 454 | ✅ 已标注 |
-| 1 | ally_hero | 0 | ❌ 待补标 |
-| 2 | enemy_minion | 622 | ⚠️ 含歧义（可能混有 ally_minion，需复核） |
-| 3 | ally_minion | 0 | ❌ 待补标 |
-| 4 | enemy_turret | 253 | ⚠️ 含歧义（可能混有 ally_turret，需复核） |
-| 5 | ally_turret | 0 | ❌ 待补标 |
-| 6/7 | enemy/ally_crystal | 0 | ❌ 待补标（水晶） |
-| 8 | neutral_monster | 0 | ❌ 待补标（野怪） |
-| 9 | hook_aim | 50 | ✅ 已标注 |
-| 10 | skill_effect | 0 | ❌ 待补标（技能特效，钟馗钩子/大招） |
+| id | 类名 | 说明 |
+|---:|---|---|
+| 0 | enemy_hero | 敌方英雄 |
+| 1 | ally_hero | 我方/友方英雄 |
+| 2 | enemy_minion | 敌方小兵 |
+| 3 | ally_minion | 我方小兵 |
+| 4 | enemy_turret | 敌方防御塔 |
+| 5 | ally_turret | 我方防御塔 |
+| 6 | enemy_crystal | 敌方水晶 |
+| 7 | ally_crystal | 我方水晶 |
+| 8 | neutral_monster | 中立野怪 |
+| 9 | dragon | 暴君/主宰等龙类 |
+| 10 | jungle_buff | 红/蓝 Buff |
+| 11 | hook_aim | 钟馗钩子瞄准指示 |
+| 12 | skill_effect | 技能特效 |
 
-总计 1379 框（train 572 + val 120 + screenshots 687），平均 2.96 框/图。
+> 早期 M1 的框数（enemy_hero 454、enemy_minion 622、enemy_turret 253、hook_aim 50，
+> 共 1379 框）对应旧 11 类 id，仅作历史参考。
 
 ## 工具用法
 
@@ -27,37 +35,25 @@
 venv\Scripts\python.exe scripts\vision\annotate.py data\screenshots\zhongkui
 ```
 
-按键：`c` 切换类别（11 类循环）｜鼠标拖框｜`l` 加载已有标签｜`s` 保存｜`n/p` 翻页（自动加载+自动保存增删）｜`d` 删除最后一个框｜`q` 退出
+按键：`c` 循环当前类别｜鼠标拖框｜`l` 加载已有标签｜`s` 保存｜`n/p` 翻页（自动加载+自动保存增删）｜`d` 删除最后一个框｜`q` 退出。
 
-## 复核优先级（按收益排序）
+标注完成后用 `prepare_dataset.py` 生成 `data.yaml`（`nc` 与 `names` 直接来自 `configs/classes.json`）。
 
-0. **自动预判（推荐先跑）**：`venv\Scripts\python.exe scripts\train\camp_autolabel.py --include-hero`
-   - 按单位头顶血条颜色（绿=友/红=敌）自动给出阵营建议：
-     主目录 + replay 目录合计 **216 个高置信建议**（ally_hero 31 / ally_minion 152 / ally_turret 33）
-     + 弱倾向分层（CSV 明细 + 血条裁剪图集 temp/camp_check*/）
-   - 先不带 `--apply` 跑，抽查裁剪图集确认准确率；满意后 `--apply` 写入（自动备份 .txt.bak）
-   - 玩红方时加 `--camp red`；replay 目录用 `--img-dir data\screenshots\replay`
-1. **歧义清单**（`data\yolo_dataset\zhongkui\AMBIGUOUS_REVIEW.txt`，294 个文件）：
-   逐张打开，把"实际是友方"的框从 id 2→3（ally_minion）、4→5（ally_turret）。
-   判断依据：兵线位置（离己方塔近的是友方）、颜色（友方血条绿/敌方红，看框内单位血条颜色）。
-2. **补标 ally_hero（id 1）**：训练营/人机局截图里我方英雄与 AI 队友。
-3. **补标 neutral_monster（id 8）**：野区（龙/红蓝 buff/小野怪）截图。
-4. **补标 skill_effect（id 10）**：钟馗 2 技能钩子飞行、1 技能、大招特效帧。
-5. **水晶（id 6/7）**：推水晶时的画面。
+## 复核优先级（数据恢复后）
 
-## 建议采集场景
+1. **旧标签重映射**：旧 9（hook_aim）→ 11，旧 10（skill_effect）→ 12；再补 9/10（dragon/jungle_buff）。
+2. **阵营歧义**：旧 `enemy_minion` / `enemy_turret` 中可能混有友方单位；按血条颜色（绿=友/红=敌）与兵线位置复核。
+3. **补标** `ally_hero`、`ally_minion`、`ally_turret`、`dragon`、`jungle_buff`、`skill_effect`。
+4. 半自动预标注只能覆盖旧 4 类；新类仍需手工框或另训检测器。
 
-- 训练营：选不同英雄当对手，打满 10 分钟，截 200-300 张（脚本 `scripts/vision/capture_screenshots.py`）
-- 人机 5v5：正常对局中采集（能覆盖 ally 兵线/塔/野怪）
-- 推荐**半自动预标注**：`venv\Scripts\python.exe scripts\train\prelabel.py`（已有模型只能标 4 类，
-  新类需手工框）
-
-## 重训流程（标注到位后）
+## 重训流程（数据恢复后）
 
 ```bat
-venv\Scripts\python.exe scripts\train\prepare_dataset.py   :: 同步 screenshots -> yolo_dataset
-:: 训练（11 类）：
-python -m ultralytics.train model=models/yolo/yolov8n.pt data=data/yolo_dataset/zhongkui/data.yaml epochs=100 imgsz=640 batch=8 device=0
+:: 1) 同步 screenshots -> yolo_dataset（类别数来自 configs/classes.json）
+venv\Scripts\python.exe scripts\train\prepare_dataset.py
+
+:: 2) 训练（需要先准备一个 YOLO 权重；当前 models/yolo/yolov8n.pt 不存在）
+venv\Scripts\yolo.exe train model=<你的权重>.pt data=data/yolo_dataset/zhongkui/data.yaml epochs=100 imgsz=640 batch=8 device=0
 ```
 
-注意：`data.yaml` 已更新为 11 类声明；训练前确认各类框数分布（`scripts\train\class_stats.py`）。
+注意：`ultralytics` 当前版本没有 `python -m ultralytics.train` 入口，使用 `yolo.exe` 或 Python API。

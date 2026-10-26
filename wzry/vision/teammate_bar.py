@@ -159,7 +159,7 @@ def detect_enemies(frame, region=(900, 0, 1280, 160)):
 if __name__ == "__main__":
     import numpy as np
     for f in ["s01.png", "s02.png", "s03.png", "s05.png"]:
-        data = np.fromfile(rf"E:\WZRYagent\temp\ann\{f}", dtype=np.uint8)
+        data = np.fromfile(str(Path(__file__).resolve().parents[2] / "temp" / "ann" / f), dtype=np.uint8)
         img = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if img is None:
             print(f"{f}: 无法读取")

@@ -68,6 +68,13 @@ class AdbExecutor:
         self._event_fp = None
         self.last_cmd_ms = 0.0
         self.cmd_count = 0
+        # 通道健康（EXEC-01）：adb 有时 TCP 半开——命令秒回 "device offline"，
+        # 不抛异常也不超时。只靠 _run 的超时重连发现不了，需按返回文本判定。
+        self._online = None
+        self._online_ts = 0.0
+        self.health_checks = 0
+        self.recoveries = 0
+        self.last_error = ""
         # v14.0 坐标空间: 全项目(校准 configs/calibration_absolute.json、小地图 242 空间)
         # 都用 1280x720 帧坐标, 而设备实际可能是 1920x1080 -> tap/swipe 必须按比例缩放。
         # 旧实现在 1080p 设备上会把触点送到 ~67% 位置(技能键全按不中)。
@@ -99,6 +106,8 @@ class AdbExecutor:
     # ---------- 基础命令 ----------
     def _run(self, args, timeout=4):
         """adb 命令: 4s 超时快速失败(防主循环卡死), 失败自动重连一次, 永不抛出。"""
+        if not self.health():
+            return None
         t0 = time.perf_counter()
         try:
             with self._lock:
@@ -108,6 +117,7 @@ class AdbExecutor:
                     errors="replace", timeout=timeout,
                 )
         except subprocess.TimeoutExpired:
+            self._online = False
             self._reconnect()
             with self._lock:
                 try:
@@ -120,6 +130,11 @@ class AdbExecutor:
                     return None
         except Exception:
             return None
+        text = (getattr(r, "stdout", "") or "") + (getattr(r, "stderr", "") or "")
+        if self.looks_offline(text):
+            # 半开连接：命令返回了，但设备已掉线。标记后下一拍 health() 会重连。
+            self._online = False
+            self.last_error = text.strip()[:160]
         self.last_cmd_ms = (time.perf_counter() - t0) * 1000.0
         self.cmd_count += 1
         return r
@@ -131,6 +146,46 @@ class AdbExecutor:
                            encoding="utf-8", errors="replace", timeout=5)
         except Exception:
             pass
+
+    OFFLINE_MARKERS = ("device offline", "no devices", "device not found",
+                       "error: closed", "cannot connect")
+
+    @classmethod
+    def looks_offline(cls, text: str) -> bool:
+        low = (text or "").lower()
+        return any(m in low for m in cls.OFFLINE_MARKERS)
+
+    def health(self, force: bool = False, ttl: float = 2.0) -> bool:
+        """检查 adb 通道是否可用；不可用时尝试重连一次。
+
+        结果缓存 ttl 秒，避免每个动作都多一次 adb 往返。只读探测，不发送输入。
+        """
+        now = time.time()
+        if not force and self._online is not None and now - self._online_ts < ttl:
+            return bool(self._online)
+        self.health_checks += 1
+
+        def _state():
+            try:
+                r = subprocess.run([ADB, "-s", self.serial, "get-state"],
+                                   capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=3)
+                return (r.stdout or "").strip()
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                return ""
+
+        state = _state()
+        if state != "device":
+            self._reconnect()
+            state = _state()
+            if state == "device":
+                self.recoveries += 1
+        self._online = state == "device"
+        self._online_ts = time.time()
+        if not self._online:
+            self.last_error = state or self.last_error or "adb offline"
+        return self._online
 
     def get_device_size(self):
         """读取**当前逻辑显示尺寸**（= adb input 的坐标空间）。

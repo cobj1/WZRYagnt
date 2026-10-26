@@ -1,0 +1,7 @@
+# WZRYagnt runtime + test core dependencies (2026-10-25, from venv)
+numpy==2.5.4
+opencv-python==5.0.0.93
+pillow==12.3.0
+onnxruntime==1.31.0
+torch==2.14.1
+pydantic==2.14.1

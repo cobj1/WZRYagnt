@@ -64,6 +64,16 @@ class OVSession:
         self.compiled = self.core.compile_model(self.model, device)
         self.req = self.compiled.create_infer_request()
         self._out_names = [o.any_name for o in self.compiled.outputs]
+        # 以编译产物为权威修正静态形状：调用方传的 max_len/max_opts 只是“期望值”，
+        # 与 IR 不一致时必须按 IR 走，否则 infer 会以
+        # "The input tensor size is not equal to the model input type" 崩在第一次推理。
+        self.declared_max_len = int(max_len)
+        self.declared_max_opts = int(max_opts)
+        self.max_len, self.max_opts = self._resolve_static_shapes(max_len, max_opts)
+        if self.max_len != self.declared_max_len or self.max_opts != self.declared_max_opts:
+            print(f"[OVSession][警告] 编译形状 L={self.max_len}/K={self.max_opts} "
+                  f"与调用方声明 L={self.declared_max_len}/K={self.declared_max_opts} 不一致, "
+                  f"已按 IR 实际形状运行({self.ir_path})")
         self.calls = 0
         self.truncated = 0      # v14.3 输入超过 max_len 被截断的次数(应由 laya 侧避免)
         self._warned_trunc = False
@@ -79,6 +89,24 @@ class OVSession:
         if not xs:
             return (None, None, 0)
         return (xs[len(xs) // 2], xs[int(0.95 * (len(xs) - 1))], len(xs))
+
+    def _resolve_static_shapes(self, max_len, max_opts):
+        """从编译后的端口读静态形状; 动态维回退到调用方声明值。"""
+        def static_dim(port, idx, default):
+            if port is None:
+                return int(default)
+            try:
+                dim = port.get_partial_shape()[idx]
+                if dim.is_static:
+                    return int(dim.get_length())
+            except Exception:                                # noqa: BLE001
+                pass
+            return int(default)
+
+        inputs = {p.any_name: p for p in self.compiled.inputs}
+        resolved_len = static_dim(inputs.get("input_ids"), 1, max_len)
+        resolved_opts = static_dim(inputs.get("marker_pos"), 1, max_opts)
+        return resolved_len, resolved_opts
 
     # ---- onnxruntime 兼容接口 ----
     def run(self, output_names=None, input_feed=None):

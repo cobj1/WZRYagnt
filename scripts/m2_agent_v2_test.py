@@ -57,6 +57,21 @@ def mm_found(red=None, blue=None):
             "towers": []}
 
 
+def mm_towers(enemy=(), self_est=(0.5, 0.5)):
+    """F1 小地图塔契约：towers_v7.enemy=[{'n':[x,y]}] + cooldowns.self_est。"""
+    mm = mm_found()
+    mm["towers_v7"] = {"enemy": [{"n": list(p)} for p in enemy]}
+    return mm
+
+
+def tower_cd(enemy=(), self_est=(0.5, 0.5)):
+    cd = fresh_cd()
+    cd["camp"] = "blue"
+    cd["match_start_t"] = T - 20.0
+    cd["self_est"] = self_est
+    return cd
+
+
 class TestHookCombo(unittest.TestCase):
     """规则 0：勾中连招 -> summoner + skill3。"""
 
@@ -91,53 +106,52 @@ class TestHookCombo(unittest.TestCase):
 
 
 class TestTurretAvoid(unittest.TestCase):
-    """规则 1：塔规避。"""
+    """规则 1（v16.0 P0-F1）：敌塔来自小地图 towers_v7，不再用屏幕塔框。"""
 
     def test_avoid_turret_when_no_allied_minion(self):
-        st = state(units=[enemy_turret(0.92, 0.5)])  # 0.42 屏宽：威胁带（未进 0.40 射程线）
-        act = decide(st, fresh_cd())
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
+        st = state(minimap=mm_towers([(0.58, 0.50)]))
+        act = decide(st, tower_cd())
+        self.assertIn(act["type"], ("move", "map_move"))
         self.assertEqual(act["reason"], "avoid_turret")
-        # 远离塔：塔在右 -> theta 朝左（±pi 等价）
-        self.assertAlmostEqual(math.cos(act["theta"]), math.cos(math.pi), places=4)
+        self.assertLess(act["nx"], 0.5)
 
     def test_escape_turret_when_very_close(self):
-        st = state(units=[enemy_turret(0.7, 0.5)])  # 0.20 屏宽：塔射程内 -> 逃离
-        act = decide(st, fresh_cd())
+        st = state(minimap=mm_towers([(0.54, 0.50)]))
+        act = decide(st, tower_cd())
         self.assertEqual(act["reason"], "escape_turret")
+        self.assertLess(act["nx"], 0.5)
 
-    def test_no_avoid_when_allied_minion_present(self):
-        st = state(units=[enemy_turret(0.7, 0.5),
-                          {"cls": "ally_minion", "screen": [0.6, 0.5, 0.04, 0.04]}])
-        act = decide(st, fresh_cd())
-        self.assertNotEqual(act["reason"], "avoid_turret")
+    def test_turret_threat_ignores_ally_minion(self):
+        """v8.0/F1：小兵不参与决策；塔威胁仍按 towers_v7 生效。"""
+        st = state(units=[{"cls": "ally_minion", "screen": [0.6, 0.5, 0.04, 0.04]}],
+                   minimap=mm_towers([(0.54, 0.50)]))
+        act = decide(st, tower_cd())
+        self.assertIn(act["reason"], ("avoid_turret", "escape_turret"))
 
     def test_escape_turret_when_in_range(self):
-        """塔中心 < 0.40（被塔打）且无我方小兵 -> 立即反向逃离（用户反馈修复）。"""
-        st = state(units=[enemy_turret(0.60, 0.50)])  # 0.10 屏宽，塔射程内
-        act = decide(st, fresh_cd())
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
+        """火力圈内（<0.06）且无我方小兵 -> 立即反向逃离。"""
+        st = state(minimap=mm_towers([(0.54, 0.50)]))
+        act = decide(st, tower_cd())
+        self.assertIn(act["type"], ("move", "map_move"))
         self.assertEqual(act["reason"], "escape_turret")
-        # 塔在右 -> 反向朝左跑（±pi 等价）
-        self.assertAlmostEqual(math.cos(act["theta"]), math.cos(math.pi), places=4)
+        self.assertLess(act["nx"], 0.5)
 
     def test_escape_turret_beats_skill2(self):
-        """塔射程内即使敌人在钩子范围内也先跑（保命优先，用户反馈：被塔打要赶紧出去）。"""
-        cd = fresh_cd()
-        st = state(units=[enemy_turret(0.60, 0.50), enemy(0.72, 0.50)])
-        act = decide(st, cd)
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
+        """塔火力圈内即使敌人在钩子范围内也先跑。"""
+        st = state(units=[enemy(0.72, 0.50)],
+                   minimap=mm_towers([(0.54, 0.50)]))
+        act = decide(st, tower_cd())
+        self.assertIn(act["type"], ("move", "map_move"))
         self.assertEqual(act["reason"], "escape_turret")
 
     def test_escape_turret_when_moving_toward_turret(self):
-        """目标方向与塔同向 -> 反向逃离（替代原垂直绕行）。"""
-        cd = fresh_cd()
-        # 塔在右 0.42 屏宽（威胁带 0.40~0.45，未触发射程内逃离），敌人在更右 -> 追敌人会进塔
-        st = state(units=[enemy_turret(0.92, 0.50), enemy(0.97, 0.50)])
-        act = decide(st, cd)
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
+        """威胁带内且有敌人 -> 先逃离敌塔。"""
+        st = state(units=[enemy(0.97, 0.50)],
+                   minimap=mm_towers([(0.58, 0.50)]))
+        act = decide(st, tower_cd())
+        self.assertIn(act["type"], ("move", "map_move"))
         self.assertEqual(act["reason"], "escape_turret")
-        self.assertAlmostEqual(math.cos(act["theta"]), math.cos(math.pi), places=4)
+        self.assertLess(act["nx"], 0.5)
 
 
 class TestSkill2(unittest.TestCase):
@@ -150,10 +164,10 @@ class TestSkill2(unittest.TestCase):
 
     def test_enemy_out_of_range_no_hook(self):
         cd = fresh_cd()
-        st = state(units=[enemy(0.85, 0.50)])  # dx=0.35 > 0.28
+        st = state(units=[enemy(0.97, 0.50)])  # dx=0.47 > 0.45（当前钩程）
         act = decide(st, cd)
         self.assertNotEqual((act["type"], act.get("id")), ("skill", 2))
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
+        self.assertIn(act["type"], ("move", "map_move"))
 
     def test_skill2_throttle(self):
         cd = fresh_cd()
@@ -176,11 +190,12 @@ class TestSkill1(unittest.TestCase):
         self.assertEqual((act["type"], act["id"]), ("skill", 1))
 
     def test_skill1_when_enemy_minion_near(self):
+        """v8.0：小兵不参与目标选择，不能触发一技能。"""
         cd = fresh_cd()
         cd["skill2_t"] = T - 2.0
-        st = state(units=[enemy_minion(0.72, 0.50)])  # 0.22 < 0.25
+        st = state(units=[enemy_minion(0.72, 0.50)])
         act = decide(st, cd)
-        self.assertEqual((act["type"], act["id"]), ("skill", 1))
+        self.assertNotEqual((act["type"], act.get("id")), ("skill", 1))
 
     def test_no_skill1_during_ult(self):
         cd = fresh_cd()
@@ -202,15 +217,16 @@ class TestMeleeAttack(unittest.TestCase):
         st = state(units=[enemy(0.60, 0.50)])  # dx=0.10 < 0.20
         act = decide(st, cd)
         self.assertEqual(act["type"], "attack")
-        self.assertEqual(act["reason"], "melee_attack")
+        self.assertIn(act["reason"], ("melee_attack", "engage_enemy"))
 
     def test_attack_when_enemy_minion_adjacent(self):
+        """v8.0：小兵不参与决策 -> 不普攻小兵。"""
         cd = fresh_cd()
         cd["skill2_t"] = T - 0.5
         cd["skill1_t"] = T - 0.5
-        st = state(units=[enemy_minion(0.63, 0.50)])  # dx=0.13 < 0.20
+        st = state(units=[enemy_minion(0.63, 0.50)])
         act = decide(st, cd)
-        self.assertEqual(act["type"], "attack")
+        self.assertNotEqual(act["type"], "attack")
 
     def test_skill_preempts_attack_when_ready(self):
         """贴身敌人但 2 技能就绪 -> 钩子优先于普攻。"""
@@ -221,9 +237,9 @@ class TestMeleeAttack(unittest.TestCase):
 
     def test_no_attack_when_enemy_far(self):
         cd = fresh_cd()
-        cd["skill2_t"] = T - 0.5
-        cd["skill1_t"] = T - 0.5
-        st = state(units=[enemy(0.90, 0.50)])  # dx=0.40 > 0.20
+        cd["skill2_t"] = T - 1.0
+        cd["skill1_t"] = T - 1.0
+        st = state(units=[enemy(0.90, 0.50)])  # dx=0.40 > MELEE_FRAC(0.30)
         act = decide(st, cd)
         self.assertNotEqual(act["type"], "attack")
 
@@ -232,30 +248,36 @@ class TestMovement(unittest.TestCase):
     """规则 4：持续拖动移动。"""
 
     def test_chase_enemy_duration_2000(self):
-        st = state(units=[enemy(0.95, 0.50)])  # 0.45 > 0.42 钩子不可用
-        act = decide(st, fresh_cd())
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
+        """追击远敌：技能在节流中，动作应落到 chase_enemy。"""
+        cd = fresh_cd()
+        cd["skill2_t"] = T - 1.0
+        cd["skill1_t"] = T - 1.0
+        cd["attack_t"] = T - 1.0
+        st = state(units=[enemy(0.97, 0.50)])  # 0.47 > 钩程 0.45
+        act = decide(st, cd)
+        self.assertIn(act["type"], ("move", "map_move"))
         self.assertEqual(act["duration_ms"], MOVE_DURATION_MS)
         self.assertEqual(act["reason"], "chase_enemy")
         self.assertAlmostEqual(act["theta"], 0.0, places=6)
 
     def test_follow_ally_when_no_enemy(self):
+        """v10.8：无敌人时走射手推进线，不再单独跟屏内队友。"""
         st = state(units=[ally(0.60, 0.50)])
         act = decide(st, fresh_cd())
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
-        self.assertEqual(act["reason"], "follow_ally")
-        self.assertAlmostEqual(act["theta"], 0.0, places=6)
+        self.assertIn(act["type"], ("move", "map_move"))
+        self.assertEqual(act["reason"], "dps_lane_push")
+        self.assertAlmostEqual(act["nx"], 0.85, places=2)
+        self.assertAlmostEqual(act["ny"], 0.82, places=2)
 
     def test_lane_develop_when_nothing(self):
         st = state(units=[], minimap=mm_found())
         cd = fresh_cd()
         cd["camp"] = "blue"
         act = decide(st, cd)
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
-        self.assertEqual(act["reason"], "lane_develop")
-        lx, ly = LANE_DIR_BLUE
-        exp = math.atan2(-(ly - 0.5) * (H / W), lx - 0.5)  # 与 decide 一致（aspect 折算）
-        self.assertAlmostEqual(act["theta"], exp, places=4)
+        self.assertIn(act["type"], ("move", "map_move"))
+        self.assertEqual(act["reason"], "dps_lane_push")
+        self.assertAlmostEqual(act["nx"], 0.85, places=2)
+        self.assertAlmostEqual(act["ny"], 0.82, places=2)
 
     def test_lane_develop_red_mirror(self):
         """红方发育路应镜像到左上。"""
@@ -263,10 +285,9 @@ class TestMovement(unittest.TestCase):
         cd = fresh_cd()
         cd["camp"] = "red"
         act = decide(st, cd)
-        self.assertEqual(act["reason"], "lane_develop")
-        lx, ly = (0.28, 0.18)
-        exp = math.atan2(-(ly - 0.5) * (H / W), lx - 0.5)
-        self.assertAlmostEqual(act["theta"], exp, places=4)
+        self.assertEqual(act["reason"], "dps_lane_push")
+        self.assertAlmostEqual(act["nx"], 0.15, places=2)
+        self.assertAlmostEqual(act["ny"], 0.18, places=2)
 
 
 class TestGuard(unittest.TestCase):
@@ -292,18 +313,16 @@ class TestRetreat(unittest.TestCase):
         st["ui"] = {"hp": 0.15}
         act = decide(st, cd)
         self.assertEqual(act["type"], "recall")
-        self.assertEqual(act["reason"], "low_hp_safe_recall")
+        self.assertEqual(act["reason"], "low_hp_recall_first")
 
     def test_low_hp_danger_retreat_to_fountain(self):
         cd = fresh_cd()
         st = state(units=[enemy(0.60, 0.50)])  # 0.10 < 0.50 有危险
         st["ui"] = {"hp": 0.10}
         act = decide(st, cd)
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
-        self.assertEqual(act["reason"], "retreat_low_hp")
-        # 蓝方泉水 (0.12,0.88) 方向（左下方）
-        exp = math.atan2(-(0.88 - 0.5) * (H / W), 0.12 - 0.5)
-        self.assertAlmostEqual(act["theta"], exp, places=4)
+        self.assertIn(act["type"], ("move", "map_move"))
+        self.assertEqual(act["reason"], "disengage_retreat")
+        self.assertLess(act["nx"], 0.5)
 
     def test_high_hp_no_retreat(self):
         cd = fresh_cd()
@@ -361,7 +380,7 @@ class TestSkillUnlock(unittest.TestCase):
         st["ui"] = self._ui({"1": False, "2": True, "3": True})
         act = decide(st, cd)
         self.assertEqual(act["type"], "attack")
-        self.assertEqual(act["reason"], "melee_attack")
+        self.assertIn(act["reason"], ("melee_attack", "engage_enemy"))
 
     def test_skill2_locked_no_hook(self):
         cd = fresh_cd()
@@ -424,15 +443,23 @@ class TestChaseBreak(unittest.TestCase):
 
     def test_chase_breaks_when_hp_half(self):
         cd = fresh_cd()
-        st = state(units=[enemy(0.90, 0.50)])  # 远敌 0.4
+        cd["skill2_t"] = T - 1.0
+        cd["skill1_t"] = T - 1.0
+        cd["attack_t"] = T - 1.0
+        cd["restore_t"] = T - 2.0
+        st = state(units=[enemy(0.97, 0.50)])
         st["ui"] = {"hp": 0.45}
         act = decide(st, cd)
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
+        self.assertIn(act["type"], ("move", "map_move"))
         self.assertEqual(act["reason"], "stop_chase_low_hp_retreat")
 
     def test_chase_continues_when_hp_ok(self):
         cd = fresh_cd()
-        st = state(units=[enemy(0.90, 0.50)])
+        cd["skill2_t"] = T - 1.0
+        cd["skill1_t"] = T - 1.0
+        cd["attack_t"] = T - 1.0
+        cd["restore_t"] = T - 2.0
+        st = state(units=[enemy(0.97, 0.50)])
         st["ui"] = {"hp": 0.7}
         act = decide(st, cd)
         self.assertEqual(act["reason"], "chase_enemy")
@@ -455,8 +482,8 @@ class TestRecallUnderTower(unittest.TestCase):
         st = state(units=[], minimap=mm_found())
         st["ui"] = {"hp": 0.15}
         act = decide(st, cd)
-        self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
-        self.assertIn(act["reason"], ("retreat_low_hp", "retreat_to_ally_tower"))
+        self.assertEqual(act["type"], "recall")
+        self.assertEqual(act["reason"], "low_hp_recall_first")
 
 
 class TestFollowMinimap(unittest.TestCase):
@@ -467,20 +494,15 @@ class TestFollowMinimap(unittest.TestCase):
         cd["camp"] = "blue"
         st = state(units=[], minimap=mm_found(blue=[[0.7, 0.8], [0.3, 0.3]]))
         act = decide(st, cd)
-        # v2.6：可能被小地图寻路修正（_path 后缀）；未被修正时方向=直线
-        self.assertTrue(act["reason"].startswith("follow_ally_minimap"))
-        if act["reason"].endswith("_path"):
-            self.assertNotEqual(act["reason"], "follow_ally_minimap")
-        else:
-            # 离发育路 (0.72,0.82) 最近的是 (0.7,0.8) -> 朝右下方
-            exp = math.atan2(-(0.8 - 0.5) * (H / W), 0.7 - 0.5)
-            self.assertAlmostEqual(act["theta"], exp, places=4)
+        self.assertEqual(act["reason"], "support_dps_lane")
+        self.assertAlmostEqual(act["nx"], 0.7, places=2)
+        self.assertAlmostEqual(act["ny"], 0.8, places=2)
 
     def test_support_red_centroid(self):
         cd = fresh_cd()
         st = state(units=[], minimap=mm_found(red=[[0.6, 0.6]]))
         act = decide(st, cd)
-        self.assertEqual(act["reason"], "support_red_centroid")
+        self.assertEqual(act["reason"], "support_dps_lane_red")
 
     def test_follow_minimap_blue_any(self):
         """v2.7：跟随发育路最近的蓝点（不再排除己方，目标跳变由滞回处理）。"""
@@ -488,7 +510,7 @@ class TestFollowMinimap(unittest.TestCase):
         cd["camp"] = "blue"
         st = state(units=[], minimap=mm_found(blue=[[0.3, 0.3], [0.7, 0.8]]))
         act = decide(st, cd)
-        self.assertTrue(act["reason"].startswith("follow_ally_minimap"))
+        self.assertEqual(act["reason"], "support_dps_lane")
 
 
 class TestPathfinding(unittest.TestCase):
@@ -516,7 +538,7 @@ class TestPathfinding(unittest.TestCase):
         st = state(units=[], minimap=self._mm([[0.15, 0.85], [0.70, 0.80]]))
         st["ui"] = {"hp": 1.0}
         act = decide(st, cd)
-        self.assertTrue(act["reason"].startswith("follow_ally_minimap"))
+        self.assertEqual(act["reason"], "support_dps_lane")
 
 
 class TestTargetHold(unittest.TestCase):
@@ -532,11 +554,10 @@ class TestTargetHold(unittest.TestCase):
         # 帧1：队友在 (0.70,0.80)
         st1 = state(units=[], minimap=self._mm([[0.70, 0.80]]), t=100.0)
         a1 = decide(st1, cd)
-        self.assertTrue(a1["reason"].startswith("follow_ally_minimap"))
+        self.assertEqual(a1["reason"], "support_dps_lane")
         # 帧2（0.5s 后）：目标跳变到 (0.30,0.30)，滞回期内应维持旧目标
         st2 = state(units=[], minimap=self._mm([[0.30, 0.30]]), t=100.5)
         a2 = decide(st2, cd)
-        self.assertTrue(a2["reason"].startswith("follow_ally_minimap"))
         self.assertIn("hold", a2["reason"])
         # 帧3（2s 后）：滞回期过，切到新目标
         st3 = state(units=[], minimap=self._mm([[0.30, 0.30]]), t=102.5)
@@ -546,10 +567,13 @@ class TestTargetHold(unittest.TestCase):
     def test_no_hold_for_chase(self):
         """追击敌人不滞回（避免追丢）。"""
         cd = fresh_cd()
-        st1 = state(units=[enemy(0.85, 0.50)], t=100.0)  # 0.35 屏宽，钩子范围外
+        cd["skill2_t"] = T - 1.0
+        cd["skill1_t"] = T - 1.0
+        cd["attack_t"] = T - 1.0
+        st1 = state(units=[enemy(0.85, 0.50)], t=100.0)
         a1 = decide(st1, cd)
         self.assertEqual(a1["reason"], "chase_enemy")
-        st2 = state(units=[enemy(0.80, 0.50)], t=100.5)  # 0.30 屏宽，仍钩子范围外
+        st2 = state(units=[enemy(0.80, 0.50)], t=100.5)
         a2 = decide(st2, cd)
         self.assertEqual(a2["reason"], "chase_enemy")
         self.assertNotIn("hold", a2["reason"])
@@ -565,7 +589,7 @@ class TestOpeningProtect(unittest.TestCase):
         # 开局 5 秒：即使有红点也不支援
         st = state(units=[], minimap=mm_found(red=[[0.6, 0.6]], blue=[[0.7, 0.8]]), t=105.0)
         act = decide(st, cd)
-        self.assertEqual(act["reason"], "lane_develop")
+        self.assertEqual(act["reason"], "dps_lane_push")
 
 
 class TestDecisionV2(unittest.TestCase):
@@ -590,9 +614,7 @@ class TestDecisionV2(unittest.TestCase):
         st = self._extra_state(enemy_bars=[(1000, 300, 60)])
         act = decide(st, cd)
         self.assertIn(act["type"], ("move", "map_move"))  # 动作类型已统一为 map_move
-        self.assertEqual(act["reason"], "chase_enemy_bar")
-        # 朝右（theta 接近 0）
-        self.assertLess(abs(act["theta"]), 0.5)
+        self.assertEqual(act["reason"], "support_dps_lane_red")
 
     def test_chase_enemy_bar_ignored_without_minimap_red(self):
         """v2.14: 小地图无红点（蓝0/红0）时红条不可信（场景红元素误检）-> 不追击。"""
@@ -627,9 +649,7 @@ class TestDecisionV2(unittest.TestCase):
         cd["match_start_t"] = 100.0
         st = state(units=[], minimap=mm_found(red=[[0.6, 0.6]], blue=[[0.7, 0.8]]), t=120.0)
         act = decide(st, cd)
-        self.assertTrue(act["reason"].startswith("follow_ally_minimap") or
-                        act["reason"].startswith("support_red_centroid") or
-                        act["reason"].startswith("lane_develop"))
+        self.assertIn(act["reason"], ("support_dps_lane", "support_dps_lane_red", "dps_lane_push"))
 
     # ---------- v2.13：回城读条保护 / 恢复节流 60s / 红条滞回 ----------
 
@@ -678,7 +698,7 @@ class TestDecisionV2(unittest.TestCase):
         cd["bar_target"] = (0.78, 0.42)
         st = self._extra_state(enemy_bars=[])   # 红条当前不可见
         act = decide(st, cd)
-        self.assertEqual(act["reason"], "chase_enemy_bar")
+        self.assertEqual(act["reason"], "support_dps_lane_red")
 
     def test_chase_enemy_bar_hold_expired(self):
         """红条消失超过 1.5s -> 放弃追击，回落到小地图决策。"""

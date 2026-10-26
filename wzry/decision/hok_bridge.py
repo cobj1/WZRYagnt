@@ -81,7 +81,7 @@ def _hero_rows(state: dict[str, Any], self_camp: str) -> list[dict[str, Any]]:
                 "id": "self",
                 "camp": self_camp,
                 "position": _ref_pos(dots["green"][0]),
-                "hp": _hp_ratio(state.get("self_state") or {}),
+                "hp": _hp_ratio(_self_state(state, self_camp)),
                 "alive": True,
             }
         )
@@ -116,12 +116,55 @@ def _gold_by_side(state: dict[str, Any], self_camp: str) -> dict[str, float]:
 
 
 def _game_time(state: dict[str, Any]) -> float:
+    """对局时钟（秒）。
+
+    真机 + --mem 时由 `clock_s`/`game_time_s` 提供；纯视觉录制（`data/matches/*/states.jsonl`）
+    里两者都不存在，此前恒返回 0——等于把所有帧都当成"第 0 分钟"，而 time_norm 恰好是
+    价值模型里符号最稳定的特征之一。这里补一条保真回退链，优先级从"真时钟"到"会话相对时间"：
+      1. 顶层 clock_s / game_time_s
+      2. ui.match_clock（面板读数）
+      3. extra.game_time_s / clock_s / session_elapsed_s
+      4. 顶层 session_elapsed_s（录制器可注入）
+      5. t - session_start_t（墙钟差，回放时由调用方注入 session_start_t）
+    都没有才返回 0.0（并保持"缺失即 0"的旧行为，不改变已有主链路）。
+    """
     for key in ("clock_s", "game_time_s"):
         value = state.get(key)
         if isinstance(value, (int, float)):
             return float(value)
-    clock = (state.get("ui") or {}).get("match_clock")
-    return float(clock) if isinstance(clock, (int, float)) else 0.0
+    ui = state.get("ui") or {}
+    for key in ("match_clock", "clock_s", "game_time_s"):
+        value = ui.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    extra = state.get("extra") or {}
+    for key in ("game_time_s", "clock_s", "session_elapsed_s"):
+        value = extra.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    elapsed = state.get("session_elapsed_s")
+    if isinstance(elapsed, (int, float)):
+        return float(elapsed)
+    wall, start = state.get("t"), state.get("session_start_t")
+    if isinstance(wall, (int, float)) and isinstance(start, (int, float)) and wall >= start:
+        return float(wall - start)
+    return 0.0
+
+
+def _self_state(state: dict[str, Any], self_camp: str) -> dict[str, Any]:
+    """自身状态；缺失时用可观测字段合成（只补 hp，不伪造金币/装备）。
+
+    纯视觉录制没有 self_state，此前 `_hp_ratio(self_state)` 恒得 1.0 → 模型永远以为满血。
+    `ui.hp` 语料覆盖 58%，补上后"残血决策"才可能被区分。金币等无法从视觉可靠读出，保持缺失。
+    """
+    raw = state.get("self_state")
+    if isinstance(raw, dict) and raw:
+        return raw
+    synthesized: dict[str, Any] = {"camp": self_camp, "synthesized": True}
+    hp = (state.get("ui") or {}).get("hp")
+    if isinstance(hp, (int, float)) and 0.0 <= float(hp) <= 1.0:
+        synthesized["hp"] = float(hp)
+    return synthesized
 
 
 def load_hok_map(

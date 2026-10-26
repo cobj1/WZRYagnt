@@ -113,6 +113,14 @@ check("A6 Action JSON 往返一致",
 check("A7 非法动作类型被拒绝", raises(lambda: Action(type="teleport")))
 check("A8 所有协议动作类型可构造",
       all(Action.for_type(t).type == t for t in ACTION_TYPES))
+decision = {"type": "move", "theta": 0.5, "duration_ms": 380, "reason": "lane"}
+proto = Action.from_decision(decision)
+check("A9 决策 dict 转 Action 保留语义",
+      proto is not None and proto.reason == "lane" and proto.duration_ms == 380)
+check("A10 Action 还原执行 dict 逐键一致",
+      proto.to_legacy_dict() == decision)
+check("A11 none/stick 不转 Action",
+      Action.from_decision({"type": "none", "reason": "x"}) is None)
 
 # ---------------------------------------------------------------- 零行为变更
 state = GameState(t=1.0, source="live")

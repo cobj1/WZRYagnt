@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from . import config as cfg
 from . import features as feat
 from . import field as vfield
+from . import grid as vgrid
 from . import motion as vpost
 from . import rules as rulemod
 from .actions import Action, enumerate_actions, enumerate_moves, T_HERO, T_MONSTER
@@ -106,6 +107,8 @@ class LinearScorer:
                 return w["none_penalty"]
             # 走位打分 = 价值场增量（对齐官方 grid action 由模型打分的位置）
             s = w["move_bonus"] + w["grid_delta"] * vfield.move_delta(snap, *act.point)
+            # 官方 `CalTowerDirValue`：方向朝塔额外加分（推塔期尤其明显）
+            s += w.get("tower_dir", 2.0) * vfield.tower_dir_value(snap, *act.point)
             recent = list(snap.last_actions or [])[-2:]
             if act.label.startswith("Move") and act.label in recent:
                 s -= w["repeat_penalty"]          # 上一帧刚这么走过 -> 别原地抖
@@ -294,10 +297,17 @@ class OfficialAI:
             return self._unpredict(s, pack, f"respawn:{int(s.self_unit.respawn_s)}s", scene)
         actions = enumerate_actions(s)
         actions.extend(enumerate_moves(s, retreat=self._should_retreat(s)))
-        # 官方 grid action 的强候选：价值场全局最优点（粗网格搜索）
+        # 官方 `GenMovePos` 的 144 格（12×12）解码：top-k → 距离/障碍校验。
+        #   与 `field.best_point`（连续粗搜索）并存：前者是官方的离散候选口径，
+        #   后者能给出网格外的点（追击/长途撤退时更合适）。
+        gm = vgrid.gen_move_pos(s)
+        if gm is not None:
+            actions.append(Action("GridBest", "move", point=gm["point"],
+                                  meta={"grid_best": True, "grid_idx": gm["idx"],
+                                        "grid_score": gm["score"]}))
         bp = vfield.best_point(s)
         if bp is not None:
-            actions.append(Action("GridBest", "move", point=bp,
+            actions.append(Action("FieldBest", "move", point=bp,
                                   meta={"grid_best": True}))
         if not actions:
             return self._unpredict(s, pack, "no_candidates", scene)

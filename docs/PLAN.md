@@ -1,7 +1,11 @@
 # 王者荣耀 AI 自动化 · 完整实现计划
 ### 目标：基于 MuMu 模拟器屏幕视觉感知，构建超过职业选手水平的钟馗 AI（先单英雄，后扩展）
 
-> 版本：v1.1　日期：2026-04-22
+> 版本：v1.1　日期：2026-04-22（进度日志追加至 2026-10-15）
+>
+> **历史蓝图声明（2026-10-25）**：本文保留 2026-04 的计划与早期进度，不作为当前架构依据。
+> 现行入口见 `docs/ARCH_*`、`docs/规划与方案/项目任务规划-2026-10-23.md`（工作区根）。
+> 文中 `E:\` 盘符、`runs/detect/zhongkui_11cls/`、`data/video_states/` 等路径已失效或已迁移。
 > 约束确认：本机 RTX 4060 Laptop 8GB；可 3-5 开 MuMu；训练数据以**比赛录像（无原始输入，需动作反推）为主 + 少量人工标注**；先做单英雄钟馗。
 >
 > **v1.1 执行策略调整（2026-04-22，与用户确认）**：
@@ -23,7 +27,7 @@
 > - ✅ **11 类标签迁移**：`scripts/train/migrate_labels_11class.py`——466 文件 1379 框迁移（带备份），294 个歧义文件清单已生成，data.yaml 更新为 11 类。
 > - ✅ **数据扩充与阵营预判**：录像抽帧 +150 帧/377 框（数据集 367 图/1317 框）；`camp_autolabel.py`（血条颜色判定，216 个高置信 ally 建议 + 联系表抽查）。
 > - ✅ **数据泄漏修复**：prepare_dataset 多次运行导致 train/val 重叠（237 个重复框键）——重建后归零，验证指标可信。
-> - ✅ **11 类全量训练**（80 轮，含 ally 类数据）：整体 **mAP50=0.633**（40 轮 0.511 → +0.12）；enemy_hero 0.857 / ally_hero 0.593 / ally_minion 0.499 / ally_turret 0.658 / enemy_turret 0.747 / hook_aim 0.537。正式版：`runs/detect/zhongkui_11cls/weights/best.pt`。⚠️ 训练时模拟器需空闲（对局渲染抢 GPU 会卡死）。
+> - ✅ **11 类全量训练**（80 轮，含 ally 类数据）：整体 **mAP50=0.633**（40 轮 0.511 → +0.12）；enemy_hero 0.857 / ally_hero 0.593 / ally_minion 0.499 / ally_turret 0.658 / enemy_turret 0.747 / hook_aim 0.537。正式版：`runs/detect/zhongkui_11cls/weights/best.pt`（历史路径，目录已不在；当前可见 `runs/detect/best.pt`）。⚠️ 训练时模拟器需空闲（对局渲染抢 GPU 会卡死）。
 > - ✅ **真局验证三轮**（用户配合）：小地图真局稳定、11 类模型真局检出、技能冷却 dark_frac 基准、HP 血条定位修复（左下角搜索区，真局 17 帧检出 88%）。
 > - ✅ **真实 BC 数据链路验证**：真实会话（357 样本/2 会话）→ bc_multi.npz；BCNet 真实数据训练链路跑通（loss 收敛）。⚠️ 被动采集会话动作全为 none，**带动作标签的 BC 数据需 Agent v2 --action 模式采集或录像反推**（M3 进行中）。
 > - ✅ **动作反推器 v2 真验**（M3）：用 Agent v2 真实对局录像（带 HUD + 146 条真实动作真值）验证——**A 通道（摇杆箭头）方向正确**；**B 通道（按钮高亮）重写为"变暗沿"检测**（王者荣耀按下技能是变暗！）+ 释放锁 + 抽样循环修复：**可见按下 100% 检出（5/5 skill2 + 1/1 skill1），0 误报**，总召回 6/9（3 次漏检为像素不可见：冷却遮罩期间按下/超录像范围）；发现并修复损坏 mkv 帧错位（顺序读 + ffmpeg 修复流程）。
@@ -42,7 +46,7 @@
 | scrcpy 采集 | 无窗口录制视频流，可用（255MB 录像已产出） | `scripts/vision/capture_scrcpy.py` |
 | 触摸控制 | adb `input tap/swipe`；MuMuManager ADB；mumu-python-api 已装 | `scripts/control/touch.py`、`scripts/control/*.py` |
 | 检测模型 | YOLOv8n 微调，4 类（enemy_hero/hook_aim/minion/turret），约 234 张标注图（184 train / 50 val），100 轮训练约 200 秒完成 | `runs/detect/zhongkui_detector3`、`zhongkui_detector_finetune` |
-| 状态提取 | 视频 → 每帧 JSON（检测框 + 置信度），已产出 2000+ 帧 | `scripts/vision/video_state_extractor.py`、`data/video_states/` |
+| 状态提取 | 视频 → 每帧 JSON（检测框 + 置信度），已产出 2000+ 帧 | `scripts/vision/video_state_extractor.py`、`data/video_states/`（历史目录，当前不在） |
 | 动作反推 | 三套独立尝试：摇杆箭头（HSV/模板）、按钮高亮（亮度）、英雄位移反推方向 | `extract_arrow_direction.py`、`extract_template_actions.py`、`extract_ui_actions_robust.py`、`extract_result_actions.py` |
 | 状态-动作对齐 | 按 frame_idx 合并 state/action | `scripts/vision/align_state_action.py` |
 | 规则 Agent | 检测→最近敌人→8 向移动/点技能，带冷却节流 | `scripts/control/zhongkui_final.py` 等 |
@@ -257,7 +261,7 @@
 ## 5. 代码结构重构目标（M0 交付）
 
 ```
-E:\WZRYagent\
+D:/work/aiKings/WZRYagnt/
 ├─ configs/            # 标定、英雄、动作原语、奖励、训练参数（yaml/json 统一）
 ├─ wzry/               # 主包（替代 scripts 散件）
 │  ├─ capture/         # window/scrcpy/mumu 三种采集，统一 get_frame(timestamp)
@@ -325,7 +329,7 @@ E:\WZRYagent\
 
 1. **M0-1**：建 git 仓库 + `wzry/` 包骨架，把 5 份 ScreenCapture 合并为 `capture/window.py`。
 2. **M0-2**：写 `bench_latency.py`，量化 mss / adb / mumu-python-api / scrcpy 四路延迟（这是选型依据，先跑）。
-3. **M0-3**：写 `mumu_farm.py` 多实例管理（MuMuManager 已有路径 E:\MuMuPlayer\nx_main\MuMuManager.exe），验证 3 开稳定性。
+3. **M0-3**：写 `mumu_farm.py` 多实例管理（MuMuManager 已有路径 `D:\app\MuMuPlayer\nx_main\MuMuManager.exe`），验证 3 开稳定性。
 4. **M1-1**：用现有 493 张截图 + scrcpy-mask 补标 ally_hero / enemy_minion / ally_minion / turret 等类，把数据集从 4 类扩到 11 类（预标注 + 人工修正）。
 5. **M1-2**：小地图圆点检测原型（HSV 聚类 + 连通域），用现有录像验证。
 6. **M1-3**：YOLO 模型 TensorRT FP16 导出 + 延迟测试。

@@ -15,7 +15,7 @@
 ## 1. 跑前准备（1 分钟）
 
 ```bash
-# 1) 改动后基线回归（应全绿：191/191 与 53/53）
+# 1) 改动后基线回归（当前应全绿：198/198 与 56/56；test_laya HEAD 版为 53）
 venv/Scripts/python.exe -X utf8 scripts/test_new_modules.py
 venv/Scripts/python.exe -X utf8 scripts/test_laya_fusion.py
 
@@ -207,7 +207,7 @@ venv/Scripts/python.exe -X utf8 scripts/m2_agent_v2.py --seconds 240 \
 
 | 证据 | 结果 |
 |---|---|
-| `tracker` 是否丢点 | **没丢**：连续帧（`temp/stream_0002.mkv`，300 帧）上 detect→tracker **丢失率 0%** |
+| `tracker` 是否丢点 | **没丢**：连续帧（`temp/stream_0001.mkv`，300 帧）上 detect→tracker **丢失率 0%** |
 | `detect()` 自己的检出 | 300 连续帧里只有 **4 帧**有"敌点"（1%）—— 瓶颈在检测器，不在 tracker |
 | 这些"敌点"是什么 | 45 个敌点只落在 **2 个位置**：(0.184,0.663)×26、(0.121,0.616)×19，**离散度 0.0000** |
 | 放大看 | 两处都是**停靠在小地图左边缘的英雄头像（带红圈）** → **精确率 0%** |
@@ -228,7 +228,7 @@ venv/Scripts/python.exe -X utf8 scripts/m2_agent_v2.py --seconds 240 \
 | 162901（1180 帧） | 992 (84%) | 48 (4%) | **4.0%** |
 | 165546（320 帧） | 285 (89%) | 33 (10%) | **10.9%** |
 
-而且那 4~11% 的红点本身还是 UI 头像（见上）。逐级漏斗（60 连续帧，`stream_0002.mkv`）：
+而且那 4~11% 的红点本身还是 UI 头像（见上）。逐级漏斗（60 连续帧，`stream_0001.mkv`）：
 
 ```
 ring 候选 1073  →  _has_avatar 拒 844  →  UI停靠带 拒 218  →  余 11  →  ring_model 全拒  →  0
@@ -308,7 +308,7 @@ ring 候选 1073  →  _has_avatar 拒 844  →  UI停靠带 拒 218  →  余 1
 - 目视复核：4 个检出点放大后**圈都是红色**（`temp/_blob_zoom.png`）；
   标注图 `temp/_blob_det.png`；面积判据图 `temp/_blob_check.png`
   （红塔图标约 210~240，与 300 阈值有干净间隔）。
-- 回归：`test_new_modules.py` **198/198**、`test_laya_fusion.py` **53/53**。
+- 回归：`test_new_modules.py` **198/198**、`test_laya_fusion.py` **56/56**（工作树；HEAD 53）。
 
 > 真值口径：真值与检测器同用"红圈大盘"定义，故 100% 是**一致性**而非绝对真值；
 > 语义正确性靠上述目视复核保证。若日后 UI 改版（头像变小/换色），需重新量 300~1600 区间。

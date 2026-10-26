@@ -5,7 +5,7 @@
 > 约束：**纯静态只读**。包内有 TP/ACE 反作弊（`libtersafe` / `libTPCore`），不注入、不改客户端。
 >
 > 姊妹文档：`docs/wzry-ai-reverse.md`（规则链、锁敌、实时内存 Route A/B/C 的交接说明）。
-> 落地复核：§11（2026-10-20 实现侧验证与更正：坐标口径、22 槽位可静态化、法力口径、规则证据分级）。
+> 落地复核：§11（2026-10-20 实现侧验证与更正：坐标口径、22 槽位可静态化 → 后经 §11.9 更正为活体 cid 分配、法力口径、规则证据分级）；内存取数成果见 §11（续）。
 
 ---
 
@@ -352,15 +352,15 @@ GetSSGChangeAILevelDependsOnDistToSpring        ← 离泉水越远，难度/行
 | --- | --- | --- | --- |
 | 单位坐标 | 战斗逻辑单元（`GetActorLogicPos` 族访问器） | ✅ 已打通（actor 表 + 位置槽） | 同源，够用 |
 | 血量/血量比 | `GetActorHpRate` / `GetHPPercent` | ✅ 内存优先（`ui.hp` + `hp_src`），视觉血条仅作对照 | 同源（2026-10-21 改为不先走视觉） |
-| 蓝量/蓝比 | `GetActorEpRate` / `GetActorEpFinalRate` + `ep_max_value_dict` | ⚠️ 上限是常量、当前值未打通；**HUD 蓝条比例已接**（`ui.mp`） | 官方也要配 `hero_ep_type_list` 才能归一化；归一化后同口径，见 §11.3 |
+| 蓝量/蓝比 | `GetActorEpRate` / `GetActorEpFinalRate` + `ep_max_value_dict` | ✅ `+0x1C4` / `+0x1C8` 已定位；HUD 蓝条比例兜底 | 绝对值未与面板对账；见 §11.3、§11.9 |
 | 经济/金币 | `GetCoinNum` / `GetCampTotalCoin` / `GetHeroAllMoney` | ✅（+0x200 总经济 / +0x15D0 可用金币） | 同源 |
 | 等级/经验 | `GetHeroLevel` | ✅ | 同源 |
 | 技能可用/CD | AI 侧 `SkillInfo{usable, cd}` | ✅（`+0x19D4`，本地英雄 C# 状态对象） | **不在 attr 组件**，在状态对象里；见 §11.6 |
 | 装备 | `GetAllEquipID` / `GetEquipInfo` + `equip_config_id_file` | ✅ 已购买 ID 列表（`+0x1928` count + `+0x192C` 数组） | 语义是"已购含小件"，ID→名称需自建表（§11.7） |
 | buff/标记 | `buff_marks` / `hero_buff_marks` / `BuffMarkState` | ❌ | 同上（§10.3） |
-| 建筑（塔/水晶）状态 | 22 个具名槽位 + `hp_rate` / 无敌状态 | ✅ 22 槽位已建（位置拓扑） | 不需要 cid，见 §11.2 |
-| 兵线 | `VecSoldier` 聚合 | ✅ 视觉有兵线检测 | 口径可对齐（按 camp/兵种/血量分桶） |
-| 野怪 | `GetAllMonsters` / `GetMonsterHpRate` | ⚠️ 只有 `config_id 16100/16101` 在场 | 官方也只看"在场"的 |
+| 建筑（塔/水晶）状态 | 22 个具名槽位 + `hp_rate` / 无敌状态 | ✅ 22 具名槽位；活体用 `assign_measured()`（cid 定层级），静态拓扑兜底 | 见 §11.2、§11.9 |
+| 兵线 | `VecSoldier` 聚合 | ✅ 视觉有兵线检测 | 内存 cid 未定位 |
+| 野怪 | `GetAllMonsters` / `GetMonsterHpRate` | ⚠️ cid 未定位；`16100/16101` 是**红方高地塔**，不是野怪 | 官方也只看"在场"的 |
 | 草丛/可见性 | `is_in_grass`、`invisible_to_visible_*` | ⚠️ 部分 | 官方的平滑规则值得抄 |
 | 局内时间 | `GetGameStartTime` / `GetCurFrameNum` | ✅ | 同源 |
 | 血包 | `VecCake` | ✅ 视觉 | — |
@@ -450,10 +450,13 @@ $PY func_dump.py out/il2cpp/lib/arm64-v8a/libGameCore.so 0x2751af4 1200 \
 只会在真机上表现为"走位整局镜像"。现已统一到 `geo.py` 一处，并用
 `test_official_ai_replica.py` T31–T35 锁死。
 
-### 11.2 22 个具名槽位可以静态化，不需要 cid
+### 11.2 22 个具名槽位与活体分配（2026-10-24 更正）
 
-原判断是"内存只有 `cid 92/95` 两种，无法区分分路/层级 → 需一次性标定"。
-复核后可以更强：**根本不需要 cid**，因为地图是固定拓扑。
+> 早期结论“根本不需要 cid”已被 §11.9 与真机复核推翻：真机层级由 `cid` 决定
+> （`organ_slots.CID_TIER` + `assign_measured()`），静态拓扑只作兜底；几何自洽 22/22 不等于世界坐标正确。
+
+原判断是“内存只有 `cid 92/95` 两种，无法区分分路/层级 → 需一次性标定”。
+复核后**不能**只靠静态拓扑：固定地图拓扑适合兜底，真机活体分配必须用 `cid` 定层级。
 
 证据与推导：
 
@@ -468,7 +471,7 @@ $PY func_dump.py out/il2cpp/lib/arm64-v8a/libGameCore.so 0x2751af4 1200 \
 5. 9 个塔位彼此最小间距 **0.135**（归一化），最近邻落槽无歧义；超过 **0.10** 判为
    "不属于这 22 栋"（例如河道中央的临时建筑），不硬塞槽位。
 
-于是"cid 无法区分槽位"这个问题从"要标定"降级为"不需要"。
+于是“cid 无法区分槽位”这个问题降级为“静态表兜底 + 活体 `assign_measured()` 精确定位”；真机几何自洽 22/22 不等于世界坐标一致（§11.9 实测偏差约 15k–18k）。
 真机复核脚本：`scripts/verify_organ_slots.py --live`（期望 22/22、无 conflict/far）。
 
 ### 11.3 法力：官方走 `GetActorEpRate`，我们走 HUD 比例，语义等价
@@ -548,7 +551,7 @@ $PY func_dump.py out/il2cpp/lib/arm64-v8a/libGameCore.so 0x2751af4 1200 \
 
 ---
 
-## 十一、内存取数成果清单（偏移表，2026-10-21 00:40）
+## 十一（续）、内存取数成果清单（偏移表，2026-10-21 00:40）
 
 英雄 C# 状态数组（stride `0x2AD8`，10 槽，用 `memscan idbag` 定位）：
 
@@ -565,7 +568,7 @@ $PY func_dump.py out/il2cpp/lib/arm64-v8a/libGameCore.so 0x2751af4 1200 \
 | ├ slot5 | `0x1BB4` | 治疗类（90003，60s） | ✅ 本轮新增 |
 | ├ slot6 | `0x1C2C` | 召唤师/装备（80115，120s ≈ 闪现） | ✅ 本轮新增 |
 | └ slot7 | `0x1CA4` | 回城（90005，total=0） | ✅ 本轮新增 |
-| `equip_ids` | vector `+0x1920` 计数 / `+0x192C` 起 | 装备 ID 列表（stride 4） | ✅ |
+| `equip_ids` | vector 头 `+0x1920` / count `+0x1928` / 数组 `+0x192C` 起 | 装备 ID 列表（stride 4） | ✅ |
 
 时间点：局内时间 `clock_s` 由差分扫描定位（stride `0x28` 连续 ≥6 项同值）。
 

@@ -28,15 +28,22 @@ from wzry.decision.laya_scorer import (LayaScorer,        # noqa: E402
                                        build_state_text, candidate_label)
 
 _PASS = []
+_FAIL = []
 
 
 def check(name, cond, extra=""):
+    """记录断言结果但不中断，跑完再用退出码报告。
+
+    早期版本是 fail-fast（首条失败即 SystemExit），导致 T21b–T21f 之类
+    后续用例根本没机会执行，失败面被掩盖。改为收集式：所有用例都跑，
+    末尾统一打印 FAILED 并 exit(1)（CI 语义不变）。
+    """
     if cond:
         _PASS.append(name)
         print(f"PASS {name}")
     else:
+        _FAIL.append(name)
         print(f"FAIL {name} {extra}")
-        raise SystemExit(1)
 
 
 def make_state(reds=(0.70, 0.75), blues=((0.55, 0.50),), enemy_scr=((0.60, 0.52),)):
@@ -515,12 +522,46 @@ def main():
     sh20.stop()
 
     # T21 v14.3 OpenVINO 后端(方案 §6.2): IR 解析 + onnxruntime 兼容接口
+    # T21a 用 tempdir 造 IR 文件断言“按 max_len 的解析优先级”，不依赖仓库里是否导出了产物。
+    # （旧版直接比较 runs/laya 下的真实路径字符串：产物缺失时反而返回首选候选 → 假通过；
+    #   产物存在时三个候选落到同一文件 → 假失败。）
+    from wzry.decision import laya_scorer as _ls
     sc320 = LayaScorer(mode="shadow", beta=0.0, backend="openvino", ov_max_len=320)
     sc512 = LayaScorer(mode="shadow", beta=0.0, backend="openvino", ov_max_len=512)
+    _real_shadow_dir = _ls.SHADOW_DIR
+    _ov_root = Path(tempfile.mkdtemp())
+    _ls.SHADOW_DIR = _ov_root
+    try:
+        missing_320 = sc320._resolve_ov_ir()
+        check("T21a1_ov_ir_missing_returns_preferred_candidate",
+              missing_320 == _ov_root / "laya_ov" / "laya_qfreeze_320.xml"
+              and not missing_320.exists(),
+              f"320->{missing_320}")
+
+        (_ov_root / "laya_ov").mkdir(parents=True, exist_ok=True)
+        (_ov_root / "laya_ov" / "laya_qfreeze.xml").write_text("<net/>", encoding="utf-8")
+        fb320, fb512 = sc320._resolve_ov_ir(), sc512._resolve_ov_ir()
+        check("T21a2_ov_ir_falls_back_to_shared_ir",
+              fb320 == fb512 == _ov_root / "laya_ov" / "laya_qfreeze.xml",
+              f"320->{fb320} | 512->{fb512}")
+
+        (_ov_root / "laya_ov" / "laya_qfreeze_320.xml").write_text("<net/>", encoding="utf-8")
+        check("T21a3_ov_ir_prefers_max_len_specific_file",
+              sc320._resolve_ov_ir() == _ov_root / "laya_ov" / "laya_qfreeze_320.xml"
+              and sc512._resolve_ov_ir() == _ov_root / "laya_ov" / "laya_qfreeze.xml",
+              f"320->{sc320._resolve_ov_ir()} | 512->{sc512._resolve_ov_ir()}")
+
+        (_ov_root / "laya_ov512").mkdir(parents=True, exist_ok=True)
+        (_ov_root / "laya_ov512" / "laya_qfreeze.xml").write_text("<net/>", encoding="utf-8")
+        check("T21a4_ov_ir_prefers_dedicated_dir_over_shared",
+              sc512._resolve_ov_ir() == _ov_root / "laya_ov512" / "laya_qfreeze.xml",
+              f"512->{sc512._resolve_ov_ir()}")
+    finally:
+        _ls.SHADOW_DIR = _real_shadow_dir
+
+    # 后续 T21b–T21f 走真实产物；没有就 SKIP（这才是“环境缺件”，不是断言失败）
     ir320, ir512 = sc320._resolve_ov_ir(), sc512._resolve_ov_ir()
-    check("T21a_ov_ir_resolve_by_max_len",
-          "320" in str(ir320) and str(ir512) != str(ir320),
-          f"320->{ir320} | 512->{ir512}")
+    print(f"INFO T21 real IR: 320->{ir320.exists()} | 512->{ir512.exists()}")
 
     try:
         from wzry.decision.laya_ov import OVSession
@@ -544,12 +585,14 @@ def main():
         check("T21c_ov_session_pads_without_truncating", sess.truncated == 0,
               f"truncated={sess.truncated}")
 
-        # 超过 IR 上限的输入 -> 截断并计数(正常路径由 laya 按 max_len 先截断)
+        # 超过 IR 上限的输入 -> 截断并计数(正常路径由 laya 按 max_len 先截断)。
+        # 长度按 IR 实际静态形状取：旧版硬编码 400，在 L=512 的产线上不会触发截断。
+        over_len = sess.max_len + 20
         sess.run(["logits", "act_logits"],
-                 dict(feed, input_ids=np.zeros((1, 400), dtype=np.int64),
-                      attention_mask=np.ones((1, 400), dtype=np.int64)))
+                 dict(feed, input_ids=np.zeros((1, over_len), dtype=np.int64),
+                      attention_mask=np.ones((1, over_len), dtype=np.int64)))
         check("T21d_ov_session_truncation_counted", sess.truncated == 1,
-              f"truncated={sess.truncated}")
+              f"truncated={sess.truncated} max_len={sess.max_len}")
 
         # 选项数超编译上限 -> 明确报错(而不是静默出错)
         try:
@@ -572,6 +615,38 @@ def main():
               out_b[0].shape == (2, 4) and out_b[1].shape[0] == 2,
               f"logits={out_b[0].shape} act={out_b[1].shape}")
 
+    # T22 异步旁路（G1 40ms 预算的前提）：慢模型不得阻塞决策热路径
+    #   实测 GPU 单次推理 92ms，若串进临界路径会把 p95 推到 111ms（超预算 2.8 倍）。
+    #   这里用 200ms 的假模型放大特征：reorder 必须立即返回，结果走缓存下一拍生效。
+    class SlowLaya(FakeLaya):
+        def _predict(self, state_text, labels):
+            time.sleep(0.20)
+            return [1.0 / len(labels)] * len(labels)
+
+    slow = SlowLaya(lambda labs: [1.0 / len(labs)] * len(labs),
+                    mode="ensemble", beta=1.0)
+    slow.start()
+    try:
+        scored_s = [(float(i), ({"type": "map_move", "nx": 0.1 + 0.01 * i,
+                                 "ny": 0.3, "reason": f"c{i}"}, f"c{i}"))
+                    for i in range(10)]
+        t0 = time.perf_counter()
+        for _ in range(20):
+            slow.reorder(scored_s, f, 0.9, "blue")
+        dt = (time.perf_counter() - t0) * 1000
+        check("T22_slow_model_does_not_block",
+              dt < 100.0, f"20 次 reorder 耗时 {dt:.1f}ms（模型单次 200ms）")
+        time.sleep(0.30)                                  # 让 worker 至少跑完一次
+        st_slow = slow.stats()
+        check("T22b_slow_model_async_stats",
+              st_slow.get("submits", 0) >= 1 and st_slow.get("errors", 0) == 0,
+              f"{st_slow}")
+    finally:
+        slow.stop()
+
+    if _FAIL:
+        print(f"\nFAILED ({len(_FAIL)}/{len(_PASS) + len(_FAIL)}): " + ", ".join(_FAIL))
+        raise SystemExit(1)
     print(f"ALL PASS ({len(_PASS)})")
 
 

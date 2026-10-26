@@ -889,6 +889,299 @@ def main():
           leg_fr.get("mode") == "drag" and leg_fr.get("target") == (900, 500),
           str(leg_fr))
 
+    # ---- 24. 召唤师技能识别（summoner.py）----
+    from wzry.decision.official_ai import summoner as SM
+    from wzry.decision.official_ai import grid as GD
+    from wzry.decision.official_ai import field as VF2
+    check("T106 召唤师识别：实测 id 优先，30s CD 兜底判惩击",
+          SM.role_of(80115) == "flash" and SM.role_of(90003) == "heal"
+          and SM.role_of(99999, 30000) == "smite"
+          and SM.role_of(99999, 120000) is None,
+          f"{SM.role_of(80115)}/{SM.role_of(90003)}/{SM.role_of(99999, 30000)}")
+
+    # ---- 25. 惩击 / 寒冰惩击 ----
+    st_cj = fixture(hp_ratio=0.9)
+    st_cj["extra"]["mem_heroes"][0]["skills"] = [
+        {"slot": 1, "id": 10610, "level": 1, "ready": True, "cd_left_ms": 0, "cd_total_ms": 5000},
+        {"slot": 6, "id": 80120, "level": 1, "role": "summoner", "ready": True,
+         "cd_left_ms": 0, "cd_total_ms": 30000},          # 召唤师号段 + 30s CD -> 判为惩击
+    ]
+    st_cj["extra"]["mem_units"] = [
+        {"cid": 16100, "kind": "monster", "camp": 2, "x": 700, "z": 300,
+         "hp": 2000, "hp_max": 9000, "dead": False},
+    ]
+    s_cj = oa.from_state_dict(st_cj, atk_range=ATK)
+    s_cj.frame = 500
+    R._SMITE_MARK["frame"] = -10 ** 9
+    res_cj = R.r_use_chengji(s_cj, A.Action("None", "none"))
+    check("T107 UseChengji：野怪进斩杀线 -> 惩击（monster 分支）",
+          res_cj is not None and res_cj[0] == "REWRITE"
+          and res_cj[1].kind == "summoner" and "monster" in res_cj[1].label.lower(),
+          str(res_cj[2] if res_cj else None))
+
+    s_cj2 = oa.from_state_dict(st_cj, atk_range=ATK)
+    s_cj2.frame = 505                       # 只过 5 帧 -> 15 帧防连发
+    res_cj2 = R.r_use_chengji(s_cj2, A.Action("None", "none"))
+    check("T108 UseChengji：15 帧内不重复惩击",
+          res_cj2 is None, str(res_cj2))
+
+    s_cj3 = oa.from_state_dict(st_cj, atk_range=ATK)
+    s_cj3.frame = 600
+    R._SMITE_MARK["frame"] = -10 ** 9
+    res_cj3 = R.r_use_hanbing_chengji(s_cj3, A.Action("None", "none"))
+    check("T109 UseHanbingChengji：寒冰惩击射程更远，同一目标可打",
+          res_cj3 is not None and res_cj3[0] == "REWRITE"
+          and res_cj3[1].label == "UseHanbingChengji",
+          str(res_cj3[2] if res_cj3 else None))
+
+    # ---- 26. 传送 ----
+    st_tp = fixture(hp_ratio=0.9, enemy_dist=40000)
+    st_tp["extra"]["mem_heroes"][0]["skills"] = [
+        {"slot": 6, "id": 88888, "level": 1, "role": "summoner", "ready": True,
+         "cd_left_ms": 0, "cd_total_ms": 75000},
+    ]
+    st_tp["extra"]["mem_units"] = []
+    s_tp = oa.from_state_dict(st_tp, atk_range=ATK)
+    R._SMITE_MARK["frame"] = -10 ** 9
+    res_tp0 = R.r_use_chuansong_skill(s_tp, A.Action("None", "none"))
+    SM.KNOWN_IDS[88888] = "teleport"        # 模拟"真机确认了传送 id"
+    try:
+        s_tp2 = oa.from_state_dict(st_tp, atk_range=ATK)
+        s_tp2.organ_geo = {
+            "friend_top_tower": (-20000.0, 20000.0),
+            "friend_bottom_tower": (-20000.0, -20000.0),
+            "friend_crystal": (-50000.0, -50000.0),
+            "enemy_crystal": (50000.0, 50000.0),
+        }
+        s_tp2.self_x, s_tp2.self_z = 0.0, 0.0
+        s_tp2.minions = [A.Unit(kind="minion", cid=1690, camp=2,
+                                x=-20000.0, z=20000.0, hp=500, hp_max=1200)
+                         for _ in range(3)]
+        res_tp1 = R.r_use_chuansong_skill(s_tp2, A.Action("None", "none"))
+    finally:
+        SM.KNOWN_IDS.pop(88888, None)
+    check("T110 传送：未配置 id 时惰性（不乱交召唤师技能）", res_tp0 is None, str(res_tp0))
+    check("T111 传送：配置后选兵线压力最大的己方塔",
+          res_tp1 is not None and res_tp1[0] == "REWRITE"
+          and res_tp1[1].meta.get("slot_name") == "friend_top_tower",
+          str(res_tp1[2] if res_tp1 else None))
+
+    # ---- 27. 无目标技能优化 ----
+    st_nt = fixture(hp_ratio=0.9, enemy_dist=30000)
+    s_nt = oa.from_state_dict(st_nt, atk_range=ATK)
+    gone = A.Unit(kind="hero", cid=107, camp=2, x=50000.0, z=50000.0,
+                  hp=800, hp_max=4000)          # 目标已远出射程
+    act_nt = A.Action("AtkHeroSkill1", "skill", A.T_HERO, gone, 1)
+    res_nt = R.r_optimize_pos_skill_when_notarget(s_nt, act_nt)
+    check("T112 OptimizePosSkillWhenNotarget：目标出射程 -> 换备选目标",
+          res_nt is not None and res_nt[0] == "REWRITE"
+          and res_nt[1].meta.get("backup") is True,
+          str(res_nt[2] if res_nt else None))
+
+    s_nt2 = oa.from_state_dict(fixture(hp_ratio=0.9, enemy_dist=40000), atk_range=ATK)
+    s_nt2.minions, s_nt2.monsters = [], []
+    res_nt2 = R.r_optimize_pos_skill_when_notarget(s_nt2, act_nt)
+    check("T113 OptimizePosSkillWhenNotarget：无备选 -> VETO 这次技能",
+          res_nt2 is not None and res_nt2[0] == "VETO",
+          str(res_nt2[2] if res_nt2 else None))
+
+    res_dir = R.r_optimize_dir_skill_when_notarget(
+        s_nt, A.Action("AtkHeroSkill1", "skill", A.T_HERO, None, 1))
+    check("T114 OptimizeDirSkillWhenNotarget：无目标技能 -> 否决（本层无定向施法）",
+          res_dir is not None and res_dir[0] == "VETO"
+          and res_dir[2].startswith("reset_dir_no_target"),
+          str(res_dir[2] if res_dir else None))
+
+    # ---- 28. GenMovePos 的 144 格解码 ----
+    s_g = oa.from_state_dict(fixture(hp_ratio=1.0, enemy_dist=800), atk_range=ATK)
+    cells = GD.cells(s_g)
+    gm = GD.gen_move_pos(s_g)
+    check("T115 GenMovePos：12×12=144 格解码 + 距离/障碍校验",
+          GD.GRID_N * GD.GRID_N == 144 and len(cells) == 144
+          and gm is not None and gm["dist"] <= GD.MAX_MOVE_DIST,
+          f"cells={len(cells)} best={gm and gm['point']}")
+
+    # ---- 29. GetRetreatPos：塔 vs 水晶 ----
+    s_rp = oa.from_state_dict(fixture(hp_ratio=0.5, enemy_dist=3000), atk_range=ATK)
+    s_rp.organ_geo = {
+        "friend_crystal": (-50000.0, -50000.0),
+        "friend_mid_2nd_tower": (-8000.0, -8000.0),
+        "enemy_crystal": (50000.0, 50000.0),
+    }
+    s_rp.organ_alive = {}
+    s_rp.organs = []                                  # 清掉活体塔，隔离到静态几何路径
+    # 在塔的**外侧**（离水晶比塔离水晶更远）-> 退到塔
+    s_rp.self_x, s_rp.self_z = 0.0, 0.0
+    p_tower = VF2.retreat_pos(s_rp)
+    # 已经退到塔**后方**（离水晶比塔更近）-> 直接回水晶
+    s_rp.self_x, s_rp.self_z = -12000.0, -12000.0
+    p_crystal = VF2.retreat_pos(s_rp)
+    check("T116 GetRetreatPos：远则退塔、近则回水晶",
+          p_tower == (-8000.0, -8000.0) and p_crystal == (-50000.0, -50000.0),
+          f"{p_tower} / {p_crystal}")
+
+    # ---- 30. 规则链规模 ----
+    cs = R.chain_stats()
+    check("T117 规则链 37/38（第五、六批共 9 条已注册）",
+          cs["implemented"] == 37 and cs["total"] == 38, str(cs))
+
+    # ---- 31. 召唤师技能识别不许误判英雄技能 ----
+    st_fp = fixture(hp_ratio=0.9)
+    st_fp["extra"]["mem_heroes"][0]["skills"] = [
+        {"slot": 1, "id": 10610, "level": 1, "ready": True, "cd_left_ms": 0, "cd_total_ms": 5000},
+        {"slot": 3, "id": 10630, "level": 1, "ready": True, "cd_left_ms": 0, "cd_total_ms": 30000},
+    ]
+    s_fp = oa.from_state_dict(st_fp, atk_range=ATK)
+    check("T118 英雄技能（含 30s CD 的大招）不被误判成惩击",
+          SM.slots_of(s_fp.self_unit) == [] and not SM.is_smite(s_fp.self_unit),
+          str(SM.slots_of(s_fp.self_unit)))
+
+    # ---- 32. IsInSavePlace：已在安全点就别再往家跑 ----
+    s_sp = oa.from_state_dict(fixture(hp_ratio=0.25, enemy_dist=30000), atk_range=ATK)
+    s_sp.organ_geo = {"friend_mid_1st_tower": (0.0, 0.0),
+                      "friend_crystal": (-50000.0, -50000.0),
+                      "enemy_crystal": (50000.0, 50000.0)}
+    s_sp.self_x, s_sp.self_z = 100.0, 100.0          # 塔下
+    rc = A.Action("ReturnCity", "move", point=(-50000.0, -50000.0))
+    res_sp = R.r_is_in_save_place(s_sp, rc)
+    s_sp.self_x, s_sp.self_z = 20000.0, 20000.0      # 远离
+    res_sp2 = R.r_is_in_save_place(s_sp, rc)
+    check("T119 IsInSavePlace：塔下否决回城、野外放行",
+          res_sp is not None and res_sp[0] == "REWRITE"
+          and res_sp[1].label == "Stand" and res_sp2 is None,
+          f"{res_sp and res_sp[2]} / {res_sp2}")
+
+    # ---- 33. IsNowEPTooLow：蓝低不打野，但附近有敌人例外 ----
+    st_ep = fixture(hp_ratio=0.9, enemy_dist=40000)
+    st_ep["extra"]["mem_heroes"][0].update({"ep": 400, "ep_max": 4000})   # 10%
+    st_ep["extra"]["mem_units"] = [
+        {"cid": 16100, "kind": "monster", "camp": 2, "x": 600, "z": 200,
+         "hp": 8000, "hp_max": 9000, "dead": False},
+    ]
+    s_ep = oa.from_state_dict(st_ep, atk_range=ATK)
+    mon_act2 = next(a for a in A.enumerate_actions(s_ep) if a.target_kind == A.T_MONSTER)
+    res_ep = R.r_is_now_ep_too_low(s_ep, mon_act2)
+    st_ep2 = fixture(hp_ratio=0.9, enemy_dist=200)
+    st_ep2["extra"]["mem_heroes"][0].update({"ep": 400, "ep_max": 4000})
+    st_ep2["extra"]["mem_units"] = st_ep["extra"]["mem_units"]
+    s_ep2 = oa.from_state_dict(st_ep2, atk_range=ATK)
+    mon_act3 = next(a for a in A.enumerate_actions(s_ep2) if a.target_kind == A.T_MONSTER)
+    res_ep2 = R.r_is_now_ep_too_low(s_ep2, mon_act3)
+    check("T120 IsNowEPTooLow：蓝低不打野；附近有敌人则例外",
+          res_ep is not None and res_ep[0] == "VETO" and res_ep2 is None,
+          f"{res_ep and res_ep[2]} / {res_ep2}")
+
+    # ---- 34. GetHeroSpeedUpSkill：撤退时交闪现拉开 ----
+    st_su = fixture(hp_ratio=0.3, enemy_dist=400)
+    st_su["extra"]["mem_heroes"][0]["skills"] = [
+        {"slot": 6, "id": 80115, "level": 1, "role": "summoner", "ready": True,
+         "cd_left_ms": 0, "cd_total_ms": 120000},
+    ]
+    s_su = oa.from_state_dict(st_su, atk_range=ATK)
+    res_su = R.r_get_hero_speed_up_skill(s_su, A.Action("Retreat", "move", point=(-3000, 0)))
+    s_su2 = oa.from_state_dict(fixture(hp_ratio=0.3, enemy_dist=5000), atk_range=ATK)
+    res_su2 = R.r_get_hero_speed_up_skill(s_su2, A.Action("Retreat", "move", point=(-3000, 0)))
+    check("T121 GetHeroSpeedUpSkill：近敌撤退交闪现、远敌不交",
+          res_su is not None and res_su[0] == "REWRITE"
+          and res_su[1].meta.get("role") == "flash" and res_su2 is None,
+          f"{res_su and res_su[2]} / {res_su2}")
+
+    # ---- 35. CheckUseZhongjie：未配置 id 时惰性；配置后收割残血 ----
+    st_zj = fixture(hp_ratio=0.9, enemy_dist=600)
+    st_zj["extra"]["mem_heroes"][1].update({"hp": 600, "hp_max": 4000})   # 敌 15%
+    st_zj["extra"]["mem_heroes"][0]["skills"] = [
+        {"slot": 6, "id": 88887, "level": 1, "role": "summoner", "ready": True,
+         "cd_left_ms": 0, "cd_total_ms": 60000},
+    ]
+    s_zj = oa.from_state_dict(st_zj, atk_range=ATK)
+    s_zj.frame = 900
+    R._ZHONGJIE_MARK.update({"frame": -10 ** 9, "cnt": 0})
+    res_zj0 = R.r_check_use_zhongjie(s_zj, A.Action("None", "none"))
+    SM.KNOWN_IDS[88887] = "zhongjie"
+    try:
+        s_zj2 = oa.from_state_dict(st_zj, atk_range=ATK)
+        s_zj2.frame = 900
+        res_zj1 = R.r_check_use_zhongjie(s_zj2, A.Action("None", "none"))
+    finally:
+        SM.KNOWN_IDS.pop(88887, None)
+    check("T122 CheckUseZhongjie：未配置惰性 / 配置后收割残血",
+          res_zj0 is None and res_zj1 is not None and res_zj1[0] == "REWRITE"
+          and res_zj1[1].label == "UseZhongjie",
+          f"{res_zj0} / {res_zj1 and res_zj1[2]}")
+
+    # ---- 36. CalTowerDirValue：方向朝塔才加分 ----
+    s_td = oa.from_state_dict(fixture(hp_ratio=1.0, enemy_dist=40000), atk_range=ATK)
+    s_td.organ_geo = {"enemy_mid_1st_tower": (5000.0, 0.0),
+                      "enemy_crystal": (50000.0, 50000.0)}
+    s_td.organs = []
+    s_td.self_x, s_td.self_z = 0.0, 0.0
+    v_toward = VF2.tower_dir_value(s_td, 3000.0, 0.0)
+    v_away = VF2.tower_dir_value(s_td, -3000.0, 0.0)
+    check("T123 CalTowerDirValue：朝塔 1.0、背塔 0.0",
+          abs(v_toward - 1.0) < 1e-6 and v_away == 0.0, f"{v_toward:.2f}/{v_away:.2f}")
+
+    # ---- 37. 法力：内存绝对值优先，HUD 蓝条只作回退 ----
+    st_mp = fixture()
+    st_mp["self_state"] = {"cid": 106, "mp": 450, "mp_max": 1000}
+    st_mp["ui"]["mp"] = 0.9          # 故意给错的 HUD 蓝条，验证内存优先
+    snap_mp = oa.from_state_dict(st_mp, atk_range=ATK)
+    me_mp = snap_mp.self_unit
+    check("T124 法力走内存绝对值（ep/ep_max 不被比例覆盖）",
+          me_mp.ep == 450.0 and me_mp.ep_max == 1000.0
+          and abs((me_mp.ep_rate or 0) - 0.45) < 1e-9,
+          f"ep={me_mp.ep}/{me_mp.ep_max} rate={me_mp.ep_rate}")
+    check("T125 内存与 HUD 冲突时以内存为准",
+          abs((snap_mp.self_ep_rate or 0) - 0.45) < 1e-9,
+          f"rate={snap_mp.self_ep_rate}（HUD 给的是 0.9）")
+
+    st_hud = fixture()
+    st_hud["ui"]["mp"] = 0.3
+    snap_hud = oa.from_state_dict(st_hud, atk_range=ATK)
+    me_hud = snap_hud.self_unit
+    check("T126 无法力内存时退回 HUD 比例（ep_max=1 不伪造绝对值）",
+          abs((me_hud.ep_rate or 0) - 0.3) < 1e-9 and me_hud.ep_max == 1.0,
+          f"ep={me_hud.ep}/{me_hud.ep_max} rate={me_hud.ep_rate}")
+
+    from wzry.decision.official_ai import features as FE
+    pack_mp = FE.build(snap_mp)
+    v_ep = pack_mp.get("self", "ep")
+    v_rate = pack_mp.get("self", "ep_rate")
+    check("T127 特征列 ep/ep_rate 均为比例且取自内存",
+          v_ep is not None and abs(v_ep - 0.45) < 1e-6
+          and v_rate is not None and abs(v_rate - 0.45) < 1e-6,
+          f"ep={v_ep} rate={v_rate}")
+
+    # ---- 38. 装备 ID 表与复活甲分支 ----
+    from wzry.decision.official_ai import equips as EQ
+    tbl = EQ.load()
+    check("T128 装备表可加载且复活甲 ID 唯一",
+          len(tbl.get("items") or {}) >= 100
+          and EQ.revive_ids() == {1337}
+          and EQ.name_of(1337) == "贤者的庇护",
+          f"n={len(tbl.get('items') or {})} revive={EQ.revive_ids()}")
+    check("T129 is_revive_armor 只认复活甲",
+          EQ.is_revive_armor([1422, 1337]) and not EQ.is_revive_armor([1422, 1137])
+          and not EQ.is_revive_armor([]) and not EQ.is_revive_armor(None),
+          f"{EQ.names([1422, 1337])}")
+
+    st_eq = fixture()
+    for h in st_eq["extra"]["mem_heroes"]:
+        if h.get("id") == 106:
+            h["equip_ids"] = [1422, 1337, 1137]
+    snap_eq = oa.from_state_dict(st_eq, atk_range=ATK)
+    check("T130 快照从装备表推出复活甲可用",
+          snap_eq.revive_armor_usable is True and 1337 in snap_eq.self_equip,
+          f"equip={snap_eq.self_equip} revive={snap_eq.revive_armor_usable}")
+
+    from wzry.decision import official_rules as ORL
+    no_ret, why = ORL.return_city_decision(hp=0.9, revive_armor_usable=True,
+                                           strategy_return=True)
+    check("T131 有复活甲时否决策略回城（官方 not return 分支）",
+          no_ret is False and why == ORL.RETURN_CITY_FUHUOJIA, f"{no_ret}/{why}")
+    ret_low, why_low = ORL.return_city_decision(hp=0.1, revive_armor_usable=True)
+    check("T132 复活甲不拦低血回城（官方顺序：hp 门槛在前）",
+          ret_low is True, f"{ret_low}/{why_low}")
+
     print(f"\n结果: {PASS}/{PASS + FAIL} 通过")
     if FAILS:
         print("失败项:", ", ".join(FAILS))

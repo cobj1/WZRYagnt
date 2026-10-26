@@ -20,7 +20,9 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 from .. import official_rules as orl
-from .actions import Action, T_CRYSTAL, T_MONSTER, T_SOLDIER, T_TOWER
+from . import summoner as _summoner
+from .actions import Action, T_CRYSTAL, T_HERO, T_MONSTER, T_SOLDIER, T_TOWER
+from .features import skill_range as _skill_range
 from .snapshot import Snapshot
 
 PASS = "PASS"
@@ -95,6 +97,55 @@ EMY_HIGH_RETURN_HP = 0.40
 # StayWithMonsterUsingSkill @0x027e620c：日志 "Ignore, main hero has low hp" +
 #   "Ignore, no target monster" —— 残血不打、无目标不打；血量门限复用 MONSTER_MIN_HP_RATE。
 
+# ---- 2026-10-25 第五批：惩击 / 寒冰惩击 / 传送 / 无目标技能优化 ----
+# UseChengji @0x027e0ba0 日志原文（分支顺序即判定顺序）：
+#   `not use, not hanbing chengji, skill_config_id:%d`   → 召唤师技能不是惩击系
+#   `no enemy hero nearby, not use`                      → 附近没敌方英雄
+#   `not use, skill num error : %d`
+#   `use forbid` / `not use, skill not usable`           → 被禁 / CD 中
+#   `kUseSummonSkill monster` / `kUseSummonSkill hero`    → 对野怪 / 对英雄施放
+# 立即数 112 / 150 / 184（150 与到达阈值同源；112/184 为伤害/距离档）。
+SMITE_MONSTER_HP = 6000.0        # 野怪可被惩击抢的血量上限（工程值，按惩击伤害量级取）
+SMITE_MONSTER_RANGE = 1500.0     # 惩击对野怪的作用距离（立即数 150 的量级 × 10）
+SMITE_HERO_RANGE = 1120.0        # 对英雄（立即数 112 的量级 × 10）
+SMITE_HERO_HP_RATE = 0.35        # 对英雄惩击的收割门限
+# UseHanbingChengji @0x027e09b0：`summon_skill_frame_no:%d + 15 < m_cur_frame_no:%d`
+#   （15 帧防连发，与治疗同源）+ `not use, out of range, dis:%d`
+SMITE_MIN_FRAMES = 15
+# UseChuanSongSkill @0x027f3f00：日志 `rule_use_chuansong_skill` / `chuansong target:%d`
+#   配置键 `MIN_CRYSTAL_DIST_CHUANSONG` —— 传送目标离敌方水晶太近时不传。
+#   `chuansong target:%d` 打的是**具名槽位**（22 槽位表的索引），所以目标必须是己方建筑。
+CHUANSONG_MIN_CRYSTAL_DIST = 8000.0   # 目标点离敌方水晶的最小距离
+CHUANSONG_MIN_SELF_DIST = 6000.0       # 太近就没必要传（走过去更快）
+# OptimizePosSkillWhenNotarget @0x027f0000：`cannot find target in range %d` /
+#   `change the target to the backup target. & new Dist is %d` —— 技能没目标就换备选目标。
+BACKUP_TARGET_SLACK = 1.35             # 备选目标的射程放宽系数（与技能射程判定同源）
+# OptimizeDirSkillWhenNotarget @0x027f02a8：`reset the direction at frame :%d` /
+#   `cannot find target in range %d` —— 无目标时把技能方向重置为主移动方向。
+
+# ---- 2026-10-25 第六批：安全点 / 终结 / 撤退加速 / 打野蓝量 ----
+# IsInSavePlace @0x27db060 日志 `[IsInSavePlace] Tower` / `[IsInSavePlace] Crystal`；
+#   立即数 50400 与"半径²"量级不符（更像配置下标），故半径取工程值：
+#   塔下 900（≈塔攻击圈）、水晶下 1400（水晶圈更大）。
+SAVE_PLACE_TOWER_R = 900.0
+SAVE_PLACE_CRYSTAL_R = 1400.0
+# CheckUseZhongjie @0x027e126c 日志（分支顺序即判定顺序）：
+#   `summon_skill_frame_no:%d + 15 < m_cur_frame_no:%d`（15 帧防连发）
+#   `not use, not zhongjie, skill_config_id:%d`
+#   `not use, skill not usable`
+#   `target_rumtime_id:%d hp_rate:%f dis:%d`（目标残血 + 距离）
+#   `not use, m_summon_skill_frame_cnt:%d >= MAX_SUMMON_SKILL_FRAME_CNT:%d`（总次数上限）
+ZHONGJIE_HP_RATE = 0.28          # 斩杀线（工程值：终结伤害量级 / 满血 4000）
+ZHONGJIE_RANGE = 900.0
+ZHONGJIE_MIN_FRAMES = 15         # 与治疗/寒冰惩击同源
+ZHONGJIE_MAX_USES = 3            # MAX_SUMMON_SKILL_FRAME_CNT（官方表不随包，取保守值）
+# GetHeroSpeedUpSkill @0x27de90c 日志 `[GetHeroSpeedUpSkill] res: %d` /
+#   `IsSummonSkillUsableToRetreat` / `is_use_model_shanxian:%d` —— 撤退时用位移技能拉开。
+SPEEDUP_ENEMY_RADIUS = 700.0     # 敌人在这个距离内才值得交闪现
+# IsNowEPTooLow @0x027df1e8 日志 `Attacking monster.` / `EP Too Low, No Enemy Around.` /
+#   `EP Too Low` —— 打野时蓝量不足就别打（除非附近有敌人要打你）。
+EP_LOW_RATE = 0.30
+
 
 
 @dataclass
@@ -117,9 +168,19 @@ class Rule:
 
 
 def _retreat(snap: Snapshot) -> Action:
-    """撤退点：朝己方泉水方向退 `step`（统一口径见 `Snapshot.retreat_point`）。"""
-    return Action("Retreat", "move", point=snap.retreat_point(),
-                  meta={"retreat": True})
+    """撤退点：官方 `GetRetreatPos @0x027e1b98`（退到塔 or 回水晶，按四个距离量选）。
+
+    退化路径：算不出时用 `Snapshot.retreat_point`（朝泉水走一步）。
+    """
+    pt = None
+    try:
+        from . import field as _vf
+        pt = _vf.retreat_pos(snap)
+    except Exception:
+        pt = None
+    if pt is None:
+        pt = snap.retreat_point()
+    return Action("Retreat", "move", point=pt, meta={"retreat": True})
 
 
 def _return_city(snap: Snapshot) -> Action:
@@ -170,8 +231,12 @@ def r_check_return_city(snap: Snapshot, act: Action):
     if me is None:
         return None
     hp = me.hp_rate
-    # ep 分支：数据链已打通（HUD 蓝条比例），阈值未从汇编确定 -> 保持 None = 不触发
-    need, reason = orl.return_city_decision(hp=hp, ep=snap.self_ep_rate)
+    # ep 分支：数据链已打通（内存 EP_CUR/EP_MAX -> 比例），阈值未从汇编确定 -> 保持 None = 不触发。
+    # 复活甲分支：`configs/equip_ids.json` 已建（官方赛事数据 132 件），ID 1337=贤者的庇护；
+    #   官方顺序是 hp 门槛在前、复活甲在后，所以它只在"血够但策略想回城"时否决。
+    need, reason = orl.return_city_decision(
+        hp=hp, ep=snap.self_ep_rate,
+        revive_armor_usable=snap.revive_armor_usable)
     if not need:
         return None
     # 已经在撤退/回城动作上，不重复改写
@@ -230,12 +295,17 @@ def r_dont_take_blood_pack(snap: Snapshot, act: Action):
 
 
 def r_wait_revive_armor(snap: Snapshot, act: Action):
-    """RuleTactics::WaitResurrectionArmor —— 装备栏已通，缺 ID→名称映射。
+    """RuleTactics::WaitResurrectionArmor —— 数据已可得，语义仍只有名字证据。
 
-    现状（2026-10-21）：`snap.self_equip` 能拿到已购装备的 config_id 序列，
-    但 `equip_config_id_file` 不随包，无法判断"哪个 ID 是复活甲（贤者的庇护）"。
-    在自建常用装备表之前**不猜**：宁可返回 None，也不按"装备数量"瞎猜。
-    待办：把常用 30~50 件装备的 ID 与名称钉进 `configs/equip_ids.json`，再启用本条。
+    2026-10-26 更新：装备 ID 表已建（`configs/equip_ids.json`，132 件，
+    复活甲 = 1337 贤者的庇护），`snap.revive_armor_usable` 已能取到真实值。
+    但本条**仍保持惰性**，理由有两条：
+      1. 官方同名的 `CheckReturnCity` 分支（`not return, fuhuojia usable`，
+         有汇编证据）已在本模块 `r_check_return_city` 里消费同一份数据；
+         再实现一条同义规则只会造成重复触发与归因混乱。
+      2. `WaitResurrectionArmor` 自身只有规则名，没有常量/指令级证据，
+         无法区分"等复活甲 CD 好"与"有复活甲所以敢打"两种相反语义。
+    待拿到该函数的常量或日志串后，再按 `evidence="disasm"` 实现。
     """
     return None
 
@@ -694,6 +764,365 @@ def _main_move_degree(snap: Snapshot) -> Optional[float]:
     return _deg_to(snap, pt)
 
 
+_SMITE_MARK = {"frame": -10 ** 9}
+
+
+def _summon(label: str, slot: int, role: str, **meta) -> Action:
+    m = {"slot": int(slot), "role": role}
+    m.update(meta)
+    return Action(label, "summoner", meta=m)
+
+
+def _smite_pick_monster(snap: Snapshot):
+    """惩击的野怪目标：血量已进入惩击斩杀线且在作用距离内（最近优先）。"""
+    best, bestd = None, 1e18
+    for m in snap.monsters:
+        if not m.alive or m.x is None or m.z is None:
+            continue
+        if (m.hp or 0) <= 0 or (m.hp or 0) > SMITE_MONSTER_HP:
+            continue
+        d = snap.dist(m)
+        if d > SMITE_MONSTER_RANGE or d >= bestd:
+            continue
+        best, bestd = m, d
+    return best, bestd
+
+
+def _smite_pick_hero(snap: Snapshot):
+    """惩击的英雄目标：残血且在作用距离内（官方 `kUseSummonSkill hero` 分支）。"""
+    best, bestd = None, 1e18
+    for h in snap.enemies():
+        if not h.alive or h.x is None or h.z is None:
+            continue
+        if h.hp_rate > SMITE_HERO_HP_RATE:
+            continue
+        d = snap.dist(h)
+        if d > SMITE_HERO_RANGE or d >= bestd:
+            continue
+        best, bestd = h, d
+    return best, bestd
+
+
+def r_use_chengji(snap: Snapshot, act: Action):
+    """RuleTactics::UseChengji @0x027e0ba0 —— 惩击（抢野 / 收割）。
+
+    分支与官方日志逐条对应：
+      `not use, not hanbing chengji, skill_config_id:%d` → 不是惩击系就退出（`summoner.find` 判）；
+      `not use, skill not usable`                        → CD 中就退出；
+      `kUseSummonSkill monster`                          → 野怪进入斩杀线，优先惩野；
+      `no enemy hero nearby, not use`                    → 想惩英雄时，附近没有敌英雄就退出。
+    """
+    me = snap.self_unit
+    if me is None:
+        return None
+    sm = _summoner.find(me, "smite")
+    if sm is None or sm["cd_left_ms"] > 0:
+        return None
+    if int(snap.frame) - int(_SMITE_MARK["frame"]) < SMITE_MIN_FRAMES:
+        return None
+
+    mon, md = _smite_pick_monster(snap)
+    if mon is not None:
+        _SMITE_MARK["frame"] = int(snap.frame)
+        return REWRITE, _summon("UseChengjiMonster", sm["slot"], "smite",
+                                target=(mon.x, mon.z), dist=md), \
+            f"chengji_monster:{mon.cid}:{int(mon.hp or 0)}"
+
+    hero, hd = _smite_pick_hero(snap)
+    if hero is not None:
+        _SMITE_MARK["frame"] = int(snap.frame)
+        return REWRITE, _summon("UseChengjiHero", sm["slot"], "smite",
+                                target=(hero.x, hero.z), dist=hd), \
+            f"chengji_hero:{hero.cid}"
+    return None
+
+
+def r_use_hanbing_chengji(snap: Snapshot, act: Action):
+    """RuleTactics::UseHanbingChengji @0x027e09b0 —— 寒冰惩击（升级版，射程更远）。
+
+    比 `UseChengji` 多的两条判据（都在日志里）：
+      `summon_skill_frame_no:%d + 15 < m_cur_frame_no:%d` → 15 帧防连发（与治疗同源）；
+      `not use, out of range, dis:%d`                     → 超距直接退出。
+    射程用 `SMITE_MONSTER_RANGE * 1.4`（升级版射程更远，工程放大系数）。
+    """
+    me = snap.self_unit
+    if me is None:
+        return None
+    sm = _summoner.find(me, "smite")
+    if sm is None or sm["cd_left_ms"] > 0:
+        return None
+    if int(snap.frame) - int(_SMITE_MARK["frame"]) < SMITE_MIN_FRAMES:
+        return None
+    far = SMITE_MONSTER_RANGE * 1.4
+    mon, md = _smite_pick_monster(snap)
+    if mon is not None and md <= far:
+        _SMITE_MARK["frame"] = int(snap.frame)
+        return REWRITE, _summon("UseHanbingChengji", sm["slot"], "smite",
+                                target=(mon.x, mon.z), dist=md), \
+            f"hanbing_chengji:{mon.cid}"
+    return None
+
+
+def _chuansong_target(snap: Snapshot):
+    """传送目标：己方建筑里"兵线压力最大"的那座塔（`chuansong target:%d` 打的是槽位索引）。
+
+    判据（`MIN_CRYSTAL_DIST_CHUANSONG`）：
+      1. 目标离**敌方**水晶必须 > `CHUANSONG_MIN_CRYSTAL_DIST`（太深会被秒）；
+      2. 目标离自己 > `CHUANSONG_MIN_SELF_DIST`（太近走过去就行，不值得交传送）；
+      3. 附近敌方小兵越多越优先（传送的意义就是补线）。
+    """
+    if snap.self_x is None or snap.self_z is None:
+        return None
+    ec = None
+    for name in ("enemy_crystal", "enemy_spring_tower"):
+        g = (snap.organ_geo or {}).get(name)
+        if g is not None:
+            ec = g
+            break
+    best, bestscore = None, -1
+    for name, (gx, gz) in (snap.organ_geo or {}).items():
+        if not name.startswith("friend_") or "crystal" in name or "spring" in name:
+            continue
+        if snap.organ_alive.get(name) is False:
+            continue
+        d_self = math.hypot(gx - snap.self_x, gz - snap.self_z)
+        if d_self < CHUANSONG_MIN_SELF_DIST:
+            continue
+        if ec is not None and math.hypot(gx - ec[0], gz - ec[1]) < CHUANSONG_MIN_CRYSTAL_DIST:
+            continue
+        pressure = sum(1 for m in snap.minions
+                       if m.alive and m.camp is not None and m.camp != snap.self_camp
+                       and math.hypot((m.x or 0) - gx, (m.z or 0) - gz) < 2500.0)
+        if pressure > bestscore:
+            best, bestscore = (name, gx, gz), pressure
+    return best
+
+
+def r_use_chuansong_skill(snap: Snapshot, act: Action):
+    """RuleTactics::UseChuanSongSkill @0x027f3f00 —— 传送（补线 / 回防）。
+
+    日志：`rule_use_chuansong_skill` / `chuansong target:%d`；
+    配置键 `MIN_CRYSTAL_DIST_CHUANSONG` 决定"能不能传到这里"。
+
+    ⚠️ 默认**惰性**：`summoner.KNOWN_IDS` 里没有传送的 id（未实测到），
+    所以 `find(me,"teleport")` 返回 None 时这条规则什么都不做。
+    真机上确认了传送的 skill_config_id 后，写进 `configs/summoner_skills.json` 即生效。
+    """
+    me = snap.self_unit
+    if me is None:
+        return None
+    tp = _summoner.find(me, "teleport")
+    if tp is None or tp["cd_left_ms"] > 0:
+        return None
+    if snap.enemy_hero_min_dist() < orl.DANGER_DIST:
+        return None                      # 打架中不传送
+    tgt = _chuansong_target(snap)
+    if tgt is None:
+        return None
+    name, gx, gz = tgt
+    return REWRITE, _summon("UseChuanSongSkill", tp["slot"], "teleport",
+                            target=(gx, gz), slot_name=name), f"chuansong:{name}"
+
+
+def r_optimize_pos_skill_when_notarget(snap: Snapshot, act: Action):
+    """RuleTactics::OptimizePosSkillWhenNotarget @0x027f0000 —— 技能没目标就换备选目标。
+
+    日志：`cannot find target in range %d` / `change the target to the backup target.
+    & new Dist is %d`。也就是：技能原目标丢了（死亡/位移出射程）时，
+    在 `射程 × BACKUP_TARGET_SLACK` 内重新挑一个，挑不到才放弃这次技能。
+    """
+    if act.kind != "skill" or act.skill_slot <= 0:
+        return None
+    me = snap.self_unit
+    if me is None:
+        return None
+    rng = float(_skill_range(me))
+    if act.target is not None and act.target.alive and snap.dist(act.target) <= rng:
+        return None                                  # 原目标还在射程内，不用动
+
+    pool = [u for u in (list(snap.enemies()) + list(snap.minions) + list(snap.monsters))
+            if u.alive and u.x is not None and u.z is not None
+            and (u.camp is None or u.camp != snap.self_camp)]
+    pool = [u for u in pool if snap.dist(u) <= rng * BACKUP_TARGET_SLACK]
+    if not pool:
+        return VETO, None, f"no_backup_target_in_range:{int(rng)}"
+    bk = min(pool, key=snap.dist)
+    new = Action(f"{act.label}Backup", "skill", act.target_kind, bk, act.skill_slot,
+                 meta={"dist": snap.dist(bk), "backup": True})
+    return REWRITE, new, f"backup_target:{bk.cid}:{int(snap.dist(bk))}"
+
+
+def r_optimize_dir_skill_when_notarget(snap: Snapshot, act: Action):
+    """RuleTactics::OptimizeDirSkillWhenNotarget @0x027f02a8 —— 无目标技能重置方向。
+
+    日志：`reset the direction at frame :%d` / `cannot find target in range %d`。
+    官方会把技能方向重置为**主移动方向**再放（技能可以空放，方向不能沿用上一帧）。
+
+    ⚠️ 我们的执行层只有 `tap`（自动瞄准），没有定向施法 —— 空放等于白交 CD。
+    所以这里取"重置方向"在本执行层下的**等价语义：否决**。
+    等执行层支持定向技能（`mode="drag"` + 帧坐标）后，改为输出带 `dir_deg` 的动作即可。
+    """
+    if act.kind != "skill" or act.skill_slot <= 0:
+        return None
+    if act.target is not None:
+        return None
+    deg = _main_move_deg(snap)
+    return VETO, None, f"reset_dir_no_target:{'-' if deg is None else int(deg)}"
+
+
+def in_save_place(snap: Snapshot) -> str:
+    """是否在"安全点"（己方塔下 / 水晶下）。对应 `IsInSavePlace @0x27db060`。
+
+    日志只有两个分支标签 `[IsInSavePlace] Tower` / `[IsInSavePlace] Crystal`，
+    说明它是**谓词**（返回"在塔下"还是"在水晶下"），不是动作规则。
+    返回 `"tower"` / `"crystal"` / `""`。
+    """
+    if snap.self_x is None or snap.self_z is None:
+        return ""
+    for name, r in (("friend_crystal", SAVE_PLACE_CRYSTAL_R),
+                    ("friend_spring_tower", SAVE_PLACE_CRYSTAL_R)):
+        g = (snap.organ_geo or {}).get(name)
+        if g is not None and math.hypot(g[0] - snap.self_x, g[1] - snap.self_z) <= r:
+            return "crystal"
+    for name, (gx, gz) in (snap.organ_geo or {}).items():
+        if not name.startswith("friend_") or "tower" not in name or "spring" in name:
+            continue
+        if math.hypot(gx - snap.self_x, gz - snap.self_z) <= SAVE_PLACE_TOWER_R:
+            return "tower"
+    return ""
+
+
+def r_is_in_save_place(snap: Snapshot, act: Action):
+    """RuleTactics::IsInSavePlace @0x27db060 —— 已经在安全点就别再往家跑了。
+
+    作用：残血时若已经站在己方塔/水晶下，**否决"继续回城"**（官方用它避免
+    "塔下还在往泉水跑"的抖动）。真正该回城的情况交给 `CheckReturnCity`。
+    """
+    if act.label not in ("ReturnCity", "Retreat"):
+        return None
+    me = snap.self_unit
+    if me is None:
+        return None
+    where = in_save_place(snap)
+    if not where:
+        return None
+    return REWRITE, Action("Stand", "move", point=(snap.self_x, snap.self_z),
+                           meta={"stand": True, "save_place": where}), \
+        f"already_save:{where}"
+
+
+_ZHONGJIE_MARK = {"frame": -10 ** 9, "cnt": 0}
+
+
+def r_check_use_zhongjie(snap: Snapshot, act: Action):
+    """RuleTactics::CheckUseZhongjie @0x027e126c —— 召唤师技能"终结"（收割残血）。
+
+    分支与日志逐条对应：
+      `summon_skill_frame_no:%d + 15 < m_cur_frame_no:%d` → 15 帧防连发；
+      `not use, not zhongjie, skill_config_id:%d`         → 不是终结就退出；
+      `not use, skill not usable`                         → CD 中就退出；
+      `target_rumtime_id:%d hp_rate:%f dis:%d`            → 目标残血且在距离内；
+      `not use, m_summon_skill_frame_cnt:%d >= MAX_...:%d` → 全场次数上限。
+    """
+    me = snap.self_unit
+    if me is None:
+        return None
+    zj = _summoner.find(me, "zhongjie")
+    if zj is None or zj["cd_left_ms"] > 0:
+        return None
+    if int(snap.frame) - int(_ZHONGJIE_MARK["frame"]) < ZHONGJIE_MIN_FRAMES:
+        return None
+    if int(_ZHONGJIE_MARK["cnt"]) >= ZHONGJIE_MAX_USES:
+        return None
+    best, bestd = None, 1e18
+    for h in snap.enemies():
+        if not h.alive or h.x is None or h.z is None:
+            continue
+        if h.hp_rate > ZHONGJIE_HP_RATE:
+            continue
+        d = snap.dist(h)
+        if d > ZHONGJIE_RANGE or d >= bestd:
+            continue
+        best, bestd = h, d
+    if best is None:
+        return None
+    _ZHONGJIE_MARK["frame"] = int(snap.frame)
+    _ZHONGJIE_MARK["cnt"] = int(_ZHONGJIE_MARK["cnt"]) + 1
+    return REWRITE, _summon("UseZhongjie", zj["slot"], "zhongjie",
+                            target=(best.x, best.z), dist=bestd), \
+        f"zhongjie:{best.cid}:{best.hp_rate:.2f}"
+
+
+def r_get_hero_speed_up_skill(snap: Snapshot, act: Action):
+    """RuleTactics::GetHeroSpeedUpSkill @0x27de90c —— 撤退时用位移技能拉开。
+
+    日志：`[GetHeroSpeedUpSkill] res: %d` / `IsSummonSkillUsableToRetreat` /
+    `is_use_model_shanxian:%d` —— 判定"撤退该不该交闪现"，方向取**远离敌人**，
+    与主移动方向一致，所以不会撞上 `StopShanxianUseInUncorrectTimeing` 的 89° 否决。
+    """
+    if act.label not in ("Retreat", "ReturnCity"):
+        return None
+    me = snap.self_unit
+    if me is None or snap.self_x is None:
+        return None
+    fl = _summoner.find(me, "flash")
+    if fl is None or fl["cd_left_ms"] > 0:
+        return None
+    foes = [h for h in snap.enemies() if h.alive and h.x is not None]
+    if not foes:
+        return None
+    near = min(foes, key=snap.dist)
+    d = snap.dist(near)
+    if d > SPEEDUP_ENEMY_RADIUS:
+        return None
+    dx, dz = snap.self_x - near.x, snap.self_z - near.z
+    n = math.hypot(dx, dz) or 1.0
+    tx, tz = snap.self_x + dx / n * 4000.0, snap.self_z + dz / n * 4000.0
+    return REWRITE, _summon("UseFlashRetreat", fl["slot"], "flash",
+                            target=(tx, tz), mode="drag"), \
+        f"speedup_flash:{int(d)}"
+
+
+def r_is_now_ep_too_low(snap: Snapshot, act: Action):
+    """RuleTactics::IsNowEPTooLow @0x027df1e8 —— 蓝量不足时不打野。
+
+    日志：`Attacking monster.` / `EP Too Low, No Enemy Around.` / `EP Too Low`。
+    三个标签构成完整语义：**打野时蓝低就停；但附近有敌人（要打架）时例外**。
+    这条正是 `ep_rate` 打通后才有意义的规则（此前 `ep` 恒 0，规则永远不触发）。
+    """
+    if act.target_kind != T_MONSTER:
+        return None
+    me = snap.self_unit
+    if me is None:
+        return None
+    ep = me.ep_rate
+    if ep is None or ep >= EP_LOW_RATE:
+        return None
+    if snap.enemy_hero_min_dist() < orl.DANGER_DIST:
+        return None                     # 附近有敌人：留着蓝打架
+    return VETO, None, f"ep_too_low:{ep:.2f}"
+
+
+def _main_move_deg(snap: Snapshot) -> Optional[float]:
+    """主移动方向（0..360）：朝最近敌人；没有敌人时朝敌方基地。"""
+    if snap.self_x is None:
+        return None
+    foes = [h for h in snap.enemies() if h.alive and h.x is not None]
+    if foes:
+        u = min(foes, key=snap.dist)
+        tx, tz = u.x, u.z
+    else:
+        try:
+            from . import field as _vf
+            tx, tz = _vf.enemy_base(snap)
+        except Exception:
+            return None
+    dx, dz = tx - snap.self_x, tz - snap.self_z
+    if abs(dx) < 1e-6 and abs(dz) < 1e-6:
+        return None
+    return math.degrees(math.atan2(dz, dx)) % 360.0
+
+
 def r_dangerous_place_retreat(snap: Snapshot, act: Action):
     """RuleTactics::DangerousPlaceRetreat @0x027de1dc —— 危险区的**动作**部分。
 
@@ -761,7 +1190,17 @@ def r_linger_in_spring(snap: Snapshot, act: Action):
 
 
 CHAIN: List[Rule] = [
-    # ---- 有汇编证据（顺序按调度器槽位近似）----
+    Rule("CheckUseZhiliao", r_check_use_zhiliao, addr="0x027e14ec",
+         evidence=EVID_NAME),
+    Rule("CheckUseZhongjie", r_check_use_zhongjie, addr="0x027e126c",
+         evidence=EVID_NAME),
+    Rule("UseChengji", r_use_chengji, addr="0x027e0ba0", evidence=EVID_NAME),
+    Rule("UseHanbingChengji", r_use_hanbing_chengji, addr="0x027e09b0",
+         evidence=EVID_NAME),
+    Rule("UseChuanSongSkill", r_use_chuansong_skill, addr="0x027f3f00",
+         evidence=EVID_NAME),
+    Rule("IsNowEPTooLow", r_is_now_ep_too_low, addr="0x027df1e8",
+         evidence=EVID_NAME),
     Rule("CheckReturnCity", r_check_return_city, "0x027df394", evidence=EVID_DISASM),
     Rule("KeepAwayFromEnemyTower", r_keep_away_from_tower, "0x027dbd98", evidence=EVID_DISASM),
     Rule("IsInDangerousPlace", r_dangerous_place, "0x027db2ac", evidence=EVID_DISASM),
@@ -769,7 +1208,6 @@ CHAIN: List[Rule] = [
     Rule("FrdFzDonotTakeBloodPack", r_dont_take_blood_pack,
          addr="0x027d9030", evidence=EVID_NAME),
     Rule("WaitResurrectionArmor", r_wait_revive_armor, implemented=False),
-    # ---- 名字级（语义推断，常量可调）----
     Rule("AvoidKilledByOrgan", r_avoid_killed_by_organ, addr="0x027f39b4",
          evidence=EVID_NAME),
     Rule("SituationAssessmentDangerous", r_situation_dangerous, evidence=EVID_NAME),
@@ -788,7 +1226,6 @@ CHAIN: List[Rule] = [
     Rule("LongTimeOnlyAtk", r_long_time_only_atk, evidence=EVID_NAME),
     Rule("NotargetOptimizeProcess", r_notarget_optimize, addr="0x027f02a8",
          evidence=EVID_NAME),
-    # ---- 2026-10-21 新增（日志串 + 立即数已定位，判定逻辑为推断）----
     Rule("IsInEnemyHoverArea", r_is_in_enemy_hover_area, addr="0x027dfa28",
          evidence=EVID_NAME),
     Rule("StayWithMonsterUsingSkill", r_stay_with_monster_using_skill,
@@ -807,10 +1244,27 @@ CHAIN: List[Rule] = [
          addr="0x027eb200", evidence=EVID_NAME),
     Rule("DangerousPlaceRetreat", r_dangerous_place_retreat, addr="0x027de1dc",
          evidence=EVID_NAME),
-    Rule("CheckUseZhiliao", r_check_use_zhiliao, addr="0x027e14ec",
-         evidence=EVID_NAME),
     Rule("StopShanxianUseInUncorrectTimeing", r_stop_shanxian_uncorrect_timing,
          addr="0x02558f0c", evidence=EVID_NAME),
+    Rule("OptimizePosSkillWhenNotarget", r_optimize_pos_skill_when_notarget,
+         addr="0x027f0000", evidence=EVID_NAME),
+    Rule("OptimizeDirSkillWhenNotarget", r_optimize_dir_skill_when_notarget,
+         addr="0x027f02a8", evidence=EVID_NAME),
+    Rule("IsInSavePlace", r_is_in_save_place, addr="0x027db060",
+         evidence=EVID_NAME),
+    Rule("GetHeroSpeedUpSkill", r_get_hero_speed_up_skill, addr="0x027de90c",
+         evidence=EVID_NAME),
+
+]
+
+# 主链之后的收尾层（对应官方 `SetPostOptimze`）。
+#   **只接受 REWRITE**：主链已经决定了"做什么"，这里只允许把动作升级成更合适的形态
+#   （例如"撤退"升级成"撤退+闪现"），不允许否决。
+POST_CHAIN: List[Rule] = [
+    Rule("IsInSavePlace", r_is_in_save_place, addr="0x027db060",
+         evidence=EVID_NAME),
+    Rule("GetHeroSpeedUpSkill", r_get_hero_speed_up_skill, addr="0x027de90c",
+         evidence=EVID_NAME),
 ]
 
 MODES = ("all", "disasm")
@@ -851,4 +1305,22 @@ def apply_rules(snap: Snapshot, act: Action,
         if verdict == REWRITE and new_act is not None:
             final = new_act
             break
+
+    # 收尾层（只接受 REWRITE）
+    for r in POST_CHAIN:
+        if mode == "disasm" and r.evidence != EVID_DISASM:
+            continue
+        try:
+            res = r.fn(snap, final)
+        except Exception as e:
+            hits.append(RuleHit(r.name, PASS, f"error:{type(e).__name__}", r.addr,
+                                evidence=r.evidence))
+            continue
+        if not res:
+            continue
+        verdict, new_act, reason = res
+        if verdict != REWRITE or new_act is None:
+            continue
+        hits.append(RuleHit(r.name, verdict, reason, r.addr, evidence=r.evidence))
+        final = new_act
     return final, hits

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """M1 小地图感知模块测试脚本。
 
-对 E:\\WZRYagent\\temp\\tmphjhl7fk3.mp4（王者荣耀对局录像）做均匀抽样测试：
+对 D:/work/aiKings/WZRYagnt/temp/tmphjhl7fk3.mp4（王者荣耀对局录像）做均匀抽样测试：
   - 第 5000 帧开始，共抽 30 帧（间隔按视频实际帧数自适应，避免越界）；
   - 对每帧运行 wzry.vision.minimap.analyze()，统计定位成功率、各阵营圆点数、
     帧间一致性、单帧耗时；
@@ -9,8 +9,8 @@
   - 生成 REPORT.md（utf-8）。
 
 用法：
-  E:\\WZRYagent\\venv\\Scripts\\python.exe scripts\\m1_minimap_test.py
-  E:\\WZRYagent\\venv\\Scripts\\python.exe scripts\\m1_minimap_test.py --video <path> --out <dir> --frames 30
+  D:\\work\\aiKings\\WZRYagnt\\venv\\Scripts\\python.exe scripts\\m1_minimap_test.py
+  D:\\work\\aiKings\\WZRYagnt\\venv\\Scripts\\python.exe scripts\\m1_minimap_test.py --video <path> --out <dir> --frames 30
 """
 from __future__ import annotations
 

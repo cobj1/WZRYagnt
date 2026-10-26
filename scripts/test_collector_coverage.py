@@ -104,6 +104,43 @@ ok3, missing3 = rec3.coverage_gate()
 check("T11_empty_session_gate_fails", not ok3 and len(missing3) == 4, f"{missing3}")
 rec3.close()
 
+# ---- 4. 对局结果（价值模型的唯一监督信号） ----
+rec4, base4 = make_recorder()
+check("T12_result_default_none", rec4.result is None)
+check("T13_result_alias_normalized", rec4.on_result("胜利") == "win", f"{rec4.result}")
+rec4.on_state({"ui": {"hp": 1.0}, "units": [], "minimap": {"dots": {}}})
+man4 = json.loads((base4 / "sess_cov" / "manifest.json").read_text(encoding="utf-8"))
+check("T14_result_in_manifest", man4.get("result") == "win", f"result={man4.get('result')}")
+check("T15_result_meta_recorded",
+      (man4.get("meta") or {}).get("result", {}).get("value") == "win")
+try:
+    rec4.on_result("maybe")
+    bad_ok = False
+except ValueError:
+    bad_ok = True
+check("T16_result_rejects_unknown", bad_ok)
+rec4.close()
+rec6, _ = make_recorder()
+check("T17_new_session_resets_result", rec6.result is None, f"{rec6.result}")
+rec6.close()
+
+# ---- 5. finalize：对局结束/程序退出共用的收尾路径 ----
+rec7, base7 = make_recorder()
+rec7.on_state({"clock_s": 3.0, "scoreboard": [{"cid": 1}],
+               "ui": {"hp": 1.0},
+               "units": [{"cls": "enemy_hero", "pos_minimap": [0.5, 0.5]}]})
+info7 = rec7.finalize("loss", note="match_end")
+check("T18_finalize_returns_gate", isinstance(info7, dict) and info7["result"] == "loss",
+      f"{info7}")
+check("T19_finalize_closes_session", not rec7.active)
+man7 = json.loads((base7 / "sess_cov" / "manifest.json").read_text(encoding="utf-8"))
+check("T20_finalize_writes_result", man7.get("result") == "loss", f"{man7.get('result')}")
+check("T21_finalize_idempotent", rec7.finalize("win") is None)
+rec8, _ = make_recorder()
+info8 = rec8.finalize(None, note="exit")
+check("T22_finalize_without_result", info8["result"] is None and info8["gate_ok"] is False,
+      f"{info8}")
+
 print()
 if _FAIL:
     print(f"FAILED ({len(_FAIL)}/{len(_PASS) + len(_FAIL)}): " + ", ".join(_FAIL))

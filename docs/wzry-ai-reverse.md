@@ -645,12 +645,12 @@ solve -> none / stand
 
 | 官方规则 | 缺什么 | 接上即生效 |
 | --- | --- | --- |
-| `FORCE_RETURN_CITY_EP` | 蓝量 `ep` 字段 | 传 `ep=` —— **仍未打通**：当前法力在内存里还没定位（`attr+0x110/+0x128` 是上限常量、数组 `+0x1A0` 是静态配置，均已排除，见 `reverse/out/mem/ACTOR_FINDINGS.md` §11.4） |
+| `FORCE_RETURN_CITY_EP` | 蓝量 `ep` 字段 | 传 `ep=` —— ✅ `+0x1C4/+0x1C8` 已定位（`mem_source` 已接）；绝对值仍需与面板对账 |
 | `not return, fuhuojia usable` | 复活甲/装备识别 | 传 `revive_armor_usable=` —— **仍未打通**（装备栏未定位） |
 | `GANK_TIME_NOT_RETURN_CITY` | 局内时间/时段 | ✅ **已可接**：`ui.match_clock`（内存直读，秒；`--mem` 开启后写入） |
 | `GotoTargetPosWhenFirstBorn` | `state["t"]` + 目标点 | ✅ `ui.match_clock` 可作精确 `elapsed_s`；目标点已有 |
 | `IsInDangerousPlace` 小兵/朝向项 | 小兵距离、`y_action` | ⏳ 小兵位置仍缺（actor 的 slot12 对非英雄为 null） |
-| `StayWithMonster`（黑白名单 + hp 门槛） | **野怪检测**（`units` 无 monster 类） | ✅ **已可接**：`extra.mem_monsters` / `extra.mem_monsters_alive`（`config_id ∈ {16100,16101}` + hp）。注意"缺席 ≠ 已死" |
+| `StayWithMonster`（黑白名单 + hp 门槛） | **野怪检测**（`units` 无 monster 类） | ⚠️ **未打通**：`extra.mem_monsters` 恒空（`CID_MONSTER` 为空）；`16100/16101` 是红方高地塔，不是野怪（§11.9） |
 
 > v16.3 已落地：`wzry/vision/mem_battle.py` + `scripts/m2_agent_v2.py --mem`。
 > 同时修正了金币口径：`+0x200` 是**总经济**，可用金币在 `+0x15D0`
@@ -927,7 +927,7 @@ CActorManager* = *(T + 0x388)
 
 | 偏移 | 含义 |
 | --- | --- |
-| `+0x28` | 配置 ID（英雄 ID / 小兵 1690-1699 / 塔 92/95 / 野怪 16100） |
+| `+0x28` | 配置 ID（英雄 ID / 高地塔 1696–1699、16100/16101 / 塔 92/95；小兵/野怪 cid 未定位） |
 | `+0x30` | 类型：0=英雄，2=小兵/塔/野怪，1=其他 |
 | `+0x34` | 阵营：1=蓝，2=红 |
 
@@ -946,8 +946,8 @@ actor + 0x1d0 -> attr 组件：+0xc0 = 最大 HP, +0xc8 = 当前 HP
 - **注意**：`actor+0x1d0/+0x230` 的指针会随重生/换组件变化，每帧必须重读；
   旧指针会读到已释放内存，出现 `hp > hp_max` 的脏值。
 - 世界坐标有符号：蓝方为负、红方为正，量级 ±60000。
-- **小兵/塔/野怪**没有同构的位置组件（slot12 为 null），血量仍可读；
-  它们的位置字段（slot7 的路径进度）需要结合 lane 路径换算，后续再做。
+- **小兵/野怪**没有同构的位置组件（slot12 为 null），血量仍可读；建筑坐标已由 `+0x278` 出生点补齐
+  （3 秒采样 0/34 变化），小兵/野怪位置仍需结合 lane 路径或逻辑单元数组，后续再做。
 
 已落地：
 - `wzry/vision/mem_source.py`：单位的 **配置 ID / 类型 / 阵营 / 世界坐标 / 当前与最大 HP**；
@@ -960,8 +960,8 @@ actor + 0x1d0 -> attr 组件：+0xc0 = 最大 HP, +0xc8 = 当前 HP
 - 新开一局实测：10 个英雄全部读到，快帧约 **280ms**，106 在出生点时
   `screen=(0.02,0.98)`，与截图小地图泉水一致。
 
-**小兵/塔位置仍缺**：对一只小兵全部 15 个 slot 连续采样，只有计时器在变，
-没有世界坐标；它们可能在 C# 视图/网络层或 lane 路径渲染侧。
+**小兵/野怪位置仍缺**：对一只小兵全部 15 个 slot 连续采样，只有计时器在变，
+没有世界坐标；建筑坐标已由 `+0x278` 补齐（见 §11.9）。
 完整记录见 `reverse/out/mem/ACTOR_FINDINGS.md`。
 
 ### 13.11 技能剩余 CD / 召唤师技能 / 回城（2026-10-20 深夜，已打通）
@@ -1029,8 +1029,8 @@ MP 基础/成长、MP回复 基础/成长、AD 基础/成长、护甲 基础/成
    → 序列模型（tensorflow/caffe）→ `SetTacticsResult(prob, rank, cmd_idx)` → 规则覆盖。
 3. 动作空间是**「双手动作」= 目标类型 × 技能槽位**（`AtkHero/AtkSoldier/AtkTower/AtkCrystal/
    AtkMonster` × `AtkSkill1..4`），不是高层战术名。高层由规则 + `tactics_list` 概率决定。
-4. **建筑是 24 个具名槽位**（friend/enemy × crystal/spring/{mid,top,bottom}×{high, norm_1st, norm_2nd}），
-   官方按语义索引取塔，不遍历识别 —— 这条最值得抄。
+4. **建筑是 22 个具名槽位**（friend/enemy × crystal/spring/{mid,top,bottom}×{high, norm_1st, norm_2nd}），
+   对应最多 24 个单位槽；官方按语义索引取塔，不遍历识别 —— 这条最值得抄。
 5. 技能 CD / 装备 / buff 在 **AI 侧结构**（`SkillInfo{usable,cd}`、`BuffMarkState`），
    不在 actor 属性块 —— 印证了我们"在 actor/attr 里扫不到 CD"的结论。
 6. 难度是参数化的：`model_id / predict_freq / delay_frame / delay_buy_time / god_vision`，

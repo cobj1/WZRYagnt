@@ -198,17 +198,17 @@ def _self_vec(snap: Snapshot) -> List[float]:
     d: Dict[str, float] = {}
     if me is not None:
         sk = {int(s.get("slot") or 0): s for s in (me.skills or [])}
-        # 法力：内存侧无该字段（见 docs 待办 P0.2），改用 HUD 蓝条比例。
-        # 官方也是"当前值 / 该英雄上限"（`hero_ep_type_list` + `ep_max_value_dict`），
-        # 归一化后与 `ep_rate` 同值，故 ep 直接取比例、ep_rate 同口径。
-        mp = snap.self_ep_rate
-        if mp is None and me.ep_rate is not None:
-            mp = me.ep_rate
-        mp = 0.0 if mp is None else float(mp)
+        # 法力：schema 里 `ep`/`ep_rate` 都是 [0,1] 归一化列（对齐官方
+        # `ep / ep_max_value` 的归一化写法），因此两列同值。**数据源**已换成内存
+        # 绝对值（`self_state.mp ← EP_CUR/EP_MAX`）算出的比例，HUD 蓝条只作回退。
+        ep_rate = snap.self_ep_rate
+        if ep_rate is None and me.ep_rate is not None:
+            ep_rate = me.ep_rate
+        ep_rate = 0.0 if ep_rate is None else float(ep_rate)
         d.update({
             "hp": float(me.hp or 0),
             "hp_rate": me.hp_rate,
-            "ep": mp, "ep_rate": mp,
+            "ep": ep_rate, "ep_rate": ep_rate,
             "atk_range": float(me.atk_range),
             "level": float(me.level or 0),
             "gold": 0.0,

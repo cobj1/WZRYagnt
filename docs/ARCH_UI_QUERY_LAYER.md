@@ -4,7 +4,9 @@
 > 范围：`wzry/uiquery/`（UI 导航与面板识别层）、`wzry/vision/`（感知读数）、`wzry/memory/`（记忆层）、
 > 以及它们的标定寄存器与取证工具（`scripts/probe_ui_tap.py` 等）。
 > 读者：接手这个仓库的人 / 下一个会话的 agent。
-> 约定：本文里的"实测"都指**真机**（MuMu + 王者荣耀，帧空间固定 1280×720）测出来的数，不是估算。
+> 约定：本文里的"实测"都指**真机**（MuMu + 王者荣耀）测出来的数，不是估算。标定逻辑空间为 1280×720；采集帧按宽高比缩放（16:9→1280×720，20:9→1280×576）。
+>
+> **数字快照（2026-10-25 复核）**：当前 `test_new_modules.py` 198/198、`test_laya_fusion.py` 工作树 56/56（HEAD 53）；文中 111/144 为当时阶段值。
 
 ---
 
@@ -28,7 +30,7 @@
 
 ```
 ┌─ 主战斗感知（实时、连续、只读战场）──────────────────────────────┐
-│ 帧采集 1280x720 · YOLO 单位框(13类) · 小地图/圆点 · 自身血条蓝条     │
+│ 帧采集 1280×720（16:9）/ 1280×576（20:9） · YOLO 单位框(13类) · 小地图/圆点 · 自身血条蓝条     │
 │ 头顶血条(敌/友比例) · 顶部头像条 · 技能就绪(变暗) · 阵亡/击杀横幅    │
 └───────────────────────────┬──────────────────────────────────────┘
                             │ 观测
@@ -148,7 +150,7 @@ PanelNavigator(tap=None, taps=None, timeout=3.0, panel_thr=0.18, settle=0.35)
 ## 5. 寄存器与标定体系
 
 ### 5.1 坐标空间
-全项目统一 **1280×720 帧空间**（`ScreencapCapture` 把设备帧缩放到此）。
+标定逻辑空间统一为 **1280×720**；采集端 `ScreencapCapture` 保持宽高比、长边缩到 1280（20:9 → **1280×576**，16:9 → 1280×720），不再无条件拉伸到 720。
 执行区 `AdbExecutor.tap` 内部按"最近一次读到的设备显示尺寸"线性换算到设备像素，故配置里只写帧空间坐标。
 
 ### 5.2 当前寄存器（`configs/calibration_absolute.json`）
@@ -210,7 +212,7 @@ PanelNavigator(tap=None, taps=None, timeout=3.0, panel_thr=0.18, settle=0.35)
 
 | 脚本 | 用途 | 特点 |
 |---|---|---|
-| `scripts/grab_panel.py` | **监听式**取面板帧（人工点开、脚本抓屏，`--mode diff|panel`） | 抓突变帧 + 面板内数字块清单 |
+| `scripts/grab_panel.py` | **监听式**取面板帧（人工点开、脚本抓屏，`--mode diff\|panel`） | 抓突变帧 + 面板内数字块清单 |
 | `scripts/watch_enemy.py` | **敌人露头**取证（只读，不发点击） | 检测到 enemy_hero 即落盘帧 + 顶部条带，打印 camp_src 与红条比例 |
 
 `watch_enemy.py` 的存在理由：两项卡住的感知（敌方血量比例、顶部锁定目标）**只在敌人可见时才有数据**，
@@ -246,8 +248,8 @@ ally_gold, enemy_gold, ally_kills, enemy_kills
 | 读数 | 实现 | 状态 |
 |---|---|---|
 | 敌方血量比例（场景头顶红条） | `wzry/vision/hero_hp.py`（`enemy_hp_ratio` / `enemy_hp_from_dets`） | 真机团战已验证；**有 HUD 假阳问题**（见 §10） |
-| 我方/友方血量比例（顶部头像条） | `wzry/vision/top_status_bars.py` + `top_bar` 寄存器 | 管线通；**寄存器未标定** → 无数据 |
-| HUD 数字（等级/金币/技能点/剩余 CD） | `wzry/vision/digit_reader.py`（模板匹配，`digit_rois`） | 管线通；`digit_rois` **未标定** |
+| 我方/友方血量比例（顶部头像条） | `wzry/vision/top_status_bars.py` + `top_bar` 寄存器 | `top_bar` 已标定（5 槽，ally_only）并被 m2 消费；见 `extra.top_bars` |
+| HUD 数字（等级/金币/技能点/剩余 CD） | `wzry/vision/digit_reader.py`（模板匹配，`digit_rois`） | `digit_rois` 仅有 gold / item_price；等级/技能点/CD 尚未标定 |
 | 面板数字（队伍人头/经济） | `panel_rois` + `read_k_gold` | 已标定 + 三层验证 ✅ |
 | 顶部锁定目标条（选中 / 正在攻击敌方英雄时才出现） | `hero_hp.lock_target()` + `lock_target` 寄存器 | **已落地并接进 m2 状态层**：19 帧（8 有 / 11 无）全判对；填充比例与条内文字真值误差 ≤0.7pp ✅ |
 | 技能就绪/变暗、阵亡/击杀横幅 | `hok_yolov5` 探针 + 二值化 | 已落地 |
@@ -294,7 +296,7 @@ ally_gold, enemy_gold, ally_kills, enemy_kills
 
 | 等级 | 做什么 | 本次结果 |
 |---|---|---|
-| L1 离线单测 | `scripts/test_new_modules.py`：判定函数、阈值分离、白名单、写盘不覆盖、关闭验证、`lock_target`、两个占优例外 | **111/111 通过** |
+| L1 离线单测 | `scripts/test_new_modules.py`：判定函数、阈值分离、白名单、写盘不覆盖、关闭验证、`lock_target`、两个占优例外 | **111/111（当时阶段）；当前 198/198** |
 | L2 历史真机帧 | 在真实对局存证帧上跑读/判 | 战绩面板 2 帧：`12/12 + 33700/37600`、`4/4 + 12500/14400` ✅；锁定目标条 19 帧（8 有 / 11 无）全判对，三个已知真值帧比例误差 ≤0.7pp ✅ |
 | L3 实机全流程 | 真的开→读→关一条跑完 | `{"ok":true,"opened":true,"closed":true,"data":{kills:0/0, gold:1500/1500}}`，结束结构分 0.373 ✅ |
 
@@ -328,11 +330,11 @@ ally_gold, enemy_gold, ally_kills, enemy_kills
      填充比例 vs 条内文字真值：`1.000→0.995`｜`0.616→0.620`｜`0.581→0.588`（误差 ≤0.7pp）。
    - **残留**：条内那串精确血量文字仍读不准（模板把 9 读成 1、0 读成 1），所以只给比例、不给精确值；
      相机距离/皮肤可能微调条体长度，需要更多对局样本回归。
-4. **`top_bar` / `digit_rois` 未标定** → 顶部头像条读数与 HUD 数字（等级/金币/技能点）实际无数据。
+4. **`top_bar` 已标定并被 m2 消费；`digit_rois` 仅 gold / item_price**，等级/技能点/CD 等 HUD 数字尚未接入。
 5. **m2 从未主动开面板**：它读的是配置里不存在的 `panel_buttons`（只靠空 dict 兜底才回落到 `ui_taps`），
    且只读"游戏自动弹出的"面板。要不要让 agent 主动查（阵亡时 / 每 N 秒），属状态-决策层的取舍。
 6. `[重锚]` 空转与 self_hp_mp 频繁调用已修（同一座塔不重复吸 + 节流 0.3s→1.0s），是否仍有帧率瓶颈待实测。
-7. C 档尾部（阻塞）：英雄身份 ID 需补模板库/重训 CNNs（`runs/heroes`、`data/heroes` 均空）；buff/debuff 图标需检测器加类重训。
+7. C 档尾部（阻塞）：英雄身份 ID 需补模板库/重训 CNNs（`data/heroes` 已有 133 张 PNG + index.json；`runs/heroes` 不存在）；buff/debuff 图标需检测器加类重训。
 8. **读数消费情况（已消费，但只到规则层）**：
    - 已消费：`ui.lock_target_hp` → **收人头窗口**；`extra.enemy_hp_scene` / `ui.enemy_hp_min` → **占优推进**。
      两者都只放宽**接战门槛**（0.35 / 0.50，常规是 0.60），**不改移动目标**，敌英数上限（≤2）照旧生效。
@@ -341,7 +343,7 @@ ally_gold, enemy_gold, ally_kills, enemy_kills
      （含 3 处必须先修的前置、判据/目标点算法/安全闸、`off|shadow|on` 三档开关与验收指标）。
      **P0 已落地**：F1 敌塔威胁改走小地图分阵营塔（`towers_v7.enemy`，原来那条 YOLO 屏幕空间判据
      是死代码）／F2 分阵营键注入 state／F3 视野外敌人粗判据；**P1 已落地**：`push_ok` / `push_target`
-     两个纯函数（判据/目标点，**未接线**，接线是 P2 的 `--push shadow`）。离线回归 144/144，**未真机**。
+     两个纯函数；**P2 `--push shadow` 已接线并完成真机两跑**；P3 尚未切 `on`。
    - 真机验证仍缺：这两条都还没在**实机对局**里跑出过触发（盯 `[kill]` / `[press]` 两行即可确认）。
 
 ---
@@ -402,7 +404,7 @@ ally_gold, enemy_gold, ally_kills, enemy_kills
 | `scripts/probe_ui_tap.py` | scan-tap 标定 |
 | `scripts/grab_panel.py` | 监听式面板取证 |
 | `scripts/watch_enemy.py` | 敌人露头取证 |
-| `scripts/test_new_modules.py` | 离线回归（111 项） |
+| `scripts/test_new_modules.py` | 离线回归（当前 198 项；本文早期阶段为 111 项） |
 
 ### 12.3 证据文件（本次会话产出，位于 `runs/detect/live/`）
 

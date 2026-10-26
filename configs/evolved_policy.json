@@ -1,6 +1,6 @@
 {
  "version": "v11",
- "n": 19032,
+ "n": 19205,
  "buckets": {
   "hp=ok|en=0|red=1|blue=2|d=0": {
    "low_hp_safe_recall": 0.0,
@@ -74,7 +74,7 @@
   "hp=high|en=0|red=1|blue=4|d=0": {
    "no_target": 0.0,
    "support_dps_lane": -0.02,
-   "dps_lane_push": 0.077,
+   "dps_lane_push": 0.074,
    "support_dps_lane_red": 0.0
   },
   "hp=low|en=0|red=2|blue=4|d=0": {
@@ -99,7 +99,8 @@
   "hp=high|en=1|red=1|blue=3|d=0": {
    "enemy_in_skill2_range": 0.0,
    "engage_enemy": 0.0,
-   "support_dps_lane": -6.25
+   "support_dps_lane": -6.25,
+   "dps_lane_push": 0.0
   },
   "hp=high|en=1|red=1|blue=2|d=0": {
    "enemy_hero_near": 0.0,
@@ -126,7 +127,8 @@
    "enemy_hero_near": 0.667,
    "engage_enemy": 0.0,
    "enemy_in_skill2_range": 0.0,
-   "chase_enemy": 0.0
+   "chase_enemy": 0.0,
+   "dps_lane_push": 0.0
   },
   "hp=high|en=1|red=3|blue=3|d=0": {
    "enemy_hero_near": 0.0,
@@ -157,7 +159,8 @@
    "engage_enemy": 0.0
   },
   "hp=high|en=2|red=0|blue=3|d=0": {
-   "enemy_in_skill2_range": 0.0
+   "enemy_in_skill2_range": 0.0,
+   "dps_lane_push": 0.0
   },
   "hp=high|en=0|red=3|blue=4|d=0": {
    "support_dps_lane": 0.0,
@@ -175,7 +178,8 @@
    "engage_enemy": 0.0,
    "enemy_in_skill2_range": 0.0,
    "support_dps_lane": 0.0,
-   "avoid_turret": 0.0
+   "avoid_turret": 0.0,
+   "dps_lane_push": 0.0
   },
   "hp=high|en=2|red=2|blue=4|d=0": {
    "engage_enemy": 0.0
@@ -186,7 +190,8 @@
   "hp=high|en=2|red=1|blue=4|d=0": {
    "enemy_hero_near": -0.2,
    "enemy_in_skill2_range": 0.0,
-   "engage_enemy": 0.0
+   "engage_enemy": 0.0,
+   "dps_lane_push": 0.0
   },
   "hp=high|en=1|red=0|blue=2|d=0": {
    "chase_enemy": 0.0,
@@ -204,7 +209,8 @@
    "engage_enemy": 0.0,
    "support_dps_lane": 0.0,
    "chase_enemy": 0.667,
-   "enemy_in_skill2_range": 0.0
+   "enemy_in_skill2_range": 0.0,
+   "dps_lane_push": 0.0
   },
   "hp=high|en=1|red=0|blue=3|d=0": {
    "enemy_hero_near": 0.222,
@@ -357,7 +363,8 @@
    "enemy_hero_near": 0.0,
    "engage_enemy": 0.0,
    "enemy_in_skill2_range": 0.368,
-   "support_dps_lane": 1.25
+   "support_dps_lane": 1.25,
+   "dps_lane_push": 0.0
   },
   "hp=high|en=4|red=0|blue=3|d=0": {
    "disengage_retreat": 0.0
@@ -380,7 +387,8 @@
    "enemy_in_skill2_range": -10.0,
    "engage_enemy": 0.0,
    "enemy_hero_near": 0.0,
-   "support_dps_lane": 0.0
+   "support_dps_lane": 0.0,
+   "dps_lane_push": 0.0
   },
   "hp=high|en=3|red=0|blue=2|d=0": {
    "chase_enemy": 0.0,
@@ -464,7 +472,7 @@
   "hp=ok|en=1|red=0|blue=1|d=0": {
    "support_dps_lane": -5.889,
    "disengage_retreat": -3.846,
-   "dps_lane_push": -7.286
+   "dps_lane_push": -6.955
   },
   "hp=mid|en=0|red=0|blue=1|d=0": {
    "low_hp_safe_recall": 3.333,
@@ -662,7 +670,10 @@
   },
   "hp=ok|en=1|red=1|blue=4|d=0": {
    "support_dps_lane": 0.0,
-   "no_target": -0.188
+   "dps_lane_push": 0.0,
+   "no_target": -0.188,
+   "dps_lane_push_hold": 0.0,
+   "support_dps_lane_hold": 0.0
   },
   "hp=mid|en=0|red=2|blue=4|d=0": {
    "support_dps_lane": -3.333
@@ -827,13 +838,15 @@
    "no_target": 0.0,
    "low_resource_safe_restore": 0.0,
    "dps_lane_push": 0.0,
-   "low_hp_safe_recall": 0.0
+   "low_hp_safe_recall": 0.0,
+   "support_dps_lane_hold": 0.0
   },
   "hp=mid|en=3|red=0|blue=2|d=0": {
    "disengage_retreat": 0.0
   },
   "hp=ok|en=2|red=0|blue=3|d=0": {
-   "support_dps_lane": 0.0
+   "support_dps_lane": 0.0,
+   "dps_lane_push": 0.0
   },
   "hp=mid|en=1|red=1|blue=2|d=0": {
    "support_dps_lane": 0.0,
@@ -955,6 +968,12 @@
   "hp=low|en=1|red=1|blue=0|d=0": {
    "dps_lane_push": 0.0,
    "no_target": 0.0
+  },
+  "hp=ok|en=2|red=1|blue=4|d=0": {
+   "dps_lane_push": 0.0
+  },
+  "hp=ok|en=3|red=1|blue=4|d=0": {
+   "dps_lane_push": 0.0
   }
  },
  "best_reason_by_state": {
@@ -1158,6 +1177,8 @@
   "hp=mid|en=1|red=1|blue=3|d=0": "low_hp_safe_recall",
   "hp=low|en=1|red=0|blue=4|d=0": "no_target",
   "hp=low|en=1|red=2|blue=4|d=0": "support_dps_lane",
-  "hp=low|en=1|red=1|blue=0|d=0": "dps_lane_push"
+  "hp=low|en=1|red=1|blue=0|d=0": "dps_lane_push",
+  "hp=ok|en=2|red=1|blue=4|d=0": "dps_lane_push",
+  "hp=ok|en=3|red=1|blue=4|d=0": "dps_lane_push"
  }
 }

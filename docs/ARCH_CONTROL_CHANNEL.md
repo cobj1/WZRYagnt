@@ -3,6 +3,8 @@
 > 硬件接线与固件细节见 [ESP32_HID_HARDWARE.md](ESP32_HID_HARDWARE.md)；感知/UI 层见
 > [ARCH_UI_QUERY_LAYER.md](ARCH_UI_QUERY_LAYER.md)；移动决策见 [ARCH_MOVE_PUSH.md](ARCH_MOVE_PUSH.md)。
 > 本文只覆盖**执行（注入）**这一条轴。
+>
+> **数字与行号快照（2026-10-25 复核）**：当前 `test_new_modules.py` 198/198、`test_laya_fusion.py` 工作树 56/56（HEAD 53）。文中固件行数、191/191 等为写作时快照；绝对行号会漂移，查代码以符号名（函数/常量）为准。
 
 ---
 
@@ -26,7 +28,7 @@
 
 | 文件 | 角色 | 关键锚点 |
 |---|---|---|
-| `firmware/esp32_hid_touch/esp32_hid_touch.ino` | **主用固件**（717 行）。自定义 `USBHIDDevice` → 对手机表现为**多点触摸屏 Digitizer + 键盘**，绝对坐标 | `TOUCH_MAX_CONTACTS 5`（L74）、`BRIDGE_PORT 7300`（L62）、`USB_SETTLE_MS 1500`（L81）、`releaseAllTouches()`、`hello <reset> <uptime> <W>x<H>` |
+| `firmware/esp32_hid_touch/esp32_hid_touch.ino` | **主用固件**（745 行）。自定义 `USBHIDDevice` → 对手机表现为**多点触摸屏 Digitizer + 键盘**，绝对坐标 | `TOUCH_MAX_CONTACTS 5`（L77）、`BRIDGE_PORT 7300`（L65）、`USB_SETTLE_MS 1500`（L88）、`releaseAllTouches()`、`hello <reset> <uptime> <W>x<H>` |
 | `firmware/esp32_hid_bridge/esp32_hid_bridge.ino` | **退路固件**（489 行）。普通相对指针鼠标，**单点** | `home/move/press/release/click/scroll` |
 | `firmware/flash.ps1` | arduino-cli 编译烧写（90 行），FQBN 板级选项已固化 | `esp32:esp32:XIAO_ESP32S3` / `USBMode=default` / `UploadMode=cdc` |
 | `wzry/control/esp32_hid.py` | 电脑端客户端：`BoardLink`（TCP 行协议）+ `Esp32HidExecutor` | 动作命令读超时 3s；**仅 `sendall` 失败才重发**（非幂等动作防重放） |
@@ -65,7 +67,7 @@ window_to_device / close`，且动作事件流字段一致（`t/type/x/y/source/
 
 ### 2.2 感知（读）轴：与执行完全解耦
 
-`--capture` 是独立参数（`m2_agent_v2.py:1731`：`desktop / screencap / scrcpy`），与 `--backend`
+`--capture` 是独立参数（`m2_agent_v2.py` 的 `--capture`：`desktop / screencap / scrcpy / screenrecord`），与 `--backend`
 **零耦合**：采集实例化不引用 `args.backend`，ESP32 执行器实例化也不引用 `args.capture`。
 
 由此得到一条重要推论：**选板子会反过来约束怎么取帧** —— 板子占住手机 USB 口（它要当 HID
@@ -78,8 +80,9 @@ window_to_device / close`，且动作事件流字段一致（`t/type/x/y/source/
 
 - 文档 §9 原话只是"是**可行的**混合配置"——**可行 ≠ 已采用**；
 - 仓库内 `--backend esp32` 的**启动命令记录为 0 条**（`*.md` / `*.bat` / `*.ps1` / `*.json` 全查过）；
-- `data/action_events.jsonl` 尾部事件带 `"display": [null, null]` 字段，这是 `AdbExecutor._log()`
-  **独有**的格式（`Esp32HidExecutor` 的事件不含该键）→ 说明实际跑的一直是 ADB 通道。
+- `data/action_events.jsonl` 的历史主体使用 `"display"` 字段（`AdbExecutor._log()` 独有），但
+  2026-10-17 尾部已出现 17 条无 `display` 的事件（12 `touch` / 3 `tap` / 2 `touch_up`；其中 14 条 `cid:0`）。
+  → 只能判断"历史上以 ADB 为主"，**不能**再据此断言"实际一直走 ADB"；`cid:0` 触摸事件表明 ESP32 至少被实际使用过。
 
 **正确表述**：执行轴**二选一**；"可以混合"只成立在"读轴用 ADB、写轴用 HID"这个组合上。
 本文以回查结果为准。
@@ -239,14 +242,14 @@ python scripts/m2_agent_v2.py
 # 驱动真机（板子优先, 不通回落 adb）
 python scripts/m2_agent_v2.py --action --backend auto `
     --board-host 192.168.0.107 --board-size 3200x1440 `
-    --capture screencap --serial 192.168.0.103:5555 --stick-hold on --seconds 300
+    --capture screenrecord --serial 192.168.0.103:5555 --stick-hold on --seconds 300
 ```
 
 | 参数 | 作用 |
 |---|---|
 | `--action` | **总开关**。不传 = 只感知/决策不驱动；`--no-action` 显式关闭 |
 | `--backend auto\|adb\|esp32` | 执行通道（§3） |
-| `--capture desktop\|screencap\|scrcpy` | 感知通道，与 `--backend` 解耦（§2.2） |
+| `--capture desktop\|screencap\|scrcpy\|screenrecord` | 感知通道，与 `--backend` 解耦（§2.2）；真机推荐 `screenrecord` |
 | `--stick-hold on\|off` | 摇杆持久触点（§3.4），默认 on |
 | `--board-host/--board-port/--board-mode/--board-size` | 板子地址与屏幕尺寸（`ESP32_HID_HARDWARE.md §10`） |
 
@@ -339,7 +342,7 @@ key <combo> | type <text(ASCII)>
 # 回放一局已录制的决策序列（Windows PowerShell）
 Get-Content data\matches\<会话>\actions.jsonl |
     python scripts\m2_agent_v2.py --drive-stdin --backend esp32 `
-        --board-host 192.168.0.107 --board-size 3200x1440 --capture screencap
+        --board-host 192.168.0.107 --board-size 3200x1440 --capture screenrecord
 ```
 
 > 实测：该管道在本机可用（109 行 → 109 条解析成功）。当前 `actions.jsonl` 全为纯 ASCII
@@ -416,7 +419,7 @@ escape_turret_hold）｜`skill`（`id`,`mode`，「**当前恒为 `tap`**」）�
 | L1 离线单测 | `test_drive_stdin.py`：驱动输入解析／节奏优先级／clamp／脏输入跳过／驱动主循环本体（背压、提前收尾） | **38/38 通过** |
 | L1 离线单测 | `test_arrival_gate.py`：到达即停／保险丝／重新计时／边界 | **31/31 通过** |
 | L1 离线单测 | `test_esp32_bridge.py`（回归）：命令串与固件解析表逐字对齐 | **29/29 ALL PASS** |
-| L1 离线单测 | `test_new_modules.py`（回归）：感知/决策/推进全量 | **191/191 通过** |
+| L1 离线单测 | `test_new_modules.py`（回归）：感知/决策/推进全量 | **198/198 通过**（2026-10-25；文档写作时为 191） |
 | L1 编译验证 | `arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:…`（touch 固件） | ✅ 943,207 B (28%) / RAM 20% |
 | L2 历史真机帧 | —— | **不适用**（本轴不依赖画面） |
 | L3 实机全流程 | 整 agent 经 ESP32 后端跑完一局 | ❌ **未做**（无运行留痕，见 §5.1） |
@@ -457,13 +460,13 @@ escape_turret_hold）｜`skill`（`id`,`mode`，「**当前恒为 `tap`**」）�
    一个猜测性的空闲阈值会在对局中途**误断健康连接** —— 属于"可能破坏功能"的改动，而本机
    又无法验证。建议的做法是成对实现：电脑端加 5 s 心跳（`ping`）+ 固件端 30 s 无字节即
    丢弃并 `releaseAllTouches()`，两者一起上才不会误伤。
-10. **持久摇杆的航位推算口径未变。** `map_move` 仍按 `dur`（`dist/STICK_SPEED`，350–900 ms）
-    名义值推进 `self_est`；持久模式下英雄实际是**连续**移动的，故该估计可能**略微低估**，
-    偏向"继续推进"而非提前停下 —— 由 v14.3 塔重锚（`_snap_self_est_to_tower`）纠偏。
-    若要精确，应改为按实际 elapsed 推进，但这会与"只改一处以便归因"冲突，故留待 L3 之后再定。
-11. **`ActionExecutor.sequence()` 是死代码。** 它被定义在 `if __name__ == "__main__":` 块内，
-    类上不可见（`hasattr(ActionExecutor, "sequence") == False`，已实测）。目前无人调用，
-    但连招编排若有使用会静默失效。属历史遗留，未在本轮改动。
+10. **持久摇杆的航位推算已按实际 elapsed 推进（v16.2）。** `map_move` 在 hold 模式下用
+    `_step = STICK_SPEED × min(now − _map_t, MAPMOVE_EL_MAX)`，非 hold 模式仍用 `dur/1000`；
+    松手处（recall / restore / summoner / stick_release / 复活）会清空 `_map_t`。早期"仍按 dur、
+    略低估"的描述已作废。
+11. **`ActionExecutor.sequence()` / `_exec_dict` 已修为类方法（2026-10-23）。** 此前它们缩进在
+    `if __name__ == "__main__":` 块内导致 `ActionExecutor` 不可见；现在 `hasattr(...)` 为 True，
+    `wzry/policy/env.py` 的调用链已可用。
 
 ---
 

@@ -31,6 +31,8 @@ W_PUSH = 26.0
 W_DIST = 0.5        # 必须小于推进项的斜率，否则"原地"永远最优
 DANGER = float(orl.DANGER_DIST)      # 301
 TOWER_ZONE = 850.0
+# GetRetreatPos 的塔搜索窗口（反汇编立即数 15000）
+RETREAT_SEARCH_TOWER_DIS = 15000.0
 
 
 def enemy_base(snap: Snapshot) -> tuple:
@@ -65,20 +67,111 @@ def enemy_tower_pts(snap: Snapshot) -> list:
 
     静态几何只给位置、不给血量 —— 对"塔区惩罚"这个用途足够（宁可保守一点），
     但不要拿它当"塔还活着"的证据。
+
+    结果按快照缓存（`field_value` 与 `tower_dir_value` 每帧各调 N 次，
+    不缓存会把这一个函数变成走位打分里最大的开销）。
     """
+    cached = getattr(snap, "_tower_pts_cache", None)
+    if cached is not None:
+        return cached
     pts = [(o.x, o.z) for o in snap.organs
            if o.alive and o.x is not None and o.camp is not None
            and o.camp != snap.self_camp]
+    if not pts:
+        out = []
+        for name, (gx, gz) in (snap.organ_geo or {}).items():
+            if not name.startswith("enemy_"):
+                continue
+            if snap.organ_alive.get(name) is False:
+                continue                    # 视觉明确说没了
+            out.append((gx, gz))
+        pts = out
+    try:
+        snap._tower_pts_cache = pts
+    except Exception:
+        pass
+    return pts
+
+
+def friendly_tower_pts(snap: Snapshot) -> list:
+    """己方塔的位置（不含水晶/泉水）：活体优先，缺活体数据时退回 22 槽位静态几何。"""
+    pts = [(o.x, o.z) for o in snap.organs
+           if o.alive and o.x is not None and o.camp is not None
+           and o.camp == snap.self_camp and o.kind == "organ"]
     if pts:
         return pts
     out = []
     for name, (gx, gz) in (snap.organ_geo or {}).items():
-        if not name.startswith("enemy_"):
+        if not name.startswith("friend_"):
+            continue
+        if "tower" not in name or "spring" in name or "crystal" in name:
             continue
         if snap.organ_alive.get(name) is False:
-            continue                    # 视觉明确说没了
+            continue
         out.append((gx, gz))
     return out
+
+
+def retreat_pos(snap: Snapshot) -> Optional[tuple]:
+    """官方 `RuleTactics::GetRetreatPos @0x027e1b98` 的等价实现。
+
+    日志原文给出四个量，正好构成"退到塔还是退到水晶"的判据：
+
+        [GetRetreatPos] search_tower_dis:%d       搜索到的塔的距离
+        [GetRetreatPos] tower_pos:%d,%d,%d hero_tower_dis:%d
+        [GetRetreatPos] crystal_hero_dis:%d       英雄 -> 水晶
+        [GetRetreatPos] crystal_tower_dis:%d      塔   -> 水晶
+        [GetRetreatPos] retreat_pos:%d,%d,%d
+
+    判据（由四个量的语义直接推出，非猜测）：
+      **英雄离水晶比塔离水晶更近 → 直接回水晶；否则退到那座塔。**
+    搜索半径用立即数 15000（塔的搜索窗口）。
+    """
+    if snap.self_x is None or snap.self_z is None:
+        return None
+    cx, cz = own_base(snap)
+    d_hero_crystal = math.hypot(cx - snap.self_x, cz - snap.self_z)
+
+    best, bestd = None, 1e18
+    for tx, tz in friendly_tower_pts(snap):
+        d = math.hypot(tx - snap.self_x, tz - snap.self_z)
+        if d < bestd:
+            best, bestd = (tx, tz), d
+    if best is None or bestd > RETREAT_SEARCH_TOWER_DIS:
+        return (cx, cz)                      # 附近没塔（或塔都太远）→ 回水晶
+
+    d_tower_crystal = math.hypot(cx - best[0], cz - best[1])
+    if d_hero_crystal < d_tower_crystal:
+        return (cx, cz)
+    return best
+
+
+def tower_dir_value(snap: Snapshot, x: float, z: float,
+                    tol_deg: float = 45.0) -> float:
+    """走位方向是否"朝塔"。对应官方 `RuleTactics::CalTowerDirValue @0x27e4494`。
+
+    日志 `[CalTowerDirValue] tower_dir_value:%f` / `model y_action not move dir`
+    说明官方把"走位方向与最近敌塔方向的夹角"折算成一个价值量。这里返回 0..1：
+    夹角 0° → 1.0，超过 `tol_deg` → 0。没有敌方塔时返回 0（不奖励）。
+    """
+    if snap.self_x is None or snap.self_z is None:
+        return 0.0
+    towers = enemy_tower_pts(snap)
+    if not towers:
+        return 0.0
+    dx, dz = x - snap.self_x, z - snap.self_z
+    n = math.hypot(dx, dz)
+    if n < 1e-6:
+        return 0.0
+    tx, tz = min(towers, key=lambda t: math.hypot(t[0] - snap.self_x, t[1] - snap.self_z))
+    tdx, tdz = tx - snap.self_x, tz - snap.self_z
+    tn = math.hypot(tdx, tdz) or 1.0
+    cos = (dx * tdx + dz * tdz) / (n * tn)
+    cos = max(-1.0, min(1.0, cos))
+    ang = math.degrees(math.acos(cos))
+    if ang >= tol_deg:
+        return 0.0
+    return 1.0 - ang / tol_deg
 
 
 def field_value(snap: Snapshot, x: float, z: float) -> float:

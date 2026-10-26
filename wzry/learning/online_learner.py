@@ -74,6 +74,7 @@ class OnlineLearner:
             self._log("学自己(教训)", "被塔打 → 塔圈风险 w_risk↑")
         elif event == "tower_kill":
             self._bump("w_map", self.alpha * 0.3)
+            self.episodes["tower"] += 1
             self._log("学我方节奏", "推塔有效 → 兵线价值 w_map↑")
         elif event == "minion_clear":
             self._bump("w_map", self.alpha * 0.05)
@@ -103,13 +104,13 @@ class OnlineLearner:
                 self.episodes = {"kill": 0, "assist": 0, "died": 0, "tower": 0}
             lines = [f"## 对局 {now_t:%Y-%m-%d %H:%M}",
                      "",
-                     "### 局中学习条目"]
+                     "### 本窗口学习条目"]
             if entries:
                 lines += entries
             else:
-                lines.append("- (本局暂无学习事件)")
-            lines += ["", "### 进化后权重 (下一局立即生效)",
-                      f"``` {w} ```", "", "### 本局战绩",
+                lines.append("- (本窗口暂无学习事件)")
+            lines += ["", "### 进化后权重 (进程内生效；重启回默认)",
+                      f"``` {w} ```", "", "### 本窗口事件计数",
                       f"- 击杀{ep['kill']} 助攻{ep['assist']} 死亡{ep['died']} 推塔{ep['tower']}"]
             if extra:
                 lines += ["", "### 局末复盘", extra]

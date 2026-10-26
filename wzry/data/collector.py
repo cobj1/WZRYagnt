@@ -25,13 +25,19 @@ _KIND_TO_CLS = {
 }
 
 
-def _canonical_mem_units(mem_units, self_camp: str) -> list[dict]:
+def _canonical_mem_units(mem_units, self_camp: str | None) -> list[dict]:
     """内存单位 -> canonical `units` 条目，仅用于录制/审计。
 
     决策层仍消费视觉 `units`（screen 坐标）；把内存单位混进去会让
     `screen` 缺失的条目被当成屏幕中心，故**只在 recorder 写盘时合并**。
+
+    阵营语义（2026-10-26 修）：`self_camp=None` 表示**自身阵营不可观测**，
+    此时一律输出 `unknown_*`，绝不默认"我方=蓝"。依据是 `camp_identity.classify`
+    与 S0-2 硬规则「不可观测 ≠ 观测为 0」——镜像局里同 cid 双阵营时默认蓝
+    会把整队敌我翻反，比缺字段危害更大。
     """
     from wzry.decision.official_ai.geo import world_to_norm
+    from wzry.vision.camp_identity import classify
 
     out: list[dict] = []
     now = time.time()
@@ -42,22 +48,18 @@ def _canonical_mem_units(mem_units, self_camp: str) -> list[dict]:
         if base is None or x is None or z is None:
             continue
         camp = str(u.get("camp") or "")
-        if base == "hero":
-            cls = "ally_hero" if camp == self_camp else "enemy_hero"
-        elif base == "minion":
-            cls = "ally_minion" if camp == self_camp else "enemy_minion"
-        elif base == "turret":
-            cls = "ally_turret" if camp == self_camp else "enemy_turret"
-        elif base == "crystal":
-            cls = "ally_crystal" if camp == self_camp else "enemy_crystal"
-        else:
+        side = classify(u, self_camp)          # ally / enemy / unknown
+        if base == "neutral_monster":
             cls = "neutral_monster"
+        else:
+            cls = f"{side}_{base}"
         nx, ny = world_to_norm(float(x), float(z))
         hp_ratio = u.get("hp_ratio")
         if hp_ratio is None and u.get("hp") is not None and u.get("hp_max"):
             hp_ratio = float(u["hp"]) / float(u["hp_max"])
         out.append({
             "cls": cls, "kind": base, "camp": camp or None,
+            "side": side,
             "uid": f"{camp}:{kind}:{u.get('cid')}:{u.get('actor')}",
             "hero_cid": u.get("cid") if base == "hero" else None,
             "cid": u.get("cid"),
@@ -95,6 +97,9 @@ class MatchRecorder:
             "clock_s": 0, "scoreboard": 0, "units.pos_minimap": 0,
             "ui.hp": 0, "minimap.dots": 0, "units": 0,
         }
+        # 对局结果：胜负是价值模型的唯一监督信号。历史 44 局没有记录，导致
+        # 域内价值模型完全无法训练——这里先补接口，避免下一批数据再次缺这一列。
+        self.result = None
 
     @property
     def active(self):
@@ -114,6 +119,8 @@ class MatchRecorder:
         self._n_states = 0
         self._n_frames = 0
         self._start_t = time.time()
+        self.result = None
+        self._field_hits = {k: 0 for k in self._field_hits}
         self._last_frame_t = 0.0
         self._meta = dict(meta or {})
         self._n_memory_states = 0
@@ -196,7 +203,11 @@ class MatchRecorder:
                     res = resolve_self(heroes, int(self_id), self_pos)
                     self_camp = res.camp
                     sources["self_camp"] = res.camp_src
-            self_camp = self_camp or "blue"
+            if self_camp:
+                sources.setdefault("self_camp", "given")
+            else:
+                # 解析不出就如实记 unknown，不用 "blue" 兜底（镜像局会整队翻反）
+                sources["self_camp"] = "unknown"
             units = list(units) + _canonical_mem_units(mem_units, self_camp)
             sources["units_memory"] = "memory"
         if units:
@@ -296,6 +307,34 @@ class MatchRecorder:
                    for k, v in need.items() if cov.get(k, 0.0) < v}
         return (not missing), missing
 
+    def on_result(self, result, *, self_camp=None, note="", source="manual"):
+        """记录对局结果（win / loss / draw）。
+
+        价值模型的监督信号只有胜负，历史 44 局全缺这一列，导致"域内价值模型"无从训练。
+        接受 "win"/"loss"/"draw"（也接受 victory/defeat/胜/负 等别名），写入 manifest。
+        返回实际落盘的规范值，便于调用方断言。
+        """
+        alias = {
+            "win": "win", "victory": "win", "won": "win", "胜": "win", "胜利": "win",
+            "loss": "loss", "lose": "loss", "lost": "loss", "defeat": "loss",
+            "负": "loss", "失败": "loss",
+            "draw": "draw", "tie": "draw", "平": "draw", "平局": "draw",
+        }
+        key = str(result).strip().lower()
+        canon = alias.get(key)
+        if canon is None:
+            raise ValueError(f"未知结果 {result!r}；允许 win/loss/draw（含常见别名）")
+        self.result = canon
+        self._meta["result"] = {
+            "value": canon,
+            "self_camp": self_camp,
+            "note": note,
+            "source": source,
+            "t": time.time(),
+        }
+        self._write_manifest()
+        return canon
+
     def _write_manifest(self, extra=None):
         if not self.session_dir:
             return
@@ -309,6 +348,7 @@ class MatchRecorder:
             "memory_states": self._n_memory_states,
             "clock_states": self._n_clock_states,
             "field_coverage": self.field_coverage(),
+            "result": self.result,
             "meta": self._meta,
         }
         if extra:
@@ -326,3 +366,21 @@ class MatchRecorder:
         self._states_fp = None
         self._actions_fp = None
         self.session_dir = None
+
+    def finalize(self, result=None, *, note="", source="cli"):
+        """收尾：可选写胜负 -> 采数闸门 -> close，返回闸门结果。
+
+        对局结束与程序退出共用这一条路径，保证"结束但没记胜负"不再发生。
+        返回 `{"result":..., "coverage":{...}, "gate_ok":bool, "missing":{...}}`；
+        未 active 时返回 None（幂等）。
+        """
+        if not self.active:
+            return None
+        canon = None
+        if result:
+            canon = self.on_result(result, note=note, source=source)
+        cov = self.field_coverage()
+        ok, missing = self.coverage_gate()
+        self.close()
+        return {"result": canon, "coverage": cov, "gate_ok": ok, "missing": missing}
+

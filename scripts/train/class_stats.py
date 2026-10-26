@@ -9,7 +9,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]  # E:/WZRYagent
+ROOT = Path(__file__).resolve().parents[2]  # 相对 WZRYagnt 仓根
 LABELS_DIR = ROOT / "data" / "yolo_dataset" / "zhongkui" / "labels"
 OUT_TXT = ROOT / "data" / "yolo_dataset" / "zhongkui" / "class_stats.txt"
 CLASSES_JSON = ROOT / "configs" / "classes.json"

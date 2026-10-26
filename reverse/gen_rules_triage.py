@@ -69,7 +69,7 @@ def main() -> int:
         "# 规则长尾分诊表（141 条）",
         "",
         "> 数据源：`reverse/out/il2cpp/rules_table.tsv`（不重新扫 `.so`）。",
-        "> 生成：`D:/app/python/python.exe reverse/gen_rules_triage.py`。",
+        "> 生成：`D:/app/python/python.exe reverse/gen_rules_triage.py`（以下命令均在 `WZRYagnt/` 下执行）。",
         f"> 现状：已实现 **{len(done)}** 条；表内可识别的具名函数（去重、去桩）**{len(rows)}** 个，"
         f"待做 **{len(todo)}** 条。",
         ">",

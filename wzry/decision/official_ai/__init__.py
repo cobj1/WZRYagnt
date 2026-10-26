@@ -18,8 +18,9 @@
   policy.py    主管线（FeatureProcess -> 打分 -> top-k -> 规则 -> 回退）
   config.py    难度参数（官方 model_id/predict_freq/delay_frame/god_vision）
 """
-from . import (actions, bridge, config, features, field, geo, organ_slots,  # noqa: F401
-               policy, rules, schema, snapshot)
+from . import (actions, bridge, config, features, field, geo, grid, lanes,  # noqa: F401
+               motion, organ_slots, policy, rules, schema, snapshot, summoner,
+               tactics, targeting)
 from .bridge import decide_legacy, to_legacy_action  # noqa: F401
 from .policy import Decision, LinearScorer, OfficialAI, softmax  # noqa: F401
 from .snapshot import Snapshot, Unit, from_state_dict  # noqa: F401
@@ -28,6 +29,7 @@ __all__ = [
     "OfficialAI", "Decision", "LinearScorer", "softmax",
     "Snapshot", "Unit", "from_state_dict",
     "decide_legacy", "to_legacy_action",
-    "actions", "bridge", "config", "features", "field", "geo", "organ_slots",
-    "policy", "rules", "schema", "snapshot",
+    "actions", "bridge", "config", "features", "field", "geo", "grid", "lanes",
+    "motion", "organ_slots", "policy", "rules", "schema", "snapshot", "summoner",
+    "tactics", "targeting",
 ]

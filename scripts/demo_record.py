@@ -20,6 +20,7 @@
 """
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -38,11 +39,11 @@ sys.path.insert(0, str(ROOT))
 
 def find_ffmpeg():
     for cand in (ROOT / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe",
-                 ROOT / "tools" / "ffmpeg.exe",
-                 Path(r"E:\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe")):
+                 ROOT / "tools" / "ffmpeg.exe"):
         if cand.exists():
             return cand
-    return None
+    which = shutil.which("ffmpeg")
+    return Path(which) if which else None
 
 
 def discover_mumu_adb():

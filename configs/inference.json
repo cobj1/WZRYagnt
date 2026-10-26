@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "version": "2026-10-25.1",
+  "primary": "laya",
+  "primary_backend": "onnx",
+  "fallback": "rule",
+  "decision_hz": 10,
+  "backends": {
+    "onnx": {
+      "model": "runs/laya/laya.int8.onnx",
+      "module": "onnxruntime",
+      "device": "CPU",
+      "notes": "laya int8；LayaScorer --laya-backend onnx"
+    },
+    "openvino": {
+      "model": "runs/laya/laya_ov/laya_qfreeze.xml",
+      "module": "openvino",
+      "device": "GPU",
+      "notes": "Arc 核显；LayaScorer --laya-backend openvino --laya-device GPU"
+    }
+  },
+  "budgets_ms": {
+    "decide_rule_p95": 2.0,
+    "laya_onnx_p95": 150.0,
+    "laya_openvino_p95": 120.0,
+    "loop_p95": 200.0
+  }
+}

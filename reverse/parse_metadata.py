@@ -38,8 +38,13 @@ from pathlib import Path
 
 # 逆向二进制原料所在目录（原 `reverse/` 已改名 `reverse-bin/`，避免与
 # WZRYagnt/reverse/ 同名混淆）。可用环境变量 AIKINGS_ROOT 覆盖工作区根。
+# 改名尚未完成时回退到旧目录，避免脚本因目录名切换而失效。
 WORKSPACE = Path(os.environ.get("AIKINGS_ROOT", Path(__file__).resolve().parents[2]))
-MD = WORKSPACE / "reverse-bin" / "hok" / "global-metadata.dat"
+_MD_CANDIDATES = [
+    WORKSPACE / "reverse-bin" / "hok" / "global-metadata.dat",
+    WORKSPACE / "reverse" / "hok" / "global-metadata.dat",
+]
+MD = next((p for p in _MD_CANDIDATES if p.exists()), _MD_CANDIDATES[0])
 TD_SIZE = 88
 FIELD_SIZE = 12
 

@@ -2,6 +2,30 @@
 
 > 基线代码：`WZRYagnt` @ 当前工作区 ｜ 体例对齐 `ARCH_MOVE_PUSH.md` / `ARCH_PUSH_PRIORITY.md` / `ARCH_UI_QUERY_LAYER.md`
 > 状态：**方案冻结（接口先行，模型后置）**。本文只定义"层与层之间怎么接"，不承诺本期训模型。
+> 数字快照：本文行号/会话数为 2026-10-16 写作时状态；当前 `data/matches` 为 44 会话。以符号名和当前数据为准。
+
+## 0.1 落地状态（2026-10-25）
+
+| 项 | 状态 | 代码/证据 |
+|---|---|---|
+| ARCH-01 协议接入 | ✅ | m2 最终动作经 `DecisionOutput.validated_action()` 走 `Action` 校验；`Action` 对象入执行队列，`apply_action` 在边界还原 dict；宏 `map_move` 生成 `Task` 写入轨迹。协议 28 项 + decision_output 23 项 |
+| ARCH-02 统一 DecisionEngine | ✅ | `decision/engine.py`：rule / official / optimizer / hunt / policy / safety 六类来源统一 `DecisionOutput`，累计 frames/adoptions/来源/耗时 |
+| ARCH-03 拆 decide | ✅ 五层抽出 | `context.py`（单位视图）、`engage.py`（接战）、`combat.py`（技能/普攻）、`combo.py`（勾中连招）、`safety.py`（塔圈/低血）已抽出，行为 62 项 + 新增 76 项单测不变；decide 仍含移动/回城/推塔规则，属后续拆分 |
+| PERC-01 读覆盖 | ✅ 代码闭环 | 录制器在写盘时把 `extra.mem_units` 合并为 canonical `units`（补 pos_minimap/world/hp/camp），不回写决策 state；四字段 + sources 契约测试 13 项。历史 44 会话录制时未启用该合并，仍 0%，需 DATA-01 重采 |
+| PERC-02 采集/小地图收敛 | ✅ 生产单实现 | m2 只 import `mm_tracker_v7`；四种流式采集器统一 start/wait_frame/stop；旧 v1–v6 已归档 |
+| PERC-03 内存字段 | ✅ 英雄级 | CID/阵营/HP/坐标/法力（ep_rate）/金币/等级/CD/装备 ID 已通；小兵 CID、野怪存活边界未通（真机反向课题） |
+| PERF-01 实时性 | ✅ 决策层 + 端到端离线 | `bench_decide` p95 0.008–0.020ms；端到端回放 44 帧：decide p95 **0.9ms**、loop p95 **196.9ms**、capture_lag p95 165.5ms、infer p95 65.7ms；分阶段 wait_frame 54.5% / YOLO 18.7% / render 15.8% / decide 0.2%。报告 `docs/决策端到端离线回放-2026-10-25.md` |
+| OBS-01 可观测性 | ✅ 面板 | `Metrics` + `DecisionTrace`（每帧 JSONL）+ `decision_trace_report.py` 生成自包含 HTML 复盘面板（来源/动作/任务/延迟 p50/p95） |
+| MEM-01 偏移版本化 | ✅ 注册表 | `configs/mem_offsets.json`（version/validated_at/evidence）+ `vision/mem_offsets.py`；`MemSource.connect()` 漂移即拒绝读取；7 项回归 |
+| EXEC-01 通道恢复 | ✅ adb 半开 | `AdbExecutor.health()` 2s TTL 探测 + `get-state` 失败重连；`_run` 识别 "device offline" 并标记；9 项回归。ESP32 原有 send-fail 自愈保留 |
+| MODEL-02 推理部署 | ✅ | `configs/inference.json` + `wzry/decision/inference.py` + `check_inference.py --load`：ONNX 441.8 MB / 2028 ms、OpenVINO IR 60 ms 均真实加载成功 |
+| DATA-03 特征/标签 | ✅ 可训练产物 | `audit_dataset.py` 审计 split/frame_id/标签/零方差；`build_frame_features.py` 已产出 11,043 行 × 16 维特征 + action/reason/label（train 8,534 / val 678 / test 1,831），缺失用 mask=0，零方差 `dead/phase_in_match` 已在 summary 标出 |
+| MODEL-01 / EVAL-01 | ✅ 评估闭环 | 模型注册表 4 权重 validated；`eval_replay` 全量 44 会话 / 11,043 帧：type 一致率 **86.85%**、p95 **0.034ms**；报告 `docs/决策离线回放评估-2026-10-25.md`。黄金集 strict 仍因 71 条全未标注而失败（标注属 DATA-02） |
+
+> 设备相关项（DATA-01/02、PERC 真机覆盖、PERF 实局）当前被 `adb devices` 为空阻塞，未以合成数据替代结论。
+
+---
+
 
 ## 0. 结论摘要
 
@@ -170,7 +194,7 @@ final, reason = legalize(acts, scene)   # -> Action | 替代动作 | 拒绝原�
 | 风险 | 等级 | 说明与对策 |
 |---|---|---|
 | **延迟预算** | 高 | `PLAN.md §6` 决策预算 ≤40ms，现状 **<2ms**；而已实测单模型（Laya，OpenVINO 核显）p95 已 **59.8ms**。因此**层 1/2/3 必须保持规则+轻量**，只有 4/5/6 可学习；且**禁止同拍串行多个大模型**，需按分支频率错峰 |
-| **数据依赖** | 高 | 层 4/5 训练需标签；`laya-fusion-plan §5.1` 已记录**来源 A 阻塞**（`data/matches/` 33 会话 swipe=0）。故 P3 之前必须先用规则版跑起来积累 `shadow` 数据 |
+| **数据依赖** | 高 | 层 4/5 训练需标签；`../../docs/规划与方案/laya-fusion-plan.md §5.1` 已记录**来源 A 阻塞**（写作时 `data/matches/` 33 会话、当前 44 会话，swipe=0）。故 P3 之前必须先用规则版跑起来积累 `shadow` 数据 |
 | **内部张力（合法性位置）** | 中 | 见 3.1，已给双位置方案 |
 | **丢掉真机经验** | 高 | `decide()` 的硬规则（回城门禁/幻影过滤/接战门槛）是成本最高的资产，**重构只做归位包装，不重写规则逻辑** |
 | **层 2/3 职责重叠** | 中 | 冷却推算属层 3（`EventLog` 已做），层 2 不得重复计算；否则两处口径漂移 |
@@ -190,4 +214,4 @@ final, reason = legalize(acts, scene)   # -> Action | 替代动作 | 拒绝原�
 | `PLAN.md §4.3` | 本文是其"分层执行（宏观 2-4Hz / 微观 10-15Hz）"的**接口级细化** |
 | `ARCH_UI_QUERY_LAYER.md` | 本文层 5-C 查询分支 = 该文档的 `PanelNavigator`，不改其契约 |
 | `ARCH_MOVE_PUSH.md` / `ARCH_PUSH_PRIORITY.md` | `push_ok/push_target` 应归入**层 4 局势判断**（它们本就是"现在该推进吗"的判断） |
-| `laya-fusion-plan.md` | 层 6 打分器（`LayaScorer`）保持可插拔；其"本期只优化 map_move"边界与本文一致 |
+| `../../docs/规划与方案/laya-fusion-plan.md` | 层 6 打分器（`LayaScorer`）保持可插拔；其"本期只优化 map_move"边界与本文一致 |

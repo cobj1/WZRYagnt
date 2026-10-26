@@ -1,0 +1,679 @@
+{
+ "schema": 1,
+ "version": "2026-10-26.1",
+ "generated_by": "scripts/build_equip_ids.py",
+ "generated_at": "2026-10-26T18:52:09",
+ "source": {
+  "dataset": "hokdata/external/kpl/raw/*/battle_*.json",
+  "field": "data.battle_player_list[*].BriefEquipList[*]",
+  "n_battles": 2696,
+  "note": "腾讯官方赛事数据；equip_id 与客户端 config_id 同源，未手工编造"
+ },
+ "n_items": 132,
+ "revive_armor_ids": [
+  1337
+ ],
+ "items": {
+  "1422": {
+   "name": "抵抗之靴",
+   "revive": false,
+   "seen": 19078
+  },
+  "1137": {
+   "name": "暗影战斧",
+   "revive": false,
+   "seen": 5495
+  },
+  "1335": {
+   "name": "魔女斗篷",
+   "revive": false,
+   "seen": 4993
+  },
+  "1126": {
+   "name": "末世",
+   "revive": false,
+   "seen": 4962
+  },
+  "1341": {
+   "name": "冰霜冲击",
+   "revive": false,
+   "seen": 4925
+  },
+  "1155": {
+   "name": "仁者破晓",
+   "revive": false,
+   "seen": 4351
+  },
+  "12211": {
+   "name": "梦魇之牙",
+   "revive": false,
+   "seen": 3999
+  },
+  "1133": {
+   "name": "无尽战刃",
+   "revive": false,
+   "seen": 3627
+  },
+  "1333": {
+   "name": "不祥征兆",
+   "revive": false,
+   "seen": 3242
+  },
+  "11311": {
+   "name": "纯净苍穹",
+   "revive": false,
+   "seen": 3155
+  },
+  "13310": {
+   "name": "冰痕之握",
+   "revive": false,
+   "seen": 3116
+  },
+  "1135": {
+   "name": "闪电匕首",
+   "revive": false,
+   "seen": 2898
+  },
+  "1534": {
+   "name": "怒龙剑盾",
+   "revive": false,
+   "seen": 2874
+  },
+  "1235": {
+   "name": "痛苦面具",
+   "revive": false,
+   "seen": 2720
+  },
+  "1136": {
+   "name": "影刃",
+   "revive": false,
+   "seen": 2683
+  },
+  "1727": {
+   "name": "日暮之流",
+   "revive": false,
+   "seen": 2535
+  },
+  "1331": {
+   "name": "红莲斗篷",
+   "revive": false,
+   "seen": 2507
+  },
+  "1421": {
+   "name": "影忍之足",
+   "revive": false,
+   "seen": 2401
+  },
+  "1533": {
+   "name": "贪婪之噬",
+   "revive": false,
+   "seen": 2314
+  },
+  "1532": {
+   "name": "巨人之握",
+   "revive": false,
+   "seen": 2205
+  },
+  "1337": {
+   "name": "贤者的庇护",
+   "revive": true,
+   "seen": 2205,
+   "desc": "<p>唯一被动-复生：死亡后2秒原地复活，并获得2000~3000点生命值，冷却时间：150秒。这个效果每局游戏只能触发2次</p>"
+  },
+  "1325": {
+   "name": "守护者之铠",
+   "revive": false,
+   "seen": 2182
+  },
+  "1232": {
+   "name": "博学者之怒",
+   "revive": false,
+   "seen": 2170
+  },
+  "1211": {
+   "name": "咒术典籍",
+   "revive": false,
+   "seen": 2147
+  },
+  "1323": {
+   "name": "神隐斗篷",
+   "revive": false,
+   "seen": 2085
+  },
+  "1311": {
+   "name": "红玛瑙",
+   "revive": false,
+   "seen": 2028
+  },
+  "1240": {
+   "name": "噬神之书",
+   "revive": false,
+   "seen": 2006
+  },
+  "1231": {
+   "name": "虚无法杖",
+   "revive": false,
+   "seen": 1976
+  },
+  "1221": {
+   "name": "大棒",
+   "revive": false,
+   "seen": 1910
+  },
+  "1424": {
+   "name": "秘法之靴",
+   "revive": false,
+   "seen": 1888
+  },
+  "1334": {
+   "name": "不死鸟之眼",
+   "revive": false,
+   "seen": 1820
+  },
+  "1138": {
+   "name": "强者破军",
+   "revive": false,
+   "seen": 1596
+  },
+  "1721": {
+   "name": "极影·救赎",
+   "revive": false,
+   "seen": 1572
+  },
+  "1328": {
+   "name": "血魔之怒",
+   "revive": false,
+   "seen": 1501
+  },
+  "1131": {
+   "name": "碎星锤",
+   "revive": false,
+   "seen": 1439
+  },
+  "1321": {
+   "name": "力量腰带",
+   "revive": false,
+   "seen": 1346
+  },
+  "1423": {
+   "name": "冷静之靴",
+   "revive": false,
+   "seen": 1339
+  },
+  "1724": {
+   "name": "近卫·救赎",
+   "revive": false,
+   "seen": 1322
+  },
+  "1121": {
+   "name": "风暴巨剑",
+   "revive": false,
+   "seen": 1233
+  },
+  "1312": {
+   "name": "布甲",
+   "revive": false,
+   "seen": 1208
+  },
+  "1243": {
+   "name": "云灵木",
+   "revive": false,
+   "seen": 1136
+  },
+  "1127": {
+   "name": "名刀·司命",
+   "revive": false,
+   "seen": 1080
+  },
+  "1338": {
+   "name": "暴烈之甲",
+   "revive": false,
+   "seen": 1052
+  },
+  "1313": {
+   "name": "抗魔披风",
+   "revive": false,
+   "seen": 1051
+  },
+  "1327": {
+   "name": "反伤刺甲",
+   "revive": false,
+   "seen": 1011
+  },
+  "1111": {
+   "name": "铁剑",
+   "revive": false,
+   "seen": 1006
+  },
+  "1336": {
+   "name": "极寒风暴",
+   "revive": false,
+   "seen": 976
+  },
+  "1134": {
+   "name": "宗师之力",
+   "revive": false,
+   "seen": 934
+  },
+  "1239": {
+   "name": "辉月",
+   "revive": false,
+   "seen": 924
+  },
+  "1159": {
+   "name": "逐风",
+   "revive": false,
+   "seen": 890
+  },
+  "1353": {
+   "name": "旭日初光",
+   "revive": false,
+   "seen": 870
+  },
+  "1737": {
+   "name": "极影·形昭",
+   "revive": false,
+   "seen": 851
+  },
+  "1234": {
+   "name": "凝冰之息",
+   "revive": false,
+   "seen": 838
+  },
+  "1347": {
+   "name": "永夜守护",
+   "revive": false,
+   "seen": 834
+  },
+  "1128": {
+   "name": "寒霜袭侵",
+   "revive": false,
+   "seen": 773
+  },
+  "1522": {
+   "name": "巡守利斧",
+   "revive": false,
+   "seen": 770
+  },
+  "1332": {
+   "name": "霸者重装",
+   "revive": false,
+   "seen": 762
+  },
+  "1132": {
+   "name": "泣血之刃",
+   "revive": false,
+   "seen": 646
+  },
+  "1345": {
+   "name": "荆棘护手",
+   "revive": false,
+   "seen": 612
+  },
+  "1141": {
+   "name": "逐日之弓",
+   "revive": false,
+   "seen": 594
+  },
+  "1226": {
+   "name": "圣杯",
+   "revive": false,
+   "seen": 586
+  },
+  "1214": {
+   "name": "圣者法典",
+   "revive": false,
+   "seen": 572
+  },
+  "1154": {
+   "name": "穿云弓",
+   "revive": false,
+   "seen": 563
+  },
+  "1754": {
+   "name": "近卫·形昭",
+   "revive": false,
+   "seen": 559
+  },
+  "1222": {
+   "name": "血族之书",
+   "revive": false,
+   "seen": 547
+  },
+  "1158": {
+   "name": "血魂刃",
+   "revive": false,
+   "seen": 513
+  },
+  "1238": {
+   "name": "贤者天书",
+   "revive": false,
+   "seen": 489
+  },
+  "1124": {
+   "name": "陨星",
+   "revive": false,
+   "seen": 478
+  },
+  "1723": {
+   "name": "极影·奔狼",
+   "revive": false,
+   "seen": 471
+  },
+  "1425": {
+   "name": "急速战靴",
+   "revive": false,
+   "seen": 465
+  },
+  "1227": {
+   "name": "炽热支配",
+   "revive": false,
+   "seen": 462
+  },
+  "1129": {
+   "name": "速击之枪",
+   "revive": false,
+   "seen": 457
+  },
+  "1317": {
+   "name": "急速铠甲",
+   "revive": false,
+   "seen": 447
+  },
+  "1233": {
+   "name": "回响之杖",
+   "revive": false,
+   "seen": 432
+  },
+  "1112": {
+   "name": "匕首",
+   "revive": false,
+   "seen": 427
+  },
+  "1426": {
+   "name": "疾步之靴",
+   "revive": false,
+   "seen": 425
+  },
+  "1753": {
+   "name": "近卫·奔狼",
+   "revive": false,
+   "seen": 384
+  },
+  "1237": {
+   "name": "时之预言",
+   "revive": false,
+   "seen": 367
+  },
+  "1224": {
+   "name": "魔道之石",
+   "revive": false,
+   "seen": 360
+  },
+  "1125": {
+   "name": "破魔刀",
+   "revive": false,
+   "seen": 332
+  },
+  "1218": {
+   "name": "元流结晶",
+   "revive": false,
+   "seen": 309
+  },
+  "13212": {
+   "name": "天地石",
+   "revive": false,
+   "seen": 304
+  },
+  "1122": {
+   "name": "日冕",
+   "revive": false,
+   "seen": 303
+  },
+  "1244": {
+   "name": "破茧之衣",
+   "revive": false,
+   "seen": 271
+  },
+  "1157": {
+   "name": "不动·天穹",
+   "revive": false,
+   "seen": 265
+  },
+  "1324": {
+   "name": "雪山圆盾",
+   "revive": false,
+   "seen": 264
+  },
+  "1161": {
+   "name": "幽影袖箭",
+   "revive": false,
+   "seen": 244
+  },
+  "1351": {
+   "name": "徐行·凛冬",
+   "revive": false,
+   "seen": 213
+  },
+  "1116": {
+   "name": "雷鸣刃",
+   "revive": false,
+   "seen": 210
+  },
+  "1114": {
+   "name": "吸血之镰",
+   "revive": false,
+   "seen": 200
+  },
+  "1236": {
+   "name": "巫术法杖",
+   "revive": false,
+   "seen": 189
+  },
+  "1747": {
+   "name": "极影·星泉",
+   "revive": false,
+   "seen": 180
+  },
+  "11211": {
+   "name": "精钢锻刀",
+   "revive": false,
+   "seen": 167
+  },
+  "1314": {
+   "name": "提神水晶",
+   "revive": false,
+   "seen": 154
+  },
+  "1350": {
+   "name": "侵掠·怒魂",
+   "revive": false,
+   "seen": 142
+  },
+  "1346": {
+   "name": "暗夜小甲",
+   "revive": false,
+   "seen": 140
+  },
+  "22029": {
+   "name": "无象神器(法师)",
+   "revive": false,
+   "seen": 128
+  },
+  "1213": {
+   "name": "炼金护符",
+   "revive": false,
+   "seen": 123
+  },
+  "22027": {
+   "name": "无象神器(战士)",
+   "revive": false,
+   "seen": 113
+  },
+  "1216": {
+   "name": "元素杖",
+   "revive": false,
+   "seen": 109
+  },
+  "1115": {
+   "name": "迅捷长矛",
+   "revive": false,
+   "seen": 107
+  },
+  "11110": {
+   "name": "附魔之羽",
+   "revive": false,
+   "seen": 99
+  },
+  "11210": {
+   "name": "制裁之刃",
+   "revive": false,
+   "seen": 98
+  },
+  "1728": {
+   "name": "金色圣剑",
+   "revive": false,
+   "seen": 94
+  },
+  "1349": {
+   "name": "原初遗珠",
+   "revive": false,
+   "seen": 91
+  },
+  "1113": {
+   "name": "搏击拳套",
+   "revive": false,
+   "seen": 90
+  },
+  "1156": {
+   "name": "迅疾·日渊",
+   "revive": false,
+   "seen": 90
+  },
+  "1217": {
+   "name": "秘法残页",
+   "revive": false,
+   "seen": 89
+  },
+  "1523": {
+   "name": "追击刀锋",
+   "revive": false,
+   "seen": 88
+  },
+  "22026": {
+   "name": "无象神器(坦克/坦辅)",
+   "revive": false,
+   "seen": 74
+  },
+  "1348": {
+   "name": "沐光斗篷",
+   "revive": false,
+   "seen": 65
+  },
+  "1123": {
+   "name": "狂暴双刃",
+   "revive": false,
+   "seen": 60
+  },
+  "1322": {
+   "name": "熔炼之心",
+   "revive": false,
+   "seen": 59
+  },
+  "13211": {
+   "name": "玛瑙护心镜",
+   "revive": false,
+   "seen": 53
+  },
+  "1223": {
+   "name": "光辉之剑",
+   "revive": false,
+   "seen": 47
+  },
+  "1725": {
+   "name": "近卫·星泉",
+   "revive": false,
+   "seen": 46
+  },
+  "22031": {
+   "name": "无象神器(法辅)",
+   "revive": false,
+   "seen": 41
+  },
+  "1524": {
+   "name": "瑞鳞拳刃",
+   "revive": false,
+   "seen": 37
+  },
+  "1225": {
+   "name": "进化水晶",
+   "revive": false,
+   "seen": 37
+  },
+  "1212": {
+   "name": "蓝宝石",
+   "revive": false,
+   "seen": 25
+  },
+  "1531": {
+   "name": "符文大剑",
+   "revive": false,
+   "seen": 25
+  },
+  "1242": {
+   "name": "难知·月神",
+   "revive": false,
+   "seen": 20
+  },
+  "1117": {
+   "name": "冲能拳套",
+   "revive": false,
+   "seen": 17
+  },
+  "1411": {
+   "name": "神速之靴",
+   "revive": false,
+   "seen": 15
+  },
+  "1229": {
+   "name": "破碎圣杯",
+   "revive": false,
+   "seen": 11
+  },
+  "22030": {
+   "name": "无象神器(射手)",
+   "revive": false,
+   "seen": 6
+  },
+  "1701": {
+   "name": "学识宝石",
+   "revive": false,
+   "seen": 5
+  },
+  "1511": {
+   "name": "狩猎宽刃",
+   "revive": false,
+   "seen": 3
+  },
+  "1711": {
+   "name": "极影",
+   "revive": false,
+   "seen": 3
+  },
+  "1521": {
+   "name": "游击弯刀",
+   "revive": false,
+   "seen": 2
+  },
+  "22028": {
+   "name": "无象神器(刺客)",
+   "revive": false,
+   "seen": 2
+  },
+  "1714": {
+   "name": "近卫",
+   "revive": false,
+   "seen": 1
+  }
+ }
+}

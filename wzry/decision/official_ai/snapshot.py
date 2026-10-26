@@ -54,7 +54,9 @@ class Unit:
     respawn_s: Optional[float] = None   # 复活倒计时（秒，内存 0x15D4）
     data_src: str = "mem"         # mem / mixed / vision / none（**取数来源审计**）        # mem / screen
     # 法力：官方 `HeroBaseInfo.ep` 的同位字段。
-    #   内存侧未打通（见 docs 待办 P0.2），只有 HUD 蓝条比例时按 `ep=ratio, ep_max=1.0` 填。
+    #   **本地英雄**已打通（`self_state.mp` ← EP_CUR/EP_MAX，0x1C4/0x1C8）；
+    #   敌方英雄没有逐英雄法力（actor 记录不含 EP），只有 HUD 蓝条比例时按
+    #   `ep=ratio, ep_max=1.0` 落位，绝不伪造成绝对值。
     ep: Optional[float] = None
     ep_max: Optional[float] = None
     # 已购买装备（config_id 列表；含合成小件）。ID→名称需自建映射。
@@ -106,6 +108,9 @@ class Snapshot:
     unlocated: Dict[str, int] = field(default_factory=dict)
     # 自己的装备（与 Unit.equip 同源，方便直接取）
     self_equip: List[int] = field(default_factory=list)
+    # 已购装备里是否有复活甲（贤者的庇护 1337）；ID 表见 configs/equip_ids.json。
+    # 只表示"买过"，不含 150s CD / 每局 2 次的可用性。
+    revive_armor_usable: bool = False
     ally_gold: float = 0.0
     enemy_gold: float = 0.0
     kill_diff: float = 0.0
@@ -320,17 +325,23 @@ def from_state_dict(state: dict, self_id: Optional[int] = None,
         snap.self_x, snap.self_z = me.x, me.z
         snap.coord_src = me.coord_src
         snap.self_equip = list(me.equip or [])
+        if snap.self_equip:
+            from . import equips as _eq
+            snap.revive_armor_usable = _eq.is_revive_armor(snap.self_equip)
         snap.self_camp_src = ("memory" if had_camp.get(id(me))
                              else ("inferred_base" if me.camp else "unknown"))
     else:
         snap.self_camp_src = "unknown"
 
-    # ---- 法力（P0.2）：内存没有该字段，走 HUD 视觉比例 ----
-    #   `ui.mp` 是 `wzry/vision/self_bars.py`/`ui_reader.find_mp_bar` 给出的 0..1 比例。
-    #   内存侧若将来打通（`mem_heroes[].mp`），优先用它算比例。
-    ep_rate = None
-    if me is not None and me.ep_rate is not None:
-        ep_rate = me.ep_rate
+    # ---- 法力：优先内存（`self_state.mp` ← EP_CUR/EP_MAX），再退 HUD 蓝条比例 ----
+    #   逐英雄法力未打通（actor 记录里没有 EP），只有**本地英雄**能从 self 对象读；
+    #   因此这里先给 self 补绝对法力，`ep` 语义才与官方 `HeroBaseInfo.ep` 对齐。
+    if me is not None and me.ep is None and isinstance(ss, dict):
+        _mp, _mp_max = ss.get("mp"), ss.get("mp_max")
+        if (isinstance(_mp, (int, float)) and isinstance(_mp_max, (int, float))
+                and 0 < float(_mp_max) <= 50_000 and 0 <= float(_mp) <= float(_mp_max)):
+            me.ep, me.ep_max = float(_mp), float(_mp_max)
+    ep_rate = me.ep_rate if me is not None else None
     if ep_rate is None:
         try:
             if ui.get("mp") is not None:

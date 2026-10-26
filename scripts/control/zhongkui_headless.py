@@ -178,7 +178,7 @@ class ZhongkuiHeadless:
 
 if __name__ == "__main__":
     MODEL_PATH = "runs/detect/zhongkui_detector_finetune/weights/best.pt"
-    MUMU_MANAGER_PATH = r"E:\MuMuPlayer\nx_main\MuMuManager.exe"
+    MUMU_MANAGER_PATH = r"D:\app\MuMuPlayer\nx_main\MuMuManager.exe"
     CONFIG_PATH = "configs/calibration.json"
     agent = ZhongkuiHeadless(MODEL_PATH, MUMU_MANAGER_PATH, CONFIG_PATH)
     agent.run()

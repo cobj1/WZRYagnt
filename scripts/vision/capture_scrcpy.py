@@ -24,7 +24,7 @@ class ScrcpyCapture:
         self.cap = None
         
     def start(self):
-        self.temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False, dir=r"E:\WZRYagent\temp")
+        self.temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False, dir=str(Path(__file__).resolve().parents[2] / "temp"))
         self.video_path = Path(self.temp_video.name)
         
         cmd = [
@@ -114,7 +114,7 @@ class ScreenshotCollector:
             print(f"Finished, {count} images saved.")
 
 if __name__ == "__main__":
-    SCRCPY_PATH = "E:/WZRYagent/tools/scrcpy"
+    SCRCPY_PATH = str(Path(__file__).resolve().parents[2] / "tools" / "scrcpy")
     HERO_NAME = "zhongkui"
     INTERVAL = 1.0
 
