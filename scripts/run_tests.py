@@ -36,6 +36,7 @@ SUITES = [
     ("eval_replay", "scripts/test_eval_replay.py", False),
     ("official", "scripts/test_official_ai_replica.py", False),
     ("laya", "scripts/test_laya_fusion.py", False),
+    ("laya_stale", "scripts/test_laya_stale_probs.py", False),
     ("new_modules", "scripts/test_new_modules.py", False),
     ("bridge_fields", "scripts/test_hok_bridge_fields.py", True),
     ("data_contract", "../hok-decision-ai/tests/test_data_contract.py", True),

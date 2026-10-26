@@ -124,7 +124,7 @@ class LayaScorer:
     def __init__(self, mode="shadow", beta=0.0, model_path=None,
                  top_k=TOP_K, cache_ttl=CACHE_TTL, shadow_path=None,
                  max_errors=MAX_ERRORS, max_label_dups=MAX_LABEL_DUPS,
-                 min_submit_interval=0.0,
+                 min_submit_interval=0.0, stale_probs_ttl=0.0,
                  backend="auto", ov_device="GPU", ov_ir=None,
                  ov_max_len=OV_MAX_LEN, ov_max_opts=None):
         assert mode in ("off", "shadow", "ensemble")
@@ -147,6 +147,13 @@ class LayaScorer:
         #   会丢掉约 70% 的提交, 徒增主线程开销与无谓日志。按模型实际吞吐限流。
         self.min_submit_interval = float(min_submit_interval)
         self._last_submit_t = 0.0
+        # v14.4 「滞后一拍」复用: 异步 worker 的推理结果在**下一次**决策点才有用。
+        #   实测 @2Hz（间隔 0.5s）且 cache_ttl=0.3s、状态 key 每帧唯一时,
+        #   缓存必然过期 -> probs 恒为 None -> ensemble 模式**一次都不会重排**。
+        #   把上一拍的概率按 max(bucket 放宽) 复用给本拍, 才能让融合真正生效。
+        #   0 = 关闭(保持旧行为, 默认)。
+        self.stale_probs_ttl = float(stale_probs_ttl)
+        self._last_probs = None      # (t, labels, probs)
         self._lat_ms = []       # v14.3 端到端耗时采样(最近 200 次), 供延迟归因
         # v14.2 运行期熔断: 异常数 / 标签重复数 超阈值 -> 本局永久降级为 off。
         #   原先 P1 门槛"异常数=0"只能靠人工看日志; 模型加载失败时每拍都会
@@ -172,7 +179,7 @@ class LayaScorer:
         self._counts = {"errors": 0, "submits": 0, "cache_hits": 0,
                         "reorders": 0, "shadow_logged": 0, "predicts": 0,
                         "label_dups": 0, "exec_logged": 0, "latency_logged": 0,
-                        "throttled": 0}
+                        "throttled": 0, "stale_hits": 0}
         self._last_err = ""
         self._last_err_print = 0.0
         self._ctx = {}          # v14.2 运行期上下文(session_id/frame_id/model_sha)
@@ -386,6 +393,13 @@ class LayaScorer:
                 if h is not None and now - h[0] <= self.cache_ttl:
                     hit = h
                     self._counts["cache_hits"] += 1
+            if hit is None and self.stale_probs_ttl > 0.0:
+                # 同一组候选标签 + 未超时 -> 用上一拍的分布(滞后一拍融合)
+                last = self._last_probs
+                if (last is not None and last[1] == tuple(labels)
+                        and now - last[0] <= self.stale_probs_ttl):
+                    hit = (last[0], last[2], round((now - last[0]) * 1000, 1))
+                    self._counts["stale_hits"] += 1
             if hit is None:
                 probs = None
                 if (self.min_submit_interval > 0.0
@@ -459,6 +473,8 @@ class LayaScorer:
         self._lat_ms.append(lat)
         if len(self._lat_ms) > 200:
             del self._lat_ms[:-200]
+        if probs:
+            self._last_probs = (time.time(), tuple(labels), probs)
         with self._cache_lock:
             self._cache[key] = (time.time(), probs, lat)
             if len(self._cache) > 64:
