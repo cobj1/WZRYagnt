@@ -156,6 +156,16 @@ def _fallback_action(state):
 
     不能用 {"type":"none"} —— optimizer._solve_core 的动作白名单里含 "none", 会原样返回,
     等于规则层完全不决策(scripts/ab_replay.py 踩过这个坑)。
+
+    ⚠️ 这是**占位兜底，不是生产规则层**。`_solve_core` 有一条白名单：
+        若 fallback 的 type 属于 skill/attack/combo/recall/restore/none，直接返回 fallback。
+    而本函数恒返回 map_move，于是技能/攻击/回城**全部被换成 map_move**。
+    实测（2026-10-26，15929 帧）：用本兜底时 `solved_type` 100% 是 map_move，
+    而生产 `m2_agent_v2.decide()` 的真实分布是 move 88.3% / none 8.2% / skill 2.8% / recall 0.4%。
+
+    → **不要用本函数的结果统计"规则层的动作分布"**，也不要用它给 Laya/A-B 当基线。
+      需要真实分布请用 `scripts/report_action_distribution.py --prod`。
+      详见 docs/数据专题/动作分布对照-2026-10-26.md
     """
     g = _self_point(state)
     return {"type": "map_move", "nx": float(g[0]), "ny": float(g[1]), "reason": "eval_rule_fb"}
