@@ -660,7 +660,9 @@ check("T26f 常量可调，且三层门槛有序（收人头 0.35 < 占优推进
 # ---------------------------------------------------------------- 27. P0-F1 敌塔威胁（小地图分阵营塔）
 check("T27a P0-F2 分阵营键已注入 build_state（旧键保留）+ F1 只认分阵营敌塔",
       '"towers_v7": mm.get("towers_v7")' in _src2 and '"towers": mm["towers"],' in _src2
-      and "def _mm_enemy_towers" in _src2)
+      # v17.1 P1: `_mm_enemy_towers` 已搬到 wzry.policy.push_tower（逐字节复制）。
+      #   原断言查源码字符串，会阻断纯搬迁；改查 m2 能否调到（行为等价，位置无关）。
+      and hasattr(m2mod, "_mm_enemy_towers"))
 check("T27b 旧 YOLO 屏幕空间塔判据已删净（TURRET_ESCAPE_FRAC / TURRET_THREAT_FRAC / _is_base_building）",
       not hasattr(m2mod, "TURRET_ESCAPE_FRAC") and not hasattr(m2mod, "TURRET_THREAT_FRAC")
       and "_is_base_building" not in _src2
