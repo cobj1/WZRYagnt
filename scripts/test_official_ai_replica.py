@@ -411,6 +411,41 @@ def main():
           inside is not None and inside[0] == R.VETO and outside is None,
           f"{inside[0] if inside else None} / {outside}")
 
+    # ---- 徘徊（IsLinger / MovePosWhenLinger / *AroundDragon）----
+    #   `linger_frames` 由 policy._observe 累加（相邻决策点位移 ∈ [60,180)）；
+    #   这里直接设值，专测规则层的阈与动作形态。
+    snap_l = oa.from_state_dict(fixture(hp_ratio=0.8, enemy_dist=30000), atk_range=ATK)
+    mv_l = A.Action("Move0", "move", point=(snap_l.self_x + 500, snap_l.self_z))
+
+    snap_l.linger_frames = R.LINGER_FRAMES - 1
+    check("T52c IsLinger：未达门柳 -> 不判徘徊",
+          R._is_linger(snap_l) is False, str(R._is_linger(snap_l)))
+    snap_l.linger_frames = R.LINGER_FRAMES
+    check("T52d IsLinger：连续 N 帧小范围移动 -> 判徘徊",
+          R._is_linger(snap_l) is True, str(R._is_linger(snap_l)))
+
+    res_l = R.r_move_pos_when_linger(snap_l, mv_l)
+    check("T52e MovePosWhenLinger：徘徊时换位",
+          res_l is not None and res_l[1].label == "LingerMove",
+          res_l[1].label if res_l else "None")
+    res_la = R.r_move_pos_when_linger(snap_l, A.Action("Atk1", "attack"))
+    check("T52f MovePosWhenLinger：技能/攻击不改写",
+          res_la is None, str(res_la))
+
+    # fixture 的野怪在 (1500,800)，距自己 ≈1700 < DRAGON_LINGER_RADIUS(1800)
+    _dragon_ok = R._check_linger_around_dragon(snap_l)
+    check("T52g CheckLingerAroundDragon：龙坑徘徊成立",
+          _dragon_ok is True, str(_dragon_ok))
+    res_ld = R.r_move_pos_when_linger_around_dragon(snap_l, mv_l)
+    check("T52h MovePosWhenLingerAroundDragon：龙坑版优先",
+          res_ld is not None and res_ld[1].label == "LingerMoveDragon",
+          res_ld[1].label if res_ld else "None")
+    snap_l.linger_frames = 0
+    check("T52i 不徘徊时两条规则都不触发",
+          R.r_move_pos_when_linger(snap_l, mv_l) is None
+          and R.r_move_pos_when_linger_around_dragon(snap_l, mv_l) is None, "")
+
+
     # ---- 16. 证据分级 / 规则规模 / 场景节拍 ----
     cs = R.chain_stats()
     check("T53 规则链规模：已实现 >=17，其中汇编证据 >=5 条",
@@ -1022,8 +1057,8 @@ def main():
 
     # ---- 30. 规则链规模 ----
     cs = R.chain_stats()
-    check("T117 规则链 37/38（第五、六批共 9 条已注册）",
-          cs["implemented"] == 37 and cs["total"] == 38, str(cs))
+    check("T117 规则链 39/40（含 2026-10-27 徘徊系列 2 条）",
+          cs["implemented"] == 39 and cs["total"] == 40, str(cs))
 
     # ---- 31. 召唤师技能识别不许误判英雄技能 ----
     st_fp = fixture(hp_ratio=0.9)

@@ -123,6 +123,11 @@ class Snapshot:
     view_distance: float = 1200.0
     # 连续"下了指令但没位移"的帧数（卡墙/卡门判据），由 policy 写入
     stuck_frames: int = 0
+    # 连续"小范围移动"的帧数（**徘徊**判据，官方 IsLinger / move_pos_when_linger）。
+    #   与 stuck_frames 的区别：stuck 是几乎没动（< STUCK_MOVE_EPS），
+    #   linger 是动了但在小圈子里打转（STUCK_MOVE_EPS .. LINGER_MOVE_EPS）。
+    #   同样由 policy 写入（不属于"观测"，延迟档位下要用当前值覆盖）。
+    linger_frames: int = 0
     # 最近 N 步动作标签（官方 add_last_n_yaction_feature_size 的同构物）
     last_actions: List[str] = field(default_factory=list)
     # 槽位分配诊断（冲突/未分配），供真机校验与回放

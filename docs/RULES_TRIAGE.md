@@ -4,11 +4,26 @@
 > 生成：`D:/app/python/python.exe reverse/gen_rules_triage.py`（以下命令均在 `WZRYagnt/` 下执行）。
 > 现状（2026-10-26 实测）：`rules.py` 注册 **40** 条（`evidence=EVID_DISASM` 5 / `EVID_NAME` 34 / 未标 1），
 > 唯一地址 **33** 个（旧文案写“已实现 37 条”，与实测不符）；
-> 表内可识别的具名函数（去重、去桩）**67** 个，待做表 **52** 条 → 去重后**实际未做 47 条**。
+> 表内可识别的具名函数（去重、去桩）**67** 个，待做表 **52** 条 → 去重并扣掉两次实现后**实际未做 45 条**。
 >
-> **2026-10-26 复核（第二次修正）**：待做表 52 条里有 **5 条**（#4 #10 #12 #33 #35）
-> 经**地址核对**已在 `rules.py` 注册 → **实际未实现 47 条**。复查命令：
-> `venv/Scripts/python.exe -X utf8 scripts/check_rules_triage.py`。
+> **2026-10-27 实现与分桶**：已实现 **MovePosWhenLinger @0x027ec574** 与
+> **MovePosWhenLingerAroundDragon @0x027eb0e4**（均 `evidence=EVID_NAME`）。
+> 判据 `IsLinger @0x027fc344` / `CheckLingerAroundDragon @0x027ea87c` 并入
+> `rules._is_linger` / `_check_linger_around_dragon`，**不单独注册**——固定顺序命中即短路，
+> 单独注册会让后面的动作规则永不执行（与 `_in_spring_box` 同一角色）。→ 真实未做 **45 条**。
+>
+> 45 条按「对本项目是否有用」分三桶（钟馗**单英雄**）：
+> - **A 4 条**：判据已被现有代码消费（#6 #16 #20 #31），无需独立注册；
+> - **B 25 条**：英雄/装备专属（守约二技能、孙尚香、鲲鲲传送、达摩卡墙……），本项目**跳过**，换英雄时再回来看；
+> - **C 16 条**：通用且未实现——**这才是真实可做的子集**：
+>   #2 move_pos_when_skill_no_move / #3 tactics_UseMapSpecialSkill / #7 Process / #11 wait_resurrection_armor /
+>   #22 multi_person_cake / #28 AtkUnit / #32 IsAroundDist / #37 AvoidStuckDoor / #38 transhold /
+>   #39 GenMovePos / #41 linger_dir_adjust / #42 Process / #44 InitSpecialPlaceStuckWall /
+>   #45 move_pos_when_struck_wall / #46 UseMapSpecialSkill / #52 attack_ding。
+>
+> 实现注意（本轮踩过的）：**加规则前先搜同类**。已有 `r_is_linger_around_dragon`
+> （IsLingerAroundDragon @0x027eafb4，语义是“目标为龙+敌近→别开龙”）与本轮的
+> `_check_linger_around_dragon`（“我在龙坑打转”）名字极像但语义相反，已改名区分。
 >
 > 复核口径的两次教训（别再用更宽的口径）：
 > - **地址只能从 `Rule(...)` 注册行取**。全文 grep 会把「注释里提到过这个地址」当成已实现：

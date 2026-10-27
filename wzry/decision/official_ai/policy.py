@@ -38,6 +38,10 @@ FALLBACK = "fallback"
 CACHED = "cached"
 
 STUCK_MOVE_EPS = 60.0        # 相邻决策点位移小于此值（世界单位）视为"没走动"
+# 徘徊阈值：位移落在 [STUCK_MOVE_EPS, LINGER_MOVE_EPS) 说明"在动但没走出去"。
+#   官方 IsLinger 的常量未从汇编确认（该函数 136 条指令，槽位落在分支链中间），
+#   这里取工程值（约 1.5 个身位/决策点）并标 evidence=name。
+LINGER_MOVE_EPS = 180.0
 
 
 @dataclass
@@ -197,6 +201,7 @@ class OfficialAI:
         self._last_pos: Optional[tuple] = None
         self._last_kind: str = ""
         self.stuck_frames = 0
+        self.linger_frames = 0          # 连续小范围移动帧数（徘徊）
         self._frame = 0
         self.n_model = 0
         self.n_rule = 0
@@ -255,6 +260,7 @@ class OfficialAI:
         s = self._delayed(snap)
         s.view_distance = float(self.params.view_distance)
         s.stuck_frames = self.stuck_frames
+        s.linger_frames = self.linger_frames
         s.last_actions = list(self._acts)
         return s
 
@@ -265,10 +271,15 @@ class OfficialAI:
                 and self._last_kind == "move"):
             moved = math.hypot(pos[0] - self._last_pos[0], pos[1] - self._last_pos[1])
             self.stuck_frames = self.stuck_frames + 1 if moved < STUCK_MOVE_EPS else 0
+            # 徘徊：在动但一直在小圈子里（官方 IsLinger 的输入）
+            self.linger_frames = (self.linger_frames + 1
+                                  if STUCK_MOVE_EPS <= moved < LINGER_MOVE_EPS else 0)
         else:
             self.stuck_frames = 0
+            self.linger_frames = 0
         self._last_pos = pos
         snap.stuck_frames = self.stuck_frames
+        snap.linger_frames = self.linger_frames
         snap.last_actions = list(self._acts)
         return snap
 

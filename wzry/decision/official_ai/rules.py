@@ -53,6 +53,13 @@ HIGH_DEFEND_RADIUS = 1500.0      # 高地塔"被围"半径
 HIGH_DEFEND_ALLY_DIST = 5000.0   # 离高地塔多远才值得回防
 STUCK_WALL_FRAMES = 8            # 连续 N 帧无位移 -> 判卡墙
 STUCK_LONG_FRAMES = 16           # 更久 -> 直接换目标点
+# ---- 徘徊（linger）系列：IsLinger / move_pos_when_linger / *AroundDragon ----
+#   官方两条判据函数（IsLinger @0x027fc344、CheckLingerAroundDragon @0x027ea87c）
+#   的常量未从汇编确认（槽位地址落在分支链中间，需要找字段写入点才能定阈值），
+#   所以阈值取工程值，两条**动作**规则标 evidence=EVID_NAME。
+LINGER_FRAMES = 6                # 连续 N 帧小范围移动 -> 判徘徊（约 3s @2Hz）
+# 龙坑半径复用已有的 DRAGON_LINGER_RADIUS（与 IsLingerAroundDragon 同一个“龙坑”概念，
+#   不另造第二个值，否则两条规则的"附近"会不一致）。
 ONLY_ATK_FRAMES = 6              # 连续 N 步只攻击不移动
 RISK_HP_RATE = 0.70              # 态势判断的"血不健康"上限
 
@@ -462,6 +469,74 @@ def r_long_time_only_atk(snap: Snapshot, act: Action):
     if me is not None and me.hp_rate < RISK_HP_RATE:
         return REWRITE, _retreat(snap), "only_atk_low_hp"
     return None
+
+
+def _is_linger(snap: Snapshot) -> bool:
+    """RuleTactics::IsLinger @0x027fc344 —— 徘徊判定（**判据**，不是动作）。
+
+    口径：`policy._observe` 每帧按“相邻决策点位移 ∈ [STUCK_MOVE_EPS, LINGER_MOVE_EPS)”
+    累加 `snap.linger_frames`，>= LINGER_FRAMES 判为徘徊。
+    与 ItStuckWall 的区别：stuck 是几乎没动，linger 是动了但在小圈子里打转。
+
+    ⚠️ 本函数**不注册**为 Rule：它只给 `r_move_pos_when_linger` /
+    `r_move_pos_when_linger_around_dragon` 当燃料（和 `_in_spring_box` 一样的角色）。
+    单独注册成规则会让两条动作规则永不被执行（固定顺序、命中即短路）。
+    """
+    return snap.linger_frames >= LINGER_FRAMES
+
+
+def _check_linger_around_dragon(snap: Snapshot) -> bool:
+    """RuleTactics::CheckLingerAroundDragon @0x027ea87c —— 龙坑附近的**徘徊**判定。
+
+    ⚠️ 不要与已实现的 `r_is_linger_around_dragon`（IsLingerAroundDragon @0x027eafb4）
+    搞混：那条是“目标为龙 + 敌英雄够近 -> 别开龙”；本条只回答“我是不是在龙坑打转”。
+    在 `_is_linger` 基础上再加“有活体野怪在 DRAGON_LINGER_RADIUS 内”。
+    只认 `snap.monsters`（记忆层的野怪单位），不拿小地图黄点充数。
+    """
+    if not _is_linger(snap):
+        return False
+    if snap.self_unit is None:
+        return False
+    for m in snap.monsters:
+        if m.alive and snap.dist(m) <= DRAGON_LINGER_RADIUS:
+            return True
+    return False
+
+
+def r_move_pos_when_linger_around_dragon(snap: Snapshot, act: Action):
+    """RuleTactics::MovePosWhenLingerAroundDragon @0x027eb0e4（name 级）—— 龙坑徘徊换位。
+
+    语义：在龙坑附近徘徊 = 蹲龙/等队友，容易被敌方开局扫描找到。官方在此重选位置；
+    这里复用价值场最优点（与 StuckBreak 同源），只改移动，不动技能/攻击。
+    比通用版更具体，所以排在它前面。
+    """
+    if not _check_linger_around_dragon(snap):
+        return None
+    if act.kind != "move":
+        return None
+    pt = _stuck_break_point(snap)
+    if pt is None:
+        return None
+    return REWRITE, Action("LingerMoveDragon", "move", point=pt,
+                           meta={"linger_dragon": True}), \
+        f"linger_dragon={snap.linger_frames}"
+
+
+def r_move_pos_when_linger(snap: Snapshot, act: Action):
+    """RuleTactics::MovePosWhenLinger @0x027ec574（name 级）—— 徘徊时换个位置。
+
+    为什么要紧：在同一小圈里来回走会被对方预判（钟馗蹲草尤其明显）。
+    只改移动动作；技能/攻击保持原样（官方也只重选移动点）。
+    """
+    if not _is_linger(snap):
+        return None
+    if act.kind != "move":
+        return None
+    pt = _stuck_break_point(snap)
+    if pt is None:
+        return None
+    return REWRITE, Action("LingerMove", "move", point=pt,
+                           meta={"linger": True}), f"linger={snap.linger_frames}"
 
 
 def r_situation_dangerous(snap: Snapshot, act: Action):
@@ -1254,6 +1329,12 @@ CHAIN: List[Rule] = [
          evidence=EVID_NAME),
     Rule("GetHeroSpeedUpSkill", r_get_hero_speed_up_skill, addr="0x027de90c",
          evidence=EVID_NAME),
+    # 徘徊系列：判据（IsLinger / CheckLingerAroundDragon）已并入 `_is_linger*`，
+    #   只注册两条**动作**规则；龙坑版更具体，排在通用版前面。
+    Rule("MovePosWhenLingerAroundDragon", r_move_pos_when_linger_around_dragon,
+         addr="0x027eb0e4", evidence=EVID_NAME),
+    Rule("MovePosWhenLinger", r_move_pos_when_linger,
+         addr="0x027ec574", evidence=EVID_NAME),
 
 ]
 
