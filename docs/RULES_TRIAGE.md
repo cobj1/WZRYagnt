@@ -58,10 +58,15 @@
 >   虚拟谓词 → 动作码 **3**；状态字段 `+0x14dc` / `+0x14e0` / `+0x1490`。
 > - #22 `multi_person_cake @0x27fe7c4`：config **900251**，返回值 ∈ **[300,301]**，时间差 **≥31**。
 >
-> **仍未新增规则（0 条）**，但阻塞点已换：真正的缺口是
-> ①**虚拟调用无法解析**（核心判据都是 `ldr x8,[GOT+slot]; blr x8`，需 GOT 槽位→方法名）；
-> ②**官方动作码未映射**（16 / 3 与 `official_ai/actions.py` 的 label 体系无对照表）。
-> 正确推进顺序：GOT 槽位解析 → 动作码对照表 → 逐条落地。
+> **仍未新增规则（0 条）**，但阻塞点已两度收敛：
+> ① ~~虚拟调用无法解析~~ → **已于同日晚打通**（`reverse/resolve_got.py`：`.rela.dyn` 的
+>   `R_AARCH64_RELATIVE` addend 就是目标函数；#11 解出 `TargetFinder`、
+>   #3 解出指向 #46 的 `RuleTactics::UseMapSpecialSkill`、#22 解出
+>   `[GetTargetVec] target_type=kAnyone`）；
+> ② **官方动作码未映射**（16 / 3 与 `official_ai/actions.py` 的 label 体系无对照表）—— 现在这是唯一硬缺口。
+> 附：`reverse/dump_rule_table.py` 从重定位重建出 **194 个规则函数 / 100 个带规则名**，
+> 本表 52 条地址 **52/52 全命中**（独立第三证据）。
+> 正确推进顺序：**动作码对照表 → 逐条落地**。
 > 另按 tags 初步判断 3 条不是动作规则，不应注册：#7 `RuleTactics::Process()` 是调度器、
 > #32 `IsAroundDist` 是距离判据、#44 `InitSpecialPlaceStuckWall` 是初始化。
 
