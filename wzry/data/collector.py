@@ -123,7 +123,7 @@ class MatchRecorder:
         # 字段覆盖率计数（写进 manifest；采数后一眼判断这局能不能用）
         self._field_hits = {
             "clock_s": 0, "scoreboard": 0, "units.pos_minimap": 0,
-            "ui.hp": 0, "minimap.dots": 0, "units": 0,
+            "ui.hp": 0, "minimap.dots": 0, "units": 0, "self_state": 0,
         }
         # 对局结果：胜负是价值模型的唯一监督信号。历史 44 局没有记录，导致
         # 域内价值模型完全无法训练——这里先补接口，避免下一批数据再次缺这一列。
@@ -303,6 +303,8 @@ class MatchRecorder:
             self._field_hits["clock_s"] += 1
         if state_dict.get("scoreboard"):
             self._field_hits["scoreboard"] += 1
+        if state_dict.get("self_state"):
+            self._field_hits["self_state"] += 1
         if (state_dict.get("minimap") or {}).get("dots"):
             self._field_hits["minimap.dots"] += 1
 

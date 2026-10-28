@@ -44,6 +44,7 @@ for i in range(3):
         "ui": {"hp": 0.8, "match_clock": 120.0 + i},
         "units": [{"cls": "enemy_hero", "pos_minimap": [0.3, 0.4]}],
         "minimap": {"found": True, "dots": {"green": [[0.5, 0.5]]}},
+        "self_state": {"cid": 131, "camp": "blue", "hp": 800, "hp_max": 1000},
         "extra": {"mem_heroes": [{"hero_cid": 131, "camp": "blue", "gold_total": 3000}]},
     }
     rec.on_state(st)
@@ -54,6 +55,7 @@ check("T1_full_frame_coverage_all_one",
       f"cov={cov}")
 ok, missing = rec.coverage_gate()
 check("T2_gate_passes_on_full_frames", ok and not missing, f"{ok} {missing}")
+check("T2b_self_state_counted", cov.get("self_state") == 1.0, f"cov={cov}")
 check("T3_session_time_injected",
       isinstance(full_states[0].get("session_start_t"), float)
       and isinstance(full_states[0].get("session_elapsed_s"), float),

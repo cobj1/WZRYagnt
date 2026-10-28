@@ -178,6 +178,38 @@ def button_vec(rec: Optional[dict]) -> Optional[Dict[str, float]]:
             "ready": bool(rec.get("ready"))}
 
 
+def _canonical_self_state(me: Dict) -> Dict:
+    """英雄数组中的本地玩家 → canonical self_state。
+
+    patch_state 与 MemWorker.apply 共用同一份构造，避免两处字段漂移
+    （历史上 apply 少写 self_state，录制语料 0/15929）。
+    """
+    return {
+        "cid": me.get("id"), "camp": me.get("camp"),
+        "hp": me.get("hp"), "hp_max": me.get("hp_max"),
+        "mp": me.get("ep"), "mp_max": me.get("ep_max"),
+        "gold": me.get("gold"), "gold_total": me.get("gold_earned"),
+        "gold_spent": me.get("gold_spent"),
+        "level": me.get("level"), "exp": me.get("exp"),
+        "kills": me.get("kills", 0), "deaths": me.get("deaths", 0),
+        "assists": me.get("assists", 0),
+        "atk_range": me.get("atk_range"),
+        "skills": [MemSource._canonical_skill(s)
+                   for s in (me.get("skills") or [])],
+        "summoner": (MemSource._canonical_skill(me["summoner"])
+                     if me.get("summoner") else None),
+        "heal": (MemSource._canonical_skill(me["heal"])
+                 if me.get("heal") else None),
+        "recall": (MemSource._canonical_skill(me["recall"])
+                   if me.get("recall") else None),
+        "equip": list(me.get("equip_ids") or []),
+        "respawn_s": me.get("respawn_s"),
+        "dead": bool(me.get("dead")),
+        "x": me.get("x"), "z": me.get("z"),
+        "visible": True, "src": "memory", "ts": time.time(),
+    }
+
+
 class MemBattle:
     """对局级内存读取器（在 MemSource 之上补"对局字段"）。"""
 
@@ -559,30 +591,7 @@ class MemBattle:
                 state_dict["sources"] = sources
             sources["scoreboard"] = "memory"
             if me is not None:
-                state_dict["self_state"] = {
-                    "cid": me.get("id"), "camp": me.get("camp"),
-                    "hp": me.get("hp"), "hp_max": me.get("hp_max"),
-                    "mp": me.get("ep"), "mp_max": me.get("ep_max"),
-                    "gold": me.get("gold"), "gold_total": me.get("gold_earned"),
-                    "gold_spent": me.get("gold_spent"),
-                    "level": me.get("level"), "exp": me.get("exp"),
-                    "kills": me.get("kills", 0), "deaths": me.get("deaths", 0),
-                    "assists": me.get("assists", 0),
-                    "atk_range": me.get("atk_range"),
-                    "skills": [MemSource._canonical_skill(s)
-                               for s in (me.get("skills") or [])],
-                    "summoner": (MemSource._canonical_skill(me["summoner"])
-                                 if me.get("summoner") else None),
-                    "heal": (MemSource._canonical_skill(me["heal"])
-                             if me.get("heal") else None),
-                    "recall": (MemSource._canonical_skill(me["recall"])
-                               if me.get("recall") else None),
-                    "equip": list(me.get("equip_ids") or []),
-                    "respawn_s": me.get("respawn_s"),
-                    "dead": bool(me.get("dead")),
-                    "x": me.get("x"), "z": me.get("z"),
-                    "visible": True, "src": "memory", "ts": time.time(),
-                }
+                state_dict["self_state"] = _canonical_self_state(me)
                 state_dict["sources"]["self"] = "memory"
 
         # 3) 单位 / 野怪
@@ -788,11 +797,13 @@ class MemWorker:
                 ui["recall_ready"] = bool(rc.get("ready"))
                 extra["mem_recall"] = {"id": int(rc.get("id") or 0),
                                        "ready": bool(rc.get("ready"))}
+            state_dict["self_state"] = _canonical_self_state(me)
+            sources["self"] = "memory"
             hs_all = {h["id"]: skill_vec(h.get("skills"))
                       for h in heroes if h.get("skills")}
             if hs_all:
                 extra["mem_hero_skills"] = hs_all
-            bs = self.src.read_hero_base_stats()
+            bs = self.mb.src.read_hero_base_stats()
             if bs:
                 lv = {h["id"]: (h.get("level") or 1) for h in heroes}
                 extra["mem_hero_stats"] = {
