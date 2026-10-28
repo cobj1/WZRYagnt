@@ -42,8 +42,32 @@
 >
 > 说明：§8.2 的 141 是 RuleTactics 调度表里的具名规则数；本表按`RuleTactics::` / `rule_` 前缀从 260 行原始注册表里抽，含部分重载与子函数，所以条数会多于 141 —— 以本表为**工作清单**，以 141 为**对账口径**。
 
+> **2026-10-28 函数边界复核（C 组）→ 当日晚间已勘误，原结论作废**
+>
+> 原结论"多数槽位地址在函数中段、需先做函数边界重建"是**工具读偏 0x1000 造成的假象**：
+> `disasm_one.py` 早期版本直接把 VA 当文件偏移（`.text` 两者差 0x1000 = 256 条指令）。
+> 用 PT_LOAD 正确映射后实测 **52/52 (100%) 条地址精确落在函数序言**，
+> 而把地址当文件偏移读时只有 1/52 (1.9%)。
+> 证据与重读结果见 `docs/反汇编地址口径勘误-2026-10-28.md`；
+> 校验脚本 `reverse/verify_addr_convention.py`；回归守卫 `scripts/test_disasm_addr.py`。
+>
+> 三条被点名的规则在正确字节下语义都相当具体（不再"不可确认"）：
+> - #11 `wait_resurrection_armor @0x27eb7d8`：动作码 **16**，config **913471**，
+>   血量比 > **0.5**，浮点门槛 **120.0**，容器 stride **56**。
+> - #3 `tactics_UseMapSpecialSkill @0x27d7ce8`：多分支调度器，每支 `状态字段≥1` +
+>   虚拟谓词 → 动作码 **3**；状态字段 `+0x14dc` / `+0x14e0` / `+0x1490`。
+> - #22 `multi_person_cake @0x27fe7c4`：config **900251**，返回值 ∈ **[300,301]**，时间差 **≥31**。
+>
+> **仍未新增规则（0 条）**，但阻塞点已换：真正的缺口是
+> ①**虚拟调用无法解析**（核心判据都是 `ldr x8,[GOT+slot]; blr x8`，需 GOT 槽位→方法名）；
+> ②**官方动作码未映射**（16 / 3 与 `official_ai/actions.py` 的 label 体系无对照表）。
+> 正确推进顺序：GOT 槽位解析 → 动作码对照表 → 逐条落地。
+> 另按 tags 初步判断 3 条不是动作规则，不应注册：#7 `RuleTactics::Process()` 是调度器、
+> #32 `IsAroundDist` 是距离判据、#44 `InitSpecialPlaceStuckWall` 是初始化。
+
 工作流（每条 10~20 分钟）：
-1. `D:/app/python/python.exe reverse/rule_consts.py <addr>` 取判据附近的 `cmp/fcmp/fmov/tbz`；
+1. `D:/app/python/python.exe reverse/disasm_one.py <addr> <n> --prologue`
+   取判据附近的 `cmp/fcmp/fmov/tbz`，并确认该地址确实是函数入口（`[prologue] YES`）；
 2. 用日志串确认分支语义（`rules_table.tsv` 的 tags 列就是该函数引用的日志）；
 3. 常量写进 `rules.py` 并标 `evidence="disasm"` + `addr`；
 4. 在 `test_official_ai_replica.py` 加一条边界测试（阈值两侧各一例）。
@@ -91,6 +115,9 @@
 | GetHeroSpeedUpSkill | name | 0x027de90c |
 
 ## 二、待做（按指令数升序 = 先做短的）
+
+> 注：表中 #5 `move_pos_when_linger_around_dragon` 与 #18 `move_pos_when_linger`
+> 已于 2026-10-27 实现（见 §一 与 CHAIN）；为保留原编号未从表内删除。
 
 | # | slot | 地址 | 指令数 | 规则名/首日志串 | 候选常量（前 8） |
 | --- | --- | --- | --- | --- | --- |
