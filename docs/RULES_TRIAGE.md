@@ -52,10 +52,13 @@
 > 校验脚本 `reverse/verify_addr_convention.py`；回归守卫 `scripts/test_disasm_addr.py`。
 >
 > 三条被点名的规则在正确字节下语义都相当具体（不再"不可确认"）：
-> - #11 `wait_resurrection_armor @0x27eb7d8`：动作码 **16**，config **913471**，
+> - #11 `wait_resurrection_armor @0x27eb7d8`：动作码 **16 = `AtkSoldierSkill3`**
+>   （码表见 `docs/动作码对照表-2026-10-28.md`），config **913471**，
 >   血量比 > **0.5**，浮点门槛 **120.0**，容器 stride **56**。
-> - #3 `tactics_UseMapSpecialSkill @0x27d7ce8`：多分支调度器，每支 `状态字段≥1` +
->   虚拟谓词 → 动作码 **3**；状态字段 `+0x14dc` / `+0x14e0` / `+0x1490`。
+> - #3 `tactics_UseMapSpecialSkill @0x27d7ce8`：多分支分发器，每支 `状态字段≥1` +
+>   虚拟谓词 → 写 `self+0xb50 = 3`；状态字段 `+0x14dc` / `+0x14e0` / `+0x1490`。
+>   ⚠️ **勘误**：早先记作"动作码 3"是错的——`[x19+0xb50]` 的 x19 是 x0（self/上下文），
+>   不是结果结构体；该字段随后被 #11 读进 `result+0xa60`。真正的动作码字段是 `result+0x150`。
 > - #22 `multi_person_cake @0x27fe7c4`：config **900251**，返回值 ∈ **[300,301]**，时间差 **≥31**。
 >
 > **仍未新增规则（0 条）**，但阻塞点已两度收敛：

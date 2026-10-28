@@ -48,6 +48,7 @@ SUITES = [
     ("mem_worker", "scripts/test_mem_worker_self_state.py", False),
     ("disasm_addr", "scripts/test_disasm_addr.py", False),
     ("mm_fusion_gate", "scripts/test_mm_fusion_gate.py", False),
+    ("action_codes", "scripts/test_action_codes.py", False),
     ("security", "scripts/validate_safety.py", False),
     ("behavior", "scripts/m2_agent_v2_test.py", False),
 ]
