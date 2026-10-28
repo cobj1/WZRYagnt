@@ -15,7 +15,9 @@
     rec.close()                 # 对局结束（或进程退出）
 """
 import json
+import math
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -107,6 +109,12 @@ class MatchRecorder:
         self._frame_dir = None
         self._n_states = 0
         self._n_frames = 0
+        # 自身阵营投票（2026-10-28）：内存/视觉都解不出 self_cid 时，
+        # 用"小地图绿点 ↔ 英雄世界坐标"的最近邻做交叉匹配，多数票锁定。
+        # 真机实测（20261026_212503，66 帧抽样）：66/66 可匹配，63 帧指向同一 cid，
+        # 典型距离 0.034 —— 比任何单帧判据都稳。
+        self._camp_votes = deque(maxlen=9)
+        self._camp_locked = None
         self._start_t = None
         self._last_frame_t = 0.0
         self._meta = {}
@@ -138,6 +146,12 @@ class MatchRecorder:
         self._actions_fp = open(self.session_dir / "actions.jsonl", "a", encoding="utf-8")
         self._n_states = 0
         self._n_frames = 0
+        # 自身阵营投票（2026-10-28）：内存/视觉都解不出 self_cid 时，
+        # 用"小地图绿点 ↔ 英雄世界坐标"的最近邻做交叉匹配，多数票锁定。
+        # 真机实测（20261026_212503，66 帧抽样）：66/66 可匹配，63 帧指向同一 cid，
+        # 典型距离 0.034 —— 比任何单帧判据都稳。
+        self._camp_votes = deque(maxlen=9)
+        self._camp_locked = None
         self._start_t = time.time()
         self.result = None
         self._field_hits = {k: 0 for k in self._field_hits}
@@ -173,6 +187,41 @@ class MatchRecorder:
                 "src": "memory",
             })
         return rows
+
+    def _camp_from_minimap_vote(self, state_dict, heroes):
+        """用"小地图绿点 ↔ 英雄世界坐标"投票解析自身阵营。
+
+        返回 'blue'/'red'/None。**只在高置信时返回**：最近邻距离 ≤ MAX_D 才计票，
+        且需要 ≥5 票、≥80% 一致才锁定；否则 None（不可观测就不猜）。
+        """
+        if self._camp_locked:
+            return self._camp_locked
+        greens = (((state_dict.get("minimap") or {}).get("dots") or {})
+                  .get("green") or [])
+        if not greens or not heroes:
+            return None
+        from wzry.decision.official_ai.geo import world_to_norm
+        best = None
+        for h in heroes:
+            if h.get("x") is None or h.get("z") is None or not h.get("camp"):
+                continue
+            try:
+                nx, ny = world_to_norm(float(h["x"]), float(h["z"]))
+            except Exception:
+                continue
+            for g in greens:
+                d = math.hypot(nx - float(g[0]), ny - float(g[1]))
+                if best is None or d < best[0]:
+                    best = (d, h.get("camp"))
+        if best is None or best[0] > 0.05:
+            return None
+        self._camp_votes.append(best[1])
+        if len(self._camp_votes) >= 5:
+            top = max(set(self._camp_votes), key=self._camp_votes.count)
+            if self._camp_votes.count(top) >= 0.8 * len(self._camp_votes):
+                self._camp_locked = top
+                return top
+        return None
 
     def on_state(self, state_dict):
         """写入一条 GameState（dict），并把内存字段提升到统一契约。"""
@@ -231,8 +280,10 @@ class MatchRecorder:
             if self_camp:
                 sources.setdefault("self_camp", "given")
             else:
-                # 解析不出就如实记 unknown，不用 "blue" 兜底（镜像局会整队翻反）
-                sources["self_camp"] = "unknown"
+                # 视觉/内存都解不出 self_cid 时的兜底：小地图绿点 ↔ 英雄世界坐标投票
+                self_camp = self._camp_from_minimap_vote(state_dict, heroes)
+                # 仍解析不出就如实记 unknown，不用 "blue" 兜底（镜像局会整队翻反）
+                sources["self_camp"] = "minimap_vote" if self_camp else "unknown"
             units = list(units) + _canonical_mem_units(mem_units, self_camp)
             sources["units_memory"] = "memory"
         if units:

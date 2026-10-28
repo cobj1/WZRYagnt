@@ -13,6 +13,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,9 +84,13 @@ def main(argv: list[str]) -> int:
         return 2
 
     failed = []
+    slow = []
     for name, rel, sibling in suites:
+        _t0 = time.perf_counter()
         ok, tail = run_one(name, rel, sibling)
-        print(f"[{'PASS' if ok else 'FAIL'}] {name:14s} {tail}")
+        _dt = time.perf_counter() - _t0
+        slow.append((_dt, name))
+        print(f"[{'PASS' if ok else 'FAIL'}] {name:14s} {_dt:6.1f}s  {tail}")
         if not ok:
             failed.append(name)
             if not args.keep_going:
@@ -93,7 +98,9 @@ def main(argv: list[str]) -> int:
     if failed:
         print(f"FAILED: {', '.join(failed)}", file=sys.stderr)
         return 1
-    print(f"ALL PASS ({len(suites)} suites)")
+    slow.sort(reverse=True)
+    print("最慢套件: " + ", ".join(f"{n} {d:.1f}s" for d, n in slow[:3]))
+    print(f"ALL PASS ({len(suites)} suites, {sum(d for d, _ in slow):.1f}s)")
     return 0
 
 

@@ -164,6 +164,25 @@ check("T24_ui_drop_counted",
       == {"minimap": 1, "portrait": 1, "skillbar": 1},
       f"{(row9.get('sources') or {}).get('units_ui_dropped')}")
 
+# ---- 7. 小地图绿点投票解析自身阵营（2026-10-28） ----
+from wzry.decision.official_ai.geo import world_to_norm
+
+rec10 = MatchRecorder(base_dir=tempfile.mkdtemp(), input_source="test")
+nx, ny = world_to_norm(50000.0, -20000.0)
+heroes10 = [{"id": 106, "camp": "blue", "x": 50000.0, "z": -20000.0},
+            {"id": 167, "camp": "red", "x": -50000.0, "z": 20000.0}]
+st10 = {"minimap": {"dots": {"green": [[nx, ny]]}}}
+camps10 = [rec10._camp_from_minimap_vote(st10, heroes10) for _ in range(6)]
+check("T25_vote_locks_self_camp", camps10[-1] == "blue", f"{camps10}")
+check("T25b_vote_needs_quorum", camps10[0] is None and camps10[3] is None,
+      f"前 4 帧应为 None（需 ≥5 票）: {camps10[:5]}")
+
+# 绿点离所有英雄都很远 -> 不锁定（不可观测就不猜）
+rec11 = MatchRecorder(base_dir=tempfile.mkdtemp(), input_source="test")
+far = {"minimap": {"dots": {"green": [[0.5, 0.5]]}}}
+camps11 = [rec11._camp_from_minimap_vote(far, heroes10) for _ in range(8)]
+check("T26_far_dot_no_camp", all(c is None for c in camps11), f"{camps11}")
+
 print()
 if _FAIL:
     print(f"FAILED ({len(_FAIL)}/{len(_PASS) + len(_FAIL)}): " + ", ".join(_FAIL))
