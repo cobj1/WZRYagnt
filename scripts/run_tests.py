@@ -43,7 +43,11 @@ SUITES = [
     ("data_contract", "../hok-decision-ai/tests/test_data_contract.py", True),
     ("golden_readiness", "../hok-decision-ai/tests/test_golden_readiness.py", True),
     ("frame_features", "../hok-decision-ai/tests/test_build_frame_features.py", True),
+    ("splits", "../hok-decision-ai/tests/test_splits.py", True),
     ("coverage", "scripts/test_collector_coverage.py", False),
+    ("mem_worker", "scripts/test_mem_worker_self_state.py", False),
+    ("disasm_addr", "scripts/test_disasm_addr.py", False),
+    ("mm_fusion_gate", "scripts/test_mm_fusion_gate.py", False),
     ("security", "scripts/validate_safety.py", False),
     ("behavior", "scripts/m2_agent_v2_test.py", False),
 ]

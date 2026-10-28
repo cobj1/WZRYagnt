@@ -77,6 +77,7 @@ HOOK_DIST_SHRINK = 0.72
 MOVE_R = 0.8
 MOVE_DURATION_MS = 450
 DANGER_FRAC = 0.45
+_MM_DETECT_WARNED = False
 # v14.3 战斗决策(用户批准): ①不占优不接战 ②回城必须无近敌
 ENGAGE_HP_MIN = 0.60          # 接战血量下限: 低于此值不主动开团
 ENGAGE_MAX_ENEMY = 2          # 屏内可信敌英数上限: >=3 个不打
@@ -2523,23 +2524,36 @@ def main():
                 pass
             # v5.0 模型小地图点融合: yolo v5 直接检测小地图上的 mm_red/mm_blue/mm_green
             #   -> 模型输出作为权威红/蓝/绿点 (mm_rules 硬规则退为兜底)
+            # v15.x 门控(2026-10-28): 默认 ONNX 后端下 `detect_minimap` 是**无条件 return []**
+            #   (见 wzry/vision/detector.py: ONNX 替代检测器只有 8 个通用类, 没有 mm_* 类),
+            #   所以该融合块在默认配置下永不生效, dots 100% 来自 MMTrackerV7。
+            #   这里按后端跳过, 保留 `.pt` 11 类后端的回退能力(不删函数)。
             try:
                 if hasattr(det, "detect_minimap"):
-                    _mm_crop = frame[0:232, 0:232]
-                    _mmdets = det.detect_minimap(_mm_crop)
-                    _md = _mmdets or []
-                    _mred = [d for d in _md if d.cls == "mm_red" and d.conf >= 0.60]
-                    _mblue = [d for d in _md if d.cls == "mm_blue" and d.conf >= 0.60]
-                    _mgreen = [d for d in _md if d.cls == "mm_green" and d.conf >= 0.60]
-                    if _mred or _mblue or _mgreen:
-                        _msz = 232.0
-                        # v5.2 统一2元组输出(弃conf): 老代码全部按(x,y)解包, 带conf会崩
-                        def _mm_n(d):
-                            return [round(d.center[0] / _msz, 4),
-                                    round(d.center[1] / _msz, 4)]
-                        mm["dots"]["red"] = [_mm_n(d) for d in _mred] or mm["dots"]["red"]
-                        mm["dots"]["blue"] = [_mm_n(d) for d in _mblue] or mm["dots"]["blue"]
-                        mm["dots"]["green"] = [_mm_n(d) for d in _mgreen] or mm["dots"]["green"]
+                    _mm_backend = getattr(det, "backend", "")
+                    if _mm_backend == "hok_yolov5_onnx":
+                        global _MM_DETECT_WARNED
+                        if not _MM_DETECT_WARNED:
+                            _MM_DETECT_WARNED = True
+                            print("[mm] detect_minimap 在 ONNX 后端无条件返回空, "
+                                  "已跳过融合块; dots 全部来自 MMTrackerV7 "
+                                  "(见《小地图实现对比-2026-10-26》§3)", flush=True)
+                    else:
+                        _mm_crop = frame[0:232, 0:232]
+                        _mmdets = det.detect_minimap(_mm_crop)
+                        _md = _mmdets or []
+                        _mred = [d for d in _md if d.cls == "mm_red" and d.conf >= 0.60]
+                        _mblue = [d for d in _md if d.cls == "mm_blue" and d.conf >= 0.60]
+                        _mgreen = [d for d in _md if d.cls == "mm_green" and d.conf >= 0.60]
+                        if _mred or _mblue or _mgreen:
+                            _msz = 232.0
+                            # v5.2 统一2元组输出(弃conf): 老代码全部按(x,y)解包, 带conf会崩
+                            def _mm_n(d):
+                                return [round(d.center[0] / _msz, 4),
+                                        round(d.center[1] / _msz, 4)]
+                            mm["dots"]["red"] = [_mm_n(d) for d in _mred] or mm["dots"]["red"]
+                            mm["dots"]["blue"] = [_mm_n(d) for d in _mblue] or mm["dots"]["blue"]
+                            mm["dots"]["green"] = [_mm_n(d) for d in _mgreen] or mm["dots"]["green"]
             except Exception:
                 pass
             if not mm["found"]:
