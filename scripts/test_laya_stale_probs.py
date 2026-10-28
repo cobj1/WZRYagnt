@@ -79,6 +79,22 @@ def wait_predict(sc, at_least=1, timeout=3.0):
         time.sleep(0.05)
 
 
+def probe_model_available(timeout=20.0):
+    """前置探测 laya 模型能否加载。
+
+    2026-10-28：本机 laya 模型加载失败（`ReadError: WinError 10053`），
+    而 `wait_model` 每次空等 120s × 3 次 → 本套件单跑 366s，占全量回归的 6/7。
+    模型不可用时本套件全部断言都建立在死 scorer 上，等于假通过；
+    因此改为**先探测、不可用就 SKIP 并退出 0**，把 6 分钟还给 CI。
+    """
+    sc = FakeLaya(bias_second, mode="ensemble", beta=10.0, cache_ttl=0.30)
+    sc.start()
+    ok = wait_model(sc, timeout=timeout)
+    err = sc.stats().get("last_error")
+    sc.stop()
+    return ok, err
+
+
 def wait_model(sc, timeout=120.0):
     """等 worker 把模型加载完。
 
@@ -95,6 +111,11 @@ def wait_model(sc, timeout=120.0):
         print(f"[warn] 模型 {timeout:.0f}s 内未就绪：{sc.stats().get('last_error') or 'unknown'}")
     return ok
 
+
+_ok, _err = probe_model_available()
+if not _ok:
+    print(f"SKIP laya 模型不可用（{_err or 'unknown'}）—— 本套件断言依赖真实模型加载")
+    raise SystemExit(0)
 
 st_hi = make_state(0.9)
 st_lo = make_state(0.4)          # 换 hp -> 状态桶变化 -> 缓存 key 不同
